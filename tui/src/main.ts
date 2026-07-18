@@ -1,0 +1,337 @@
+import {
+	CombinedAutocompleteProvider,
+	Container,
+	Editor,
+	Key,
+	matchesKey,
+	ProcessTerminal,
+	Spacer,
+	TUI,
+} from "@mariozechner/pi-tui";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { Bridge, type ServerMessage } from "./bridge.ts";
+import {
+	AssistantMessage,
+	HeaderBar,
+	HintLine,
+	ModelPicker,
+	Notice,
+	PermissionCard,
+	type PermissionSpec,
+	Thinking,
+	UserMessage,
+} from "./components.ts";
+import { runDemoTurn } from "./demo.ts";
+import { t } from "./theme.ts";
+
+/* ---------- args ---------- */
+
+const argv = process.argv.slice(2);
+function argValue(flag: string): string | undefined {
+	const i = argv.indexOf(flag);
+	return i >= 0 ? argv[i + 1] : undefined;
+}
+const DEMO = argv.includes("--demo");
+const NO_KG = argv.includes("--no-kg");
+const MODEL_ARG = argValue("--model");
+let repo = resolve(argValue("--repo") ?? process.cwd());
+// `npm start` runs inside tui/ — the agent should work on the enclosing repo
+if (basename(repo) === "tui" && existsSync(join(dirname(repo), "pyproject.toml"))) {
+	repo = dirname(repo);
+}
+
+function tildify(p: string): string {
+	const home = homedir();
+	return p.startsWith(home) ? "~" + p.slice(home.length) : p;
+}
+
+// Mirrors mha's REPL commands (src/mha/repl.py)
+const SLASH_COMMANDS = [
+	{ name: "help", description: "list commands" },
+	{ name: "model", description: "pick from available models (sets default)" },
+	{ name: "kg", description: "knowledge graph status / build / query" },
+	{ name: "tools", description: "list available tools" },
+	{ name: "compact", description: "compact conversation history" },
+	{ name: "clear", description: "start a fresh conversation" },
+	{ name: "session", description: "show session info" },
+	{ name: "sessions", description: "list all past sessions with names" },
+	{ name: "continue", description: "resume a previous session" },
+	{ name: "quit", description: "exit mha" },
+];
+
+/* ---------- UI scaffold ---------- */
+
+const terminal = new ProcessTerminal();
+const tui = new TUI(terminal);
+
+const header = new HeaderBar(tildify(repo), DEMO ? "demo" : "connecting…");
+const hint = new HintLine(DEMO ? "demo" : "connecting…");
+const chat = new Container();
+const editor = new Editor(tui, {
+	borderColor: (s) => t.dim(s),
+	selectList: {
+		selectedPrefix: (s) => t.accentBold(s),
+		selectedText: (s) => t.accentBold(s),
+		description: (s) => t.muted(s),
+		scrollInfo: (s) => t.dim(s),
+		noMatch: (s) => t.muted(s),
+	},
+});
+editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, repo));
+
+tui.addChild(header);
+tui.addChild(new Spacer(1));
+tui.addChild(chat);
+tui.addChild(new Spacer(1));
+tui.addChild(editor);
+tui.addChild(hint);
+
+let busy = false;
+const thinking = new Thinking(tui);
+let thinkingShown = false;
+
+function addToChat(...components: Parameters<Container["addChild"]>[0][]): void {
+	hideThinking();
+	for (const c of components) {
+		chat.addChild(c);
+		chat.addChild(new Spacer(1));
+	}
+	if (busy) showThinking();
+	tui.requestRender();
+}
+
+function showThinking(): void {
+	if (!thinkingShown) {
+		chat.addChild(thinking);
+		thinking.start();
+		thinkingShown = true;
+	}
+}
+
+function hideThinking(): void {
+	if (thinkingShown) {
+		thinking.stop();
+		chat.removeChild(thinking);
+		thinkingShown = false;
+	}
+}
+
+function endTurn(): void {
+	busy = false;
+	hideThinking();
+	tui.setFocus(editor);
+	tui.requestRender();
+}
+
+function setModel(model: string): void {
+	header.setModel(model);
+	hint.setModel(model);
+	tui.requestRender();
+}
+
+/* ---------- bridge wiring ---------- */
+
+function shortToolLabel(name: string, argsJson: string): string {
+	try {
+		const args = JSON.parse(argsJson || "{}");
+		const detail = args.command ?? args.path ?? args.question ?? args.summary ?? "";
+		const label = `${name} ${String(detail)}`.trim().replace(/\s+/g, " ");
+		return label.length > 100 ? label.slice(0, 100) + "…" : label;
+	} catch {
+		return name;
+	}
+}
+
+let bridge: Bridge | null = null;
+
+/* streaming state: assistant text arrives token-by-token via assistant_delta,
+   then the "assistant" harness event finalizes it. When the finalized message
+   had no tool calls it IS the reply, so turn_end must not re-add it. */
+let streamMsg: AssistantMessage | null = null;
+let streamText = "";
+let streamedReply = false;
+
+function finalizeStream(content: string | null, cursor = false): void {
+	if (!streamMsg) return;
+	streamMsg.setText((content ?? streamText).trim(), cursor);
+	streamMsg = null;
+	streamText = "";
+	tui.requestRender();
+}
+
+function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }): void {
+	switch (msg.type) {
+		case "ready": {
+			setModel(msg.model);
+			const kgNote = msg.kg ? (msg.kg_ready ? "kg ready" : "kg building in background") : "kg off";
+			addToChat(new Notice(`connected · session ${msg.run_id} · ${kgNote}`));
+			break;
+		}
+		case "state":
+			setModel((msg as unknown as { model: string }).model);
+			break;
+		case "harness_event": {
+			const { event, data } = msg;
+			if (event === "assistant_delta") {
+				if (!streamMsg) {
+					streamMsg = new AssistantMessage("");
+					streamText = "";
+					addToChat(streamMsg);
+				}
+				streamText += (data.text as string) ?? "";
+				streamMsg.setText(streamText, true);
+				tui.requestRender();
+			} else if (event === "assistant") {
+				const calls = (data.tool_calls as { name: string; arguments_json: string }[]) ?? [];
+				const content = (data.content as string) ?? "";
+				if (streamMsg) {
+					streamedReply = calls.length === 0;
+					finalizeStream(content);
+				} else if (calls.length && content.trim()) {
+					addToChat(new Notice(content.trim()));
+				}
+				for (const c of calls) addToChat(new Notice(`› ${shortToolLabel(c.name, c.arguments_json)}`, "accent"));
+			} else if (event === "tool_result" && data.is_error) {
+				addToChat(new Notice(`✕ ${data.name} failed`, "danger"));
+			} else if (event === "kg_ready_notice") {
+				addToChat(new Notice("✓ knowledge graph ready — kg_query is live", "success"));
+			} else if (event === "bash_rejected") {
+				addToChat(new Notice(`✕ bash rejected: ${data.reason}`, "danger"));
+			}
+			break;
+		}
+		case "permission_request": {
+			const spec: PermissionSpec =
+				msg.kind === "bash" ? { kind: "bash", cmd: msg.cmd } : { kind: msg.kind, file: msg.file, lines: msg.lines };
+			const card = new PermissionCard(spec);
+			card.onResolve = (r) => {
+				bridge?.permission(msg.id, r === "approved");
+				tui.setFocus(thinkingShown ? thinking : editor);
+				tui.requestRender();
+			};
+			addToChat(card);
+			tui.setFocus(card);
+			break;
+		}
+		case "turn_end": {
+			const { status, summary } = msg;
+			finalizeStream(null); // drop the cursor if a stream was cut short
+			if (status === "reply" || status === "done") {
+				if (status !== "reply" || !streamedReply) {
+					addToChat(new AssistantMessage((status === "done" ? "✓ " : "") + summary));
+				}
+			} else if (status === "interrupted") {
+				addToChat(new Notice("✕ interrupted"));
+			} else {
+				addToChat(
+					new Notice(`⚠ ${status}: ${summary}`, "danger"),
+					new Notice("(conversation kept; rephrase or /clear to reset)"),
+				);
+			}
+			endTurn();
+			break;
+		}
+		case "model_list": {
+			for (const n of msg.notes ?? []) addToChat(new Notice(n));
+			const picker = new ModelPicker(msg.models, msg.current, msg.default);
+			picker.onDone = (spec) => {
+				chat.removeChild(picker);
+				tui.setFocus(editor);
+				if (spec) bridge?.command(`/model ${spec}`);
+				tui.requestRender();
+			};
+			chat.addChild(picker);
+			chat.addChild(new Spacer(1));
+			tui.setFocus(picker);
+			tui.requestRender();
+			break;
+		}
+		case "command_output":
+			if (msg.text) addToChat(new Notice(msg.text));
+			break;
+		case "error":
+			addToChat(new Notice(`⚠ ${msg.message}`, "danger"));
+			break;
+		case "bye":
+			shutdown(0);
+			break;
+	}
+}
+
+function shutdown(code: number): void {
+	bridge?.stop();
+	tui.stop();
+	process.exit(code);
+}
+
+if (!DEMO) {
+	bridge = new Bridge({
+		repo,
+		model: MODEL_ARG,
+		noKg: NO_KG,
+		onMessage,
+		onStderr: (line) => addToChat(new Notice(line, "danger")),
+		onExit: (code) => {
+			if (code !== 0) {
+				hideThinking();
+				addToChat(new Notice(`mha serve exited (code ${code}) — is the venv installed and ollama running?`, "danger"));
+				busy = false;
+				tui.requestRender();
+			} else {
+				shutdown(0);
+			}
+		},
+	});
+}
+
+/* ---------- input ---------- */
+
+thinking.onAbort = () => {
+	if (DEMO) return; // demo handles its own abort
+	bridge?.interrupt();
+	addToChat(new Notice("interrupt requested — takes effect at the next harness step"));
+};
+
+editor.onSubmit = (text) => {
+	const trimmed = text.trim();
+	if (!trimmed) return;
+	if (busy) return;
+	editor.setText("");
+
+	if (trimmed.startsWith("/")) {
+		const cmd = trimmed.slice(1).split(/\s+/)[0];
+		if (cmd === "quit" || cmd === "exit") {
+			if (bridge) bridge.command("/quit");
+			else shutdown(0);
+			return;
+		}
+		if (cmd === "clear") chat.clear();
+		if (DEMO) {
+			addToChat(new Notice(`/${cmd} needs the live harness — run without --demo.`));
+			return;
+		}
+		bridge?.command(trimmed);
+		return;
+	}
+
+	addToChat(new UserMessage(trimmed));
+	busy = true;
+	streamedReply = false;
+	showThinking();
+	tui.setFocus(thinking);
+	if (DEMO) {
+		runDemoTurn({ tui, chat, thinking: { hide: hideThinking }, addToChat, endTurn });
+	} else {
+		bridge?.userInput(trimmed);
+	}
+};
+
+tui.setFocus(editor);
+
+tui.addInputListener((data) => {
+	if (matchesKey(data, Key.ctrl("c"))) shutdown(0);
+});
+
+tui.start();

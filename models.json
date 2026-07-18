@@ -1,0 +1,70 @@
+{
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY"
+    },
+    "ollama": {
+      "base_url": "http://localhost:11434/v1",
+      "native_url": "http://localhost:11434",
+      "api_key_env": null
+    }
+  },
+  "models": {
+    "ollama:ornith": {
+      "context_window": 262144,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:ornith:35b": {
+      "context_window": 262144,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:qwen2.5-coder:14b": {
+      "context_window": 32768,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:qwen2.5-coder:7b": {
+      "context_window": 32768,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "openrouter:anthropic/claude-sonnet-5": {
+      "context_window": 200000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "openrouter:anthropic/claude-haiku-4.5": {
+      "context_window": 200000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "openrouter:zai/glm-5.2": {
+      "context_window": 200000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "openrouter:minimax/minimax-m3": {
+      "context_window": 200000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "openrouter:moonshotai/kimi-k3": {
+      "context_window": 200000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "openrouter:thinkingmachines/inkling": {
+      "context_window": 1000000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    }
+  },
+  "aliases": {
+    "default": "openrouter:minimax/minimax-m3",
+    "judge": "openrouter:minimax/minimax-m3",
+    "compactor": "openrouter:minimax/minimax-m3"
+  }
+}

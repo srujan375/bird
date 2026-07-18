@@ -1,0 +1,21 @@
+{
+  "name": "mha-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Terminal UI for mha (multi-harness agent) — Claude Native design direction, built on pi-tui",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "dev": "tsx src/main.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mariozechner/pi-tui": "^0.73.1",
+    "chalk": "^5.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.0",
+    "typescript": "^7.0.2"
+  }
+}
