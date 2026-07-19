@@ -12,6 +12,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from ..llm.registry import ModelSpec, Registry
 from ..llm.types import Message, Usage
@@ -150,6 +151,11 @@ class RunResult:
     messages: list[Message] = field(default_factory=list)
 
 
+def _plan_tracker(ctx: ToolContext) -> str | None:
+    """Default tracker provider: the Code harness's plan tracker."""
+    return ctx.plan.render() if ctx.plan is not None else None
+
+
 class Runner:
     def __init__(
         self,
@@ -161,6 +167,11 @@ class Runner:
         max_turns: int = MAX_TURNS,
         temperature: float = 0.0,
         on_delta: OnDelta | None = None,
+        instructions_path: Path | None = None,
+        mutating_tools: set[str] | frozenset[str] | None = None,
+        tracker: Callable[[ToolContext], str | None] | None = None,
+        tracker_prefix: str | None = None,
+        explore_nudge: str | None = None,
     ):
         self.spec = spec
         self.client = client
@@ -172,6 +183,13 @@ class Runner:
         self.temperature = temperature
         # streams assistant text as it generates; None keeps requests non-streaming
         self.on_delta = on_delta
+        # harness tuning — defaults are the Code harness's, so existing callers
+        # are untouched; other harnesses (arch) pass their own
+        self.instructions_path = instructions_path or INSTRUCTIONS_PATH
+        self.mutating_tools = set(mutating_tools) if mutating_tools is not None else set(MUTATING_TOOLS)
+        self.tracker = tracker or _plan_tracker
+        self.tracker_prefix = tracker_prefix or PLAN_TRACKER_PREFIX
+        self.explore_nudge = explore_nudge or EXPLORE_NUDGE
 
     def run(self, task: str) -> RunResult:
         messages = [
@@ -194,7 +212,7 @@ class Runner:
         to guess where it is or what the codebase looks like (that guess is
         where /testbed-style hallucinations come from)."""
         parts = [
-            INSTRUCTIONS_PATH.read_text(encoding="utf-8"),
+            self.instructions_path.read_text(encoding="utf-8"),
             f"Repository root: {self.ctx.repo_root}\n"
             "All tool paths are relative to this root.",
         ]
@@ -209,13 +227,12 @@ class Runner:
             parts.append(render_index(self.ctx.skills))
         return "\n\n".join(p for p in parts if p)
 
-    @staticmethod
-    def _strip_plan_tracker(messages: list[Message]) -> None:
+    def _strip_tracker(self, messages: list[Message]) -> None:
         """Remove the pinned tracker copies, mutating the list in place."""
         messages[:] = [
             m
             for m in messages
-            if not (m.role == "user" and (m.content or "").startswith(PLAN_TRACKER_PREFIX))
+            if not (m.role == "user" and (m.content or "").startswith(self.tracker_prefix))
         ]
 
     def _loop(self, messages: list[Message], interactive: bool) -> RunResult:
@@ -240,16 +257,17 @@ class Runner:
                 self.ctx.emit("kg_ready_notice", {"turn": turn})
                 kg_was_unready = False
 
-            # plan tracker: exactly one live copy, re-rendered every turn and
+            # tracker: exactly one live copy, re-rendered every turn and
             # always at the tail — pinned by refresh, so compaction (which
-            # keeps the recent tail) can never lose the plan
+            # keeps the recent tail) can never lose it
             # NB: mutate in place (never rebind `messages`) — interactive
             # callers hold this same list and keep it across exchanges; a
             # rebind here silently forks the transcript and later turns run
             # without the history
-            if self.ctx.plan is not None:
-                self._strip_plan_tracker(messages)
-                messages.append(Message(role="user", content=self.ctx.plan.render()))
+            tracker_text = self.tracker(self.ctx)
+            if tracker_text is not None:
+                self._strip_tracker(messages)
+                messages.append(Message(role="user", content=tracker_text))
 
             if needs_compaction(messages, self.spec.context_window):
                 messages[:] = compact(
@@ -345,7 +363,7 @@ class Runner:
                     # stale "all steps closed" scoreboard
                     if self.ctx.plan is not None:
                         self.ctx.plan = None
-                        self._strip_plan_tracker(messages)
+                        self._strip_tracker(messages)
                     return RunResult("done", result.output, usage, turn, messages)
                 if tc.name in READONLY_LOOP_TOOLS and not result.is_error:
                     readonly_call_counts[f"{tc.name}:{tc.arguments_json}"] += 1
@@ -381,7 +399,7 @@ class Runner:
 
             # --- explore-budget nudge: a model that keeps reading and restating
             # its plan needs an explicit push over the planning→acting boundary ---
-            if any(t.name in MUTATING_TOOLS for t in assistant.tool_calls):
+            if any(t.name in self.mutating_tools for t in assistant.tool_calls):
                 explore_streak = 0
             else:
                 explore_streak += 1
@@ -397,7 +415,7 @@ class Runner:
                             files=", ".join(step.files),
                         )
                     else:
-                        nudge = EXPLORE_NUDGE.format(n=explore_streak)
+                        nudge = self.explore_nudge.format(n=explore_streak)
                     messages.append(Message(role="user", content=nudge))
                     self.ctx.emit("explore_nudge", {"turn": turn, "streak": explore_streak})
                     explore_streak = 0

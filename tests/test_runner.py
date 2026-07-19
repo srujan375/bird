@@ -343,3 +343,38 @@ def test_repair_interrupted_noop_on_clean_transcript():
     messages = [Message(role="user", content="go"), assistant(content="hi")]
     repair_interrupted(messages)
     assert len(messages) == 2
+
+
+# ---------- harness tuning params (arch harness reuses the engine) ----------
+
+
+def test_custom_tracker_pinned_once_and_refreshed(make_runner):
+    """A non-plan tracker provider is pinned into the transcript each turn,
+    with exactly one live copy (strip + re-append)."""
+    r = make_runner(
+        [assistant(content="hello"), assistant(content="again")],
+        tracker=lambda ctx: "[arch tracker] phase: propose",
+        tracker_prefix="[arch tracker",
+    )
+    messages = []
+    r.chat(messages, "hi")
+    assert sum(1 for m in messages if (m.content or "").startswith("[arch tracker")) == 1
+    r.chat(messages, "more")
+    assert sum(1 for m in messages if (m.content or "").startswith("[arch tracker")) == 1
+
+
+def test_custom_mutating_tools_suppress_explore_nudge(repo, make_runner):
+    """When the harness declares its own mutating tools, calls to them reset
+    the explore streak — no bogus 'make an edit/write NOW' nudges."""
+    for i in range(7):
+        (repo / f"m{i}.py").write_text("y = 1\n")
+    reads = [assistant(calls=[tc("read", {"path": f"m{i}.py"}, id=f"c{i}")]) for i in range(7)]
+    script = reads + [assistant(calls=[tc("done", {"summary": "ok"}, id="cd")])]
+
+    r = make_runner(list(script), mutating_tools={"read"}, explore_nudge="[system notice] {n} CUSTOM")
+    result = r.run("look around")
+    assert not any("CUSTOM" in (m.content or "") for m in result.messages)
+
+    r2 = make_runner(list(script), explore_nudge="[system notice] {n} CUSTOM")
+    result2 = r2.run("look around")
+    assert any("CUSTOM" in (m.content or "") for m in result2.messages)
