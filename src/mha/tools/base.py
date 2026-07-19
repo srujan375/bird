@@ -43,6 +43,7 @@ class ToolContext:
     bash_categories: tuple[str, ...] = ("search", "test", "lint", "git_read")
     client: Any | None = None  # llm.wire.openai_compat.OpenAICompatClient — used by web_fetch to ask the model
     skills: list[Any] | None = None  # skills.Skill list; None = no skills loaded
+    arch: Any | None = None  # harnesses.arch.session.ArchSession in arch sessions
 
     def emit(self, event_type: str, data: dict[str, Any]) -> None:
         if self.record:
