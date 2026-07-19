@@ -9,3 +9,4 @@ node_modules/
 .DS_Store
 multi-harness architecture.excalidraw
 tui/node_modules
+.playwright-mcp/

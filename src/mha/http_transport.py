@@ -85,7 +85,10 @@ class HttpTransport:
             elif kind == "permission_request":
                 self._pending_perm = event
             elif kind in BUFFERED_TYPES:
-                self._buffer.append(event)
+                # deltas are live-only: the `assistant` event carries the full
+                # text, so replaying token chunks would only waste the buffer
+                if event.get("event") != "assistant_delta":
+                    self._buffer.append(event)
             for q in self._clients:
                 q.put(event)
         if self._stop_when is not None and self._stop_when(event):

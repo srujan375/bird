@@ -2,19 +2,90 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>mha arch</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='1' width='6' height='6' rx='1' fill='%23111'/><rect x='9' y='9' width='6' height='6' rx='1' fill='%231677ff'/><path d='M7 4h4v5' stroke='%23949494' fill='none'/></svg>" />
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <h1>mha arch</h1>
-  <p>Placeholder page — the Workbench UI lands here. The backend is live:
-     events stream on <code>/events</code>; POST <code>/input</code>,
-     <code>/permission</code>, <code>/interrupt</code>.</p>
-  <pre id="log"></pre>
-  <script>
-    const log = document.getElementById("log");
-    new EventSource("/events").onmessage = (e) => {
-      log.textContent += e.data + "\n\n";
-    };
-  </script>
+  <div class="s-workbench">
+    <header class="statusbar">
+      <div class="left">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="title">mha arch</span>
+        <span class="kv">model <code id="sb-model">—</code></span>
+      </div>
+      <div class="right">
+        <span class="kv">repo <code id="sb-repo">—</code></span>
+        <span class="kv">session <code id="sb-session">—</code></span>
+        <span class="chip conn" id="sb-conn"><i class="dot"></i><span>Connecting…</span></span>
+      </div>
+    </header>
+
+    <div class="banner" id="banner" hidden>
+      <span>Connection lost — the harness server exited.</span>
+      <button id="banner-reconnect">Reconnect</button>
+    </div>
+
+    <div class="body">
+      <div class="wmain">
+        <aside class="rail">
+          <div class="block">
+            <div class="label">Session</div>
+            <dl class="mono" id="rail-session"></dl>
+          </div>
+          <div class="block">
+            <div class="label">Jump to</div>
+            <nav class="jump" id="rail-jump"></nav>
+          </div>
+          <div class="block" id="rail-obligations-block" hidden>
+            <div class="label">Obligations</div>
+            <ul class="obligations mono" id="rail-obligations"></ul>
+          </div>
+        </aside>
+
+        <section class="wdiag">
+          <div class="dtoolbar">
+            <span class="pill" id="d-live"><i class="dot"></i><span>connecting</span></span>
+            <span class="crumb mono" id="d-crumb"></span>
+            <span class="cue mono" id="d-cue"></span>
+            <span class="spacer"></span>
+            <span class="zoom">
+              <button id="d-fit">Fit</button><button id="d-out">−</button><button id="d-in">+</button>
+            </span>
+          </div>
+          <div class="dpane" id="dpane">
+            <div class="dempty" id="dempty">No components yet</div>
+            <svg id="dsvg"></svg>
+            <div class="derror" id="derror" hidden>
+              <b>Diagram failed to render</b>
+              <div id="derror-msg" class="mono"></div>
+              <span class="muted">showing the last good render</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="dock">
+        <div class="tabs" id="dock-tabs"></div>
+        <div class="tb" id="dock-body"></div>
+      </section>
+
+      <footer class="commandbar" id="commandbar"></footer>
+    </div>
+
+    <div class="overlay" id="overlay" hidden>
+      <div class="card">
+        <div class="big">Session complete</div>
+        <p>The architecture was finalized and the handoff bundle written:</p>
+        <ul class="mono" id="overlay-paths"></ul>
+        <p class="muted">next: <code>mha code</code> · this page is now read-only</p>
+        <button id="overlay-dismiss">View the design</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="diagram.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
