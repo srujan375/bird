@@ -356,7 +356,10 @@ class Runner:
                     },
                 )
                 messages.append(Message(role="tool", content=output, tool_call_id=tc.id))
-                if tc.name == "done" and not result.is_error:
+                # termination is signaled by the result's details, not by the
+                # name alone: a phase-gate done (arch toplevel approval) can
+                # succeed without ending the session
+                if tc.name == "done" and not result.is_error and result.details.get("done"):
                     self.ctx.emit("run_done", {"turn": turn, "summary": result.output})
                     # the plan lived its life with this task — clear it (and its
                     # pinned tracker) so the next exchange isn't steered by a

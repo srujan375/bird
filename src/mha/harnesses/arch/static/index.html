@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>mha arch</title>
+</head>
+<body>
+  <h1>mha arch</h1>
+  <p>Placeholder page — the Workbench UI lands here. The backend is live:
+     events stream on <code>/events</code>; POST <code>/input</code>,
+     <code>/permission</code>, <code>/interrupt</code>.</p>
+  <pre id="log"></pre>
+  <script>
+    const log = document.getElementById("log");
+    new EventSource("/events").onmessage = (e) => {
+      log.textContent += e.data + "\n\n";
+    };
+  </script>
+</body>
+</html>
