@@ -78,12 +78,13 @@ class Boom(Tool):
 
 
 class StubBroker:
-    def __init__(self, answer):
+    def __init__(self, answer, feedback=""):
         self.answer = answer
+        self.feedback = feedback
 
     def request(self, payload):
         self.payload = payload
-        return self.answer
+        return self.answer, self.feedback
 
 
 def test_gated_tool_denied(tmp_path):
@@ -283,3 +284,64 @@ def test_serve_reload_emits_run_id(monkeypatch, tmp_path):
     assert msg["run_id"] == "t"  # make_repl uses run_id="t"
     feeder.close()
     thread.join(timeout=5)
+
+
+# ---------- transport split ----------
+
+
+def test_permission_response_feedback_reaches_broker(monkeypatch, tmp_path):
+    """A rejection's feedback string travels wire -> broker -> request()."""
+    from mha.serve import PermissionBroker
+
+    events = []
+    broker = PermissionBroker(lambda t, **d: events.append({"type": t, **d}))
+    got = {}
+
+    def ask():
+        got["answer"] = broker.request({"kind": "finalize", "summary": "s"})
+
+    t = threading.Thread(target=ask)
+    t.start()
+    deadline = time.time() + 5
+    while not events and time.time() < deadline:
+        time.sleep(0.01)
+    req = events[0]
+    assert req["type"] == "permission_request" and req["kind"] == "finalize"
+    broker.resolve(req["id"], False, feedback="drop the cache")
+    t.join(timeout=5)
+    assert got["answer"] == (False, "drop the cache")
+
+
+class FakeTransport:
+    """Collects emitted events; run() drives one scripted user turn."""
+
+    def __init__(self):
+        self.events = []
+        self.done = threading.Event()
+
+    def emit(self, event):
+        self.events.append(event)
+        if event["type"] == "turn_end":
+            self.done.set()
+
+    def run(self, handlers):
+        handlers.on_user_input("hello?")
+        assert self.done.wait(timeout=5)
+
+
+def test_server_runs_on_custom_transport(tmp_path):
+    """The pump is transport-agnostic: a fake transport gets the same event
+    vocabulary stdio produces, with no stdio involved at all."""
+    transport = FakeTransport()
+    repl = make_repl(tmp_path, [Message(role="assistant", content="hi there")])
+    server = Server(repl, transport=transport)
+    assert server.run() == 0
+    types = [e["type"] for e in transport.events]
+    assert types[0] == "ready" and types[-1] == "bye"
+    end = next(e for e in transport.events if e["type"] == "turn_end")
+    assert end["status"] == "reply" and end["summary"] == "hi there"
+    deltas = [
+        e for e in transport.events
+        if e["type"] == "harness_event" and e["event"] == "assistant_delta"
+    ]
+    assert [d["data"]["text"] for d in deltas] == ["hi there"]

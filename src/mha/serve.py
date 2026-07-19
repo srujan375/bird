@@ -1,22 +1,29 @@
-"""mha serve — JSON-lines bridge for external UIs (the TUI).
+"""mha serve — the session pump plus its transports.
 
-Protocol (one JSON object per line):
+The pump (Server) owns session logic: turns on a worker thread, the
+permission broker, interrupts, event tee-ing, transcript persistence. A
+Transport owns only how bytes move between the pump and a UI. StdioTransport
+is the JSON-lines protocol the TUI speaks (one JSON object per line):
 
-  stdin  → {"type": "user_input", "text": "..."}
-           {"type": "command", "line": "/model ..."}
-           {"type": "permission_response", "id": 3, "approved": true}
-           {"type": "interrupt"}
+  inbound  → {"type": "user_input", "text": "..."}
+             {"type": "command", "line": "/model ..."}
+             {"type": "permission_response", "id": 3, "approved": true,
+              "feedback": "optional — rejection text returned to the loop"}
+             {"type": "interrupt"}
 
-  stdout ← {"type": "ready", "model": ..., "kg": ..., "run_id": ...}
-           {"type": "harness_event", "event": "assistant"|"tool_result"|..., "data": {...}}
-           {"type": "harness_event", "event": "assistant_delta", "data": {"text": "..."}}
-           {"type": "permission_request", "id": 3, "kind": "edit"|"write"|"bash", ...}
-           {"type": "turn_end", "status": ..., "summary": ..., "turns": ...}
-           {"type": "model_list", "current": ..., "default": ..., "models": [...], "notes": [...]}
-           {"type": "command_output", "text": "..."}
-           {"type": "bye"}
+  outbound ← {"type": "ready", "model": ..., "kg": ..., "run_id": ...}
+             {"type": "harness_event", "event": "assistant"|"tool_result"|..., "data": {...}}
+             {"type": "harness_event", "event": "assistant_delta", "data": {"text": "..."}}
+             {"type": "permission_request", "id": 3, "kind": "edit"|"write"|..., ...}
+             {"type": "turn_end", "status": ..., "summary": ..., "turns": ...}
+             {"type": "model_list", "current": ..., "default": ..., "models": [...], "notes": [...]}
+             {"type": "command_output", "text": "..."}
+             {"type": "bye"}
 
-Turns run in a worker thread so stdin stays responsive for permission
+HttpTransport (mha.http_transport) carries the same events over SSE + POSTs
+for the arch harness's browser page.
+
+Turns run in a worker thread so inbound stays responsive for permission
 responses and interrupts. Interrupts take effect at the next harness event
 or streamed token, whichever comes first. Permission gating wraps
 the mutating tools (edit/write) — bash stays ungated because it is already
@@ -31,7 +38,7 @@ import io
 import json
 import sys
 import threading
-from typing import Any
+from typing import Any, Callable, Protocol
 
 from .engine.runner import repair_interrupted
 from .engine.session import save_messages
@@ -48,49 +55,96 @@ class _Interrupted(Exception):
     pass
 
 
-class Bridge:
-    """Thread-safe JSON-lines writer bound to the real stdout, immune to
-    redirect_stdout (used to capture Repl command output)."""
+class Handlers(Protocol):
+    """What a transport delivers inbound messages to (implemented by Server)."""
+
+    def on_user_input(self, text: str) -> None: ...
+    def on_permission(self, req_id: int, approved: bool, feedback: str) -> None: ...
+    def on_interrupt(self) -> None: ...
+    def on_command(self, line: str) -> bool | None: ...
+
+
+class Transport(Protocol):
+    """How bytes move between the pump and a UI. No session knowledge."""
+
+    def emit(self, event: dict[str, Any]) -> None: ...
+    def run(self, handlers: Handlers) -> None: ...
+
+
+class StdioTransport:
+    """JSON lines over stdin/stdout — the TUI's protocol, byte-compatible
+    with the pre-split Server. Binds the real stdout at construction so
+    redirect_stdout (used to capture Repl command output) can't steal it."""
 
     def __init__(self) -> None:
         self._out = sys.stdout
         self._lock = threading.Lock()
 
-    def emit(self, event_type: str, **data: Any) -> None:
-        line = json.dumps({"type": event_type, **data}, ensure_ascii=False, default=str)
+    def emit(self, event: dict[str, Any]) -> None:
+        line = json.dumps(event, ensure_ascii=False, default=str)
         with self._lock:
             self._out.write(line + "\n")
             self._out.flush()
 
+    def run(self, handlers: Handlers) -> None:
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError as e:
+                self.emit({"type": "error", "message": f"bad JSON on stdin: {e}"})
+                continue
+            kind = msg.get("type")
+            if kind == "user_input":
+                handlers.on_user_input(str(msg.get("text", "")))
+            elif kind == "permission_response":
+                handlers.on_permission(
+                    int(msg.get("id", 0)),
+                    bool(msg.get("approved")),
+                    str(msg.get("feedback", "") or ""),
+                )
+            elif kind == "interrupt":
+                handlers.on_interrupt()
+            elif kind == "command":
+                if handlers.on_command(str(msg.get("line", ""))) is False:
+                    break
+            else:
+                self.emit({"type": "error", "message": f"unknown message type: {kind!r}"})
+
 
 class PermissionBroker:
-    """Blocks a worker-thread tool call until the UI answers."""
+    """Blocks a worker-thread tool call until the UI answers. The answer is
+    (approved, feedback); feedback carries "Request changes" text on
+    rejection of the arch gates and is empty otherwise."""
 
-    def __init__(self, bridge: Bridge) -> None:
-        self.bridge = bridge
+    def __init__(self, emit: Callable[..., None]) -> None:
+        self._emit = emit
         self._lock = threading.Lock()
         self._next_id = 0
-        self._pending: dict[int, tuple[threading.Event, list[bool]]] = {}
+        self._pending: dict[int, tuple[threading.Event, list[Any]]] = {}
 
-    def request(self, payload: dict[str, Any]) -> bool:
+    def request(self, payload: dict[str, Any]) -> tuple[bool, str]:
         with self._lock:
             self._next_id += 1
             req_id = self._next_id
             done = threading.Event()
-            slot: list[bool] = [False]
+            slot: list[Any] = [False, ""]
             self._pending[req_id] = (done, slot)
-        self.bridge.emit("permission_request", id=req_id, **payload)
+        self._emit("permission_request", id=req_id, **payload)
         done.wait()
         with self._lock:
             self._pending.pop(req_id, None)
-        return slot[0]
+        return slot[0], slot[1]
 
-    def resolve(self, req_id: int, approved: bool) -> None:
+    def resolve(self, req_id: int, approved: bool, feedback: str = "") -> None:
         with self._lock:
             entry = self._pending.get(req_id)
         if entry:
             done, slot = entry
             slot[0] = approved
+            slot[1] = feedback
             done.set()
 
     def deny_all(self) -> None:
@@ -98,6 +152,7 @@ class PermissionBroker:
             entries = list(self._pending.values())
         for done, slot in entries:
             slot[0] = False
+            slot[1] = ""
             done.set()
 
 
@@ -147,7 +202,8 @@ class GatedTool(Tool):
 
     def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         payload = _permission_payload(self.name, args, ctx)
-        if not self.broker.request(payload):
+        approved, _feedback = self.broker.request(payload)
+        if not approved:
             ctx.emit("permission_denied", {"tool": self.name, "args": args})
             return ToolResult(
                 output=(
@@ -161,10 +217,12 @@ class GatedTool(Tool):
 
 
 class Server:
-    def __init__(self, repl: Repl):
+    """The pump. Transport-agnostic: session logic only."""
+
+    def __init__(self, repl: Repl, transport: Transport | None = None):
         self.repl = repl
-        self.bridge = Bridge()
-        self.broker = PermissionBroker(self.bridge)
+        self.transport = transport or StdioTransport()
+        self.broker = PermissionBroker(self._emit)
         self.cancel = threading.Event()
         self.worker: threading.Thread | None = None
 
@@ -179,7 +237,7 @@ class Server:
 
         def record(event_type: str, data: dict[str, Any]) -> None:
             recorder_event(event_type, data)
-            self.bridge.emit("harness_event", event=event_type, data=data)
+            self._emit("harness_event", event=event_type, data=data)
             if self.cancel.is_set():
                 raise _Interrupted()
 
@@ -192,56 +250,57 @@ class Server:
             if self.cancel.is_set():
                 raise _Interrupted()
             if chunk:  # "" is a wire-level cancel heartbeat, not display text
-                self.bridge.emit("harness_event", event="assistant_delta", data={"text": chunk})
+                self._emit("harness_event", event="assistant_delta", data={"text": chunk})
 
         runner.on_delta = on_delta
 
-    def run(self) -> int:
-        repl, bridge = self.repl, self.bridge
-        bridge.emit(
-            "ready",
-            model=repl.runner.spec.spec,
-            kg=repl.kg is not None,
-            kg_ready=bool(repl.kg and repl.kg.is_ready()),
-            run_id=repl.run_id,
-            repo=str(repl.runner.ctx.repo_root),
-            skills=[
+    def _emit(self, event_type: str, **data: Any) -> None:
+        self.transport.emit({"type": event_type, **data})
+
+    def ready_payload(self) -> dict[str, Any]:
+        repl = self.repl
+        return {
+            "model": repl.runner.spec.spec,
+            "kg": repl.kg is not None,
+            "kg_ready": bool(repl.kg and repl.kg.is_ready()),
+            "run_id": repl.run_id,
+            "repo": str(repl.runner.ctx.repo_root),
+            "skills": [
                 {"name": s.name, "description": s.description, "source": s.source}
                 for s in (repl.runner.ctx.skills or [])
             ],
-        )
-        for raw in sys.stdin:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError as e:
-                bridge.emit("error", message=f"bad JSON on stdin: {e}")
-                continue
-            kind = msg.get("type")
-            if kind == "user_input":
-                self._start_turn(str(msg.get("text", "")))
-            elif kind == "permission_response":
-                self.broker.resolve(int(msg.get("id", 0)), bool(msg.get("approved")))
-            elif kind == "interrupt":
-                self.cancel.set()
-                self.broker.deny_all()
-            elif kind == "command":
-                if self._command(str(msg.get("line", ""))) is False:
-                    break
-            else:
-                bridge.emit("error", message=f"unknown message type: {kind!r}")
+        }
+
+    def run(self) -> int:
+        self._emit("ready", **self.ready_payload())
+        self.transport.run(self)
         self.cancel.set()
         self.broker.deny_all()
         if self.worker:
             self.worker.join(timeout=5)
-        bridge.emit("bye")
+        self._emit("bye")
         return 0
+
+    # ---- inbound handlers (the Handlers protocol) ----
+
+    def on_user_input(self, text: str) -> None:
+        self._start_turn(text)
+
+    def on_permission(self, req_id: int, approved: bool, feedback: str) -> None:
+        self.broker.resolve(req_id, approved, feedback)
+
+    def on_interrupt(self) -> None:
+        self.cancel.set()
+        self.broker.deny_all()
+
+    def on_command(self, line: str) -> bool | None:
+        return self._command(line)
+
+    # ---- session logic ----
 
     def _start_turn(self, text: str) -> None:
         if self.worker and self.worker.is_alive():
-            self.bridge.emit("error", message="a turn is already running")
+            self._emit("error", message="a turn is already running")
             return
         self.cancel.clear()
 
@@ -250,9 +309,9 @@ class Server:
                 result = self.repl.runner.chat(self.repl.messages, text)
             except _Interrupted:
                 repair_interrupted(self.repl.messages)
-                self.bridge.emit("turn_end", status="interrupted", summary="", turns=0)
+                self._emit("turn_end", status="interrupted", summary="", turns=0)
             except Exception as e:  # surface, don't die: the UI owns the terminal
-                self.bridge.emit("turn_end", status="error", summary=str(e), turns=0)
+                self._emit("turn_end", status="error", summary=str(e), turns=0)
             else:
                 # persist the transcript so a /reload respawn can resume it
                 # (the plain REPL does this too; serve never used to)
@@ -260,7 +319,7 @@ class Server:
                     [m.to_dict() for m in self.repl.messages],
                     self.repl.recorder.run_dir,
                 )
-                self.bridge.emit(
+                self._emit(
                     "turn_end",
                     status=result.status,
                     summary=result.summary,
@@ -272,20 +331,20 @@ class Server:
 
     def _command(self, line: str) -> bool | None:
         if self.worker and self.worker.is_alive():
-            self.bridge.emit("command_output", text="busy: wait for the turn to finish")
+            self._emit("command_output", text="busy: wait for the turn to finish")
             return None
         if line.strip() in ("/reload", "/reload-skills"):
             # The serve process can't reload its own code in place — the TUI
             # owns the process and respawns `mha serve` fresh from disk. We
             # hand it the current run_id so the respawn resumes this session
             # via --resume (transcript is persisted after every turn).
-            self.bridge.emit("reload", run_id=self.repl.run_id)
+            self._emit("reload", run_id=self.repl.run_id)
             return None
         if line.strip() == "/model":
             # bare /model is the picker — the UI renders the selectable list
             # and answers with "/model <spec>"
             models, notes = discover_models(self.repl.registry)
-            self.bridge.emit(
+            self._emit(
                 "model_list",
                 current=self.repl.runner.spec.spec,
                 default=self.repl.registry.aliases.get("default"),
@@ -304,10 +363,10 @@ class Server:
             # by forwarding it to _list_sessions via a direct text match.
             sessions = self.repl._list_sessions()
             if not sessions:
-                self.bridge.emit("command_output", text="no past sessions found")
+                self._emit("command_output", text="no past sessions found")
                 return None
             current_id = self.repl.run_id
-            self.bridge.emit(
+            self._emit(
                 "session_list",
                 current=current_id,
                 sessions=[
@@ -323,9 +382,9 @@ class Server:
                 # it. The TUI answers with "/continue <id>".
                 sessions = self.repl._list_sessions()
                 if not sessions:
-                    self.bridge.emit("command_output", text="no past sessions found")
+                    self._emit("command_output", text="no past sessions found")
                     return None
-                self.bridge.emit(
+                self._emit(
                     "session_list",
                     current=self.repl.run_id,
                     sessions=[
@@ -337,13 +396,13 @@ class Server:
             # resume by id — delegate to Repl which loads messages and carries
             # the recorded model.
             self.repl._resume_session(arg)
-            self.bridge.emit("state", model=self.repl.runner.spec.spec)
+            self._emit("state", model=self.repl.runner.spec.spec)
             return None
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             result = self.repl._command(line)
-        self.bridge.emit("command_output", text=buf.getvalue().rstrip())
-        self.bridge.emit("state", model=self.repl.runner.spec.spec)
+        self._emit("command_output", text=buf.getvalue().rstrip())
+        self._emit("state", model=self.repl.runner.spec.spec)
         return result
 
 
