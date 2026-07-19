@@ -10,12 +10,13 @@ from dotenv import load_dotenv
 
 from .activity import attach_printer
 from .context.kg import KG
-from .harness.runner import Runner
-from .harness.session import SessionRecorder, new_run_id
+from .engine.runner import Runner
+from .engine.session import SessionRecorder, new_run_id
 from .llm.ollama import Ollama, OllamaError
 from .llm.registry import Registry
 from .llm.wire.openai_compat import OpenAICompatClient
-from .tools import ToolContext, code_harness_tools
+from .harnesses.code import code_harness_tools
+from .tools import ToolContext
 from .skills import load_skills
 
 
@@ -219,7 +220,7 @@ def _resume_into_repl(repl, run_id: str, registry: "Registry") -> None:
     *old* process's code/skills — strip it so the freshly-loaded runner
     rebuilds a current one on the next turn. Re-applies the session's model
     so the resumed chat keeps running on the same LLM."""
-    from .harness.session import load_messages, read_session_meta
+    from .engine.session import load_messages, read_session_meta
     from .llm.types import Message
 
     sessions_dir = repl.recorder.run_dir.parent

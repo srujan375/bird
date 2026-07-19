@@ -21,9 +21,9 @@ except ImportError:  # Windows lacks readline; completion just won't work
 
 from .activity import attach_printer
 from .context.kg import KG, KGError
-from .harness.compactor import compact, estimate_tokens
-from .harness.runner import Runner, repair_interrupted
-from .harness.session import (
+from .engine.compactor import compact, estimate_tokens
+from .engine.runner import Runner, repair_interrupted
+from .engine.session import (
     MESSAGES_FILE,
     SessionRecorder,
     find_most_recent_session,

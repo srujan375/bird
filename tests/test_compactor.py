@@ -1,4 +1,4 @@
-from mha.harness.compactor import (
+from mha.engine.compactor import (
     compact,
     estimate_tokens,
     needs_compaction,

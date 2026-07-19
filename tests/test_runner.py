@@ -2,10 +2,11 @@ import json
 
 import pytest
 
-from mha.harness.runner import Runner
+from mha.engine.runner import Runner
 from mha.llm.registry import ModelSpec, ProviderConfig, Registry
 from mha.llm.types import LLMResponse, Message, ToolCall, Usage
-from mha.tools import ToolContext, code_harness_tools
+from mha.harnesses.code import code_harness_tools
+from mha.tools import ToolContext
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -318,7 +319,7 @@ def test_no_drift_nudge_without_kg_tool(make_runner):
 
 
 def test_repair_interrupted_answers_dangling_calls():
-    from mha.harness.runner import repair_interrupted
+    from mha.engine.runner import repair_interrupted
 
     messages = [
         Message(role="user", content="go"),
@@ -337,7 +338,7 @@ def test_repair_interrupted_answers_dangling_calls():
 
 
 def test_repair_interrupted_noop_on_clean_transcript():
-    from mha.harness.runner import repair_interrupted
+    from mha.engine.runner import repair_interrupted
 
     messages = [Message(role="user", content="go"), assistant(content="hi")]
     repair_interrupted(messages)

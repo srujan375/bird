@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from mha.tools import BashTool, DoneTool, EditTool, ReadTool, WriteTool, code_harness_tools
+from mha.harnesses.code import code_harness_tools
+from mha.tools import BashTool, DoneTool, EditTool, ReadTool, WriteTool
 from mha.tools.base import ToolContext
 from mha.tools.bash import check_command
 

@@ -19,7 +19,8 @@ from urllib.parse import quote
 import httpx
 import pytest
 
-from mha.tools import WebFetchTool, WebSearchTool, code_harness_tools
+from mha.harnesses.code import code_harness_tools
+from mha.tools import WebFetchTool, WebSearchTool
 from mha.tools.base import ToolContext, ToolError
 
 

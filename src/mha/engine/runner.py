@@ -37,7 +37,9 @@ EXPLORE_NUDGE_TURNS = 6
 KG_DRIFT_NUDGE_SEARCHES = 3
 DRIFT_SEARCH_COMMANDS = {"rg", "grep", "find"}
 
-INSTRUCTIONS_PATH = Path(__file__).with_name("instructions.md")
+# the Code harness's instructions; becomes a Runner parameter when the next
+# harness lands (the engine should not name a harness)
+INSTRUCTIONS_PATH = Path(__file__).parents[1] / "harnesses" / "code" / "instructions.md"
 
 KG_READY_NOTICE = (
     "[system notice] The knowledge graph has finished building — kg_query now "

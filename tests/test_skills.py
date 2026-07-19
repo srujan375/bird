@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from mha.skills import Skill, is_valid_skill_name, load_skills, render_index
-from mha.tools import code_harness_tools
+from mha.harnesses.code import code_harness_tools
 from mha.tools.base import ToolContext
 from mha.tools.skill import SkillTool
 
@@ -208,8 +208,8 @@ def test_all_schemas_under_token_budget():
 def test_repl_completer_builtin_commands(tmp_path):
     """The readline completer returns built-in /commands."""
     from mha.repl import Repl
-    from mha.harness.runner import Runner
-    from mha.harness.session import SessionRecorder
+    from mha.engine.runner import Runner
+    from mha.engine.session import SessionRecorder
     from mha.llm.registry import ModelSpec, ProviderConfig, Registry
     from mha.llm.types import Message, Usage, LLMResponse
     from mha.llm.wire.openai_compat import OpenAICompatClient
@@ -261,8 +261,8 @@ def test_repl_completer_builtin_commands(tmp_path):
 def test_repl_completer_includes_skills(tmp_path):
     """The readline completer includes /<skill-name> alongside built-ins."""
     from mha.repl import Repl
-    from mha.harness.runner import Runner
-    from mha.harness.session import SessionRecorder
+    from mha.engine.runner import Runner
+    from mha.engine.session import SessionRecorder
     from mha.llm.registry import ModelSpec, ProviderConfig, Registry
     from mha.llm.types import Message, Usage, LLMResponse
 
@@ -328,8 +328,8 @@ def test_repl_completer_includes_skills(tmp_path):
 def test_repl_completer_non_slash_returns_none(tmp_path):
     """Non-slash input gets no completion."""
     from mha.repl import Repl
-    from mha.harness.runner import Runner
-    from mha.harness.session import SessionRecorder
+    from mha.engine.runner import Runner
+    from mha.engine.session import SessionRecorder
     from mha.llm.registry import ModelSpec, ProviderConfig, Registry
     from mha.llm.types import Message, Usage, LLMResponse
 
@@ -365,8 +365,8 @@ def test_serve_ready_includes_skills(monkeypatch, tmp_path):
     import threading
     import time
 
-    from mha.harness.runner import Runner
-    from mha.harness.session import SessionRecorder
+    from mha.engine.runner import Runner
+    from mha.engine.session import SessionRecorder
     from mha.llm.registry import ModelSpec, ProviderConfig, Registry
     from mha.llm.types import LLMResponse, Message, Usage
     from mha.repl import Repl

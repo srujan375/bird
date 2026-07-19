@@ -2,10 +2,11 @@ import json
 
 import pytest
 
-from mha.harness.runner import PLAN_TRACKER_PREFIX, Runner
+from mha.engine.runner import PLAN_TRACKER_PREFIX, Runner
 from mha.llm.registry import ModelSpec, ProviderConfig, Registry
 from mha.llm.types import LLMResponse, Message, ToolCall, Usage
-from mha.tools import DoneTool, PlanTool, PlanUpdateTool, ToolContext, code_harness_tools
+from mha.harnesses.code import code_harness_tools
+from mha.tools import DoneTool, PlanTool, PlanUpdateTool, ToolContext
 
 SPEC = ModelSpec(
     spec="fake:model",

@@ -2,12 +2,13 @@ import json
 
 import pytest
 
-from mha.harness.runner import Runner
-from mha.harness.session import SessionRecorder, load_messages
+from mha.engine.runner import Runner
+from mha.engine.session import SessionRecorder, load_messages
 from mha.llm.registry import ModelSpec, ProviderConfig, Registry
 from mha.llm.types import LLMResponse, Message, ToolCall, Usage
 from mha.repl import Repl
-from mha.tools import ToolContext, code_harness_tools
+from mha.harnesses.code import code_harness_tools
+from mha.tools import ToolContext
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -485,7 +486,7 @@ def test_load_messages_falls_back_to_events_jsonl(tmp_path):
     resume those sessions — load_messages reconstructs the user seed from
     run_start.data.task and pulls assistant content from assistant events."""
     import json
-    from mha.harness.session import load_messages
+    from mha.engine.session import load_messages
     run_dir = tmp_path / "legacy_session"
     run_dir.mkdir()
     events = [
@@ -506,7 +507,7 @@ def test_load_messages_missing_events_returns_none(tmp_path):
     """If neither messages.jsonl nor events.jsonl exists, /continue can't
     resume — we must return None so the caller can report a clean error
     rather than fabricate a transcript."""
-    from mha.harness.session import load_messages
+    from mha.engine.session import load_messages
     run_dir = tmp_path / "empty_session"
     run_dir.mkdir()
     assert load_messages(run_dir) is None

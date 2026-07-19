@@ -5,13 +5,14 @@ import queue
 import threading
 import time
 
-from mha.harness.runner import Runner
-from mha.harness.session import SessionRecorder
+from mha.engine.runner import Runner
+from mha.engine.session import SessionRecorder
 from mha.llm.registry import ModelSpec, ProviderConfig, Registry
 from mha.llm.types import LLMResponse, Message, ToolCall, Usage
 from mha.repl import Repl
 from mha.serve import GatedTool, Server, _diff_lines
-from mha.tools import Tool, ToolContext, ToolResult, code_harness_tools
+from mha.harnesses.code import code_harness_tools
+from mha.tools import Tool, ToolContext, ToolResult
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -254,7 +255,7 @@ def test_serve_command(monkeypatch, tmp_path):
 def test_serve_persists_transcript_after_turn(monkeypatch, tmp_path):
     """serve must persist messages.jsonl after a turn so a /reload respawn
     can resume the conversation (it never used to)."""
-    from mha.harness.session import load_messages
+    from mha.engine.session import load_messages
 
     feeder, out, thread = run_server(
         monkeypatch, tmp_path, [Message(role="assistant", content="hello there")]

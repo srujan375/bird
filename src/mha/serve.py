@@ -33,8 +33,8 @@ import sys
 import threading
 from typing import Any
 
-from .harness.runner import repair_interrupted
-from .harness.session import save_messages
+from .engine.runner import repair_interrupted
+from .engine.session import save_messages
 from .llm.discovery import discover_models
 from .repl import Repl
 from .tools import Tool, ToolContext, ToolResult
