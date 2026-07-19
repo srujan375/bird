@@ -47,7 +47,10 @@ def discover_models(
 
     provider = registry.providers.get("ollama")
     if provider is not None:
-        client = ollama or Ollama(provider.native_url or DEFAULT_NATIVE_URL)
+        client = ollama or Ollama(
+            provider.native_url or DEFAULT_NATIVE_URL,
+            api_key_env=provider.api_key_env,
+        )
         try:
             if client.is_up():
                 for name in sorted(client.local_models()):

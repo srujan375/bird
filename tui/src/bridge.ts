@@ -9,7 +9,7 @@ export interface DiffLine {
 }
 
 export type ServerMessage =
-	| { type: "ready"; model: string; kg: boolean; kg_ready: boolean; run_id: string; repo: string }
+	| { type: "ready"; model: string; kg: boolean; kg_ready: boolean; run_id: string; repo: string; skills: { name: string; description: string; source: string }[] }
 	| { type: "harness_event"; event: string; data: Record<string, unknown> }
 	| ({ type: "permission_request"; id: number } & (
 			| { kind: "bash"; cmd: string }
@@ -23,8 +23,14 @@ export type ServerMessage =
 			models: { spec: string; source: string; context_window: number | null }[];
 			notes: string[];
 	  }
+	| {
+			type: "session_list";
+			current: string;
+			sessions: { id: string; name: string; last_event: string }[];
+	  }
 	| { type: "turn_end"; status: string; summary: string; turns: number }
 	| { type: "command_output"; text: string }
+	| { type: "reload"; run_id: string }
 	| { type: "error"; message: string }
 	| { type: "bye" };
 
@@ -52,17 +58,28 @@ function findPython(repo: string): string {
 export class Bridge {
 	private proc: ChildProcessWithoutNullStreams;
 	private buffer = "";
+	private opts: BridgeOptions;
 
 	constructor(opts: BridgeOptions) {
-		const args = ["-m", "mha", "serve", "--repo", opts.repo];
-		if (opts.model) args.push("--model", opts.model);
-		if (opts.noKg) args.push("--no-kg");
-		this.proc = spawn(findPython(opts.repo), args, {
-			cwd: opts.repo,
+		this.opts = opts;
+		this.proc = this.spawn();
+	}
+
+	private serveArgs(resume?: string): string[] {
+		const args = ["-m", "mha", "serve", "--repo", this.opts.repo];
+		if (this.opts.model) args.push("--model", this.opts.model);
+		if (this.opts.noKg) args.push("--no-kg");
+		if (resume) args.push("--resume", resume);
+		return args;
+	}
+
+	private spawn(resume?: string): ChildProcessWithoutNullStreams {
+		const proc = spawn(findPython(this.opts.repo), this.serveArgs(resume), {
+			cwd: this.opts.repo,
 			env: process.env,
 		});
-		this.proc.stdout.setEncoding("utf-8");
-		this.proc.stdout.on("data", (chunk: string) => {
+		proc.stdout.setEncoding("utf-8");
+		proc.stdout.on("data", (chunk: string) => {
 			this.buffer += chunk;
 			let nl: number;
 			while ((nl = this.buffer.indexOf("\n")) >= 0) {
@@ -70,21 +87,54 @@ export class Bridge {
 				this.buffer = this.buffer.slice(nl + 1);
 				if (!line) continue;
 				try {
-					opts.onMessage(JSON.parse(line) as ServerMessage);
+					this.opts.onMessage(JSON.parse(line) as ServerMessage);
 				} catch {
-					opts.onStderr(line);
+					this.opts.onStderr(line);
 				}
 			}
 		});
-		this.proc.stderr.setEncoding("utf-8");
-		this.proc.stderr.on("data", (chunk: string) => {
-			for (const line of chunk.split("\n")) if (line.trim()) opts.onStderr(line.trim());
+		proc.stderr.setEncoding("utf-8");
+		proc.stderr.on("data", (chunk: string) => {
+			for (const line of chunk.split("\n")) if (line.trim()) this.opts.onStderr(line.trim());
 		});
-		this.proc.on("exit", (code) => opts.onExit(code));
-		this.proc.on("error", (err) => {
-			opts.onStderr(`failed to start mha serve: ${err.message}`);
-			opts.onExit(1);
+		// During a restart we manage the lifecycle ourselves (see restart()),
+		// so suppress the default onExit handler that would shut the TUI down.
+		proc.on("exit", (code) => {
+			if (this.restarting) return;
+			this.opts.onExit(code);
 		});
+		proc.on("error", (err) => {
+			if (this.restarting) {
+				this.opts.onStderr(`failed to restart mha serve: ${err.message}`);
+				return;
+			}
+			this.opts.onStderr(`failed to start mha serve: ${err.message}`);
+			this.opts.onExit(1);
+		});
+		return proc;
+	}
+
+	private restarting = false;
+
+	/** Respawn `mha serve` fresh from disk, resuming `runId`'s transcript.
+	 * Used by /reload so code/skill/tool changes take effect without a new
+	 * terminal session. The old process is killed; the new one reuses the
+	 * same onMessage/onStderr handlers. */
+	restart(runId: string): void {
+		this.restarting = true;
+		try {
+			this.buffer = "";
+			// close stdin so the old process drains and exits; then kill to be sure
+			this.proc.stdin.end();
+			try {
+				this.proc.kill("SIGTERM");
+			} catch {
+				/* already dead */
+			}
+			this.proc = this.spawn(runId);
+		} finally {
+			this.restarting = false;
+		}
 	}
 
 	private send(obj: Record<string, unknown>): void {

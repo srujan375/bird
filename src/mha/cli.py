@@ -16,6 +16,7 @@ from .llm.ollama import Ollama, OllamaError
 from .llm.registry import Registry
 from .llm.wire.openai_compat import OpenAICompatClient
 from .tools import ToolContext, code_harness_tools
+from .skills import load_skills
 
 
 def _add_common(p) -> None:
@@ -24,6 +25,12 @@ def _add_common(p) -> None:
     p.add_argument("--no-kg", action="store_true", help="control arm: no kg_query tool")
     p.add_argument("--max-turns", type=int, default=40)
     p.add_argument("--models-json", default=None, help="path to a models.json override")
+    p.add_argument(
+        "--resume",
+        default=None,
+        metavar="RUN_ID",
+        help="resume a previous session by run-id (loads its transcript + model)",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,7 +114,10 @@ def _setup(args):
 
     if spec.provider.name == "ollama":
         try:
-            Ollama(spec.provider.native_url or "http://localhost:11434").ensure(spec.model)
+            Ollama(
+                spec.provider.native_url or "http://localhost:11434",
+                api_key_env=spec.provider.api_key_env,
+            ).ensure(spec.model)
         except OllamaError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -124,7 +134,13 @@ def _setup(args):
 
 def _make_runner(args, registry, spec, kg, recorder) -> Runner:
     repo_root = Path(args.repo).resolve()
-    ctx = ToolContext(repo_root=repo_root, kg=kg, record=recorder.event)
+    ctx = ToolContext(
+        repo_root=repo_root,
+        kg=kg,
+        record=recorder.event,
+        client=OpenAICompatClient(),
+        skills=load_skills(repo_root),
+    )
     return Runner(
         spec=spec,
         client=OpenAICompatClient(),
@@ -167,7 +183,13 @@ def _chat_main(args) -> int:
 
     with SessionRecorder(run_dir) as recorder:
         runner = _make_runner(args, registry, spec, kg, recorder)
-        return Repl(runner, registry, kg, recorder, run_id).run()
+        repl = Repl(runner, registry, kg, recorder, run_id)
+        # /reload re-execs `mha chat --resume <run_id>: load the prior session's
+        # transcript + model so the conversation continues on freshly-loaded
+        # code/skills without losing history.
+        if getattr(args, "resume", None):
+            _resume_into_repl(repl, args.resume, registry)
+        return repl.run()
 
 
 def _serve_main(args) -> int:
@@ -181,7 +203,49 @@ def _serve_main(args) -> int:
 
     with SessionRecorder(run_dir) as recorder:
         runner = _make_runner(args, registry, spec, kg, recorder)
-        return serve(Repl(runner, registry, kg, recorder, run_id))
+        repl = Repl(runner, registry, kg, recorder, run_id)
+        # /reload respawns `mha serve` with --resume <old_run_id>: load the
+        # previous session's transcript + model so the conversation continues
+        # on freshly-loaded code/skills without losing history.
+        if getattr(args, "resume", None):
+            _resume_into_repl(repl, args.resume, registry)
+        return serve(repl)
+
+
+def _resume_into_repl(repl, run_id: str, registry: "Registry") -> None:
+    """Load a prior session's transcript into an existing Repl.
+
+    The saved transcript's first message is a system prompt built from the
+    *old* process's code/skills — strip it so the freshly-loaded runner
+    rebuilds a current one on the next turn. Re-applies the session's model
+    so the resumed chat keeps running on the same LLM."""
+    from .harness.session import load_messages, read_session_meta
+    from .llm.types import Message
+
+    sessions_dir = repl.recorder.run_dir.parent
+    target = None
+    for entry in sorted(sessions_dir.iterdir(), key=lambda p: p.stat().st_mtime):
+        if entry.name == run_id or entry.name.startswith(run_id + "-"):
+            target = entry
+            break
+    if target is None:
+        return  # nothing to resume — start fresh
+    rows = load_messages(target)
+    if not rows:
+        return
+    msgs = [Message.from_dict(r) for r in rows]
+    # drop the stale system prompt; the new runner regenerates it
+    if msgs and msgs[0].role == "system":
+        msgs = msgs[1:]
+    repl.messages = msgs
+    repl.recorder.event("resume", {"from": target.name, "messages": len(msgs), "via": "reload"})
+    # re-apply the session's recorded model
+    recorded = read_session_meta(target).get("model")
+    if recorded and recorded != repl.runner.spec.spec:
+        try:
+            repl.runner.spec = registry.resolve(recorded)
+        except Exception:
+            pass  # keep the current model if the recorded one is unavailable
 
 
 def _tui_dir() -> Path | None:

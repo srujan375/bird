@@ -18,6 +18,7 @@ from ..llm.types import Message, Usage
 from ..llm.validate import validate_tool_call
 from ..llm.wire.openai_compat import OnDelta, OpenAICompatClient
 from ..tools import Tool, ToolContext
+from ..skills import render_index
 from .compactor import compact, needs_compaction
 
 MAX_TURNS = 40
@@ -202,6 +203,8 @@ class Runner:
             except Exception:
                 orientation = ""
         parts.append(orientation or _shallow_tree(self.ctx.repo_root))
+        if self.ctx.skills:
+            parts.append(render_index(self.ctx.skills))
         return "\n\n".join(p for p in parts if p)
 
     @staticmethod

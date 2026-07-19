@@ -93,15 +93,58 @@ def save_messages(messages: list[dict[str, Any]], run_dir: Path) -> None:
 
 def load_messages(run_dir: Path) -> list[dict[str, Any]] | None:
     """Load a persisted conversation transcript. Returns None if not found
-    or unreadable."""
+    or unreadable. Falls back to reconstructing from events.jsonl for
+    sessions recorded by older mha versions that didn't separate the
+    message log from events."""
     path = run_dir / MESSAGES_FILE
-    if not path.is_file():
+    if path.is_file():
+        try:
+            with open(path, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+            if rows:
+                return rows
+        except (json.JSONDecodeError, OSError):
+            pass
+    return _load_messages_from_events(run_dir)
+
+
+def _load_messages_from_events(run_dir: Path) -> list[dict[str, Any]] | None:
+    """Reconstruct a transcript from events.jsonl for legacy sessions that
+    never wrote messages.jsonl. Returns None if events.jsonl is missing,
+    empty, or contains no reconstructable user/assistant turns.
+
+    Reconstruction is best-effort: run_start.data.task becomes the first
+    user message, and each assistant event becomes an assistant message.
+    No tool_calls survive — older sessions didn't record them on the
+    assistant message anyway, and the resume path can't replay them."""
+    events_path = run_dir / "events.jsonl"
+    if not events_path.is_file():
         return None
+    messages: list[dict[str, Any]] = []
+    saw_user = False
     try:
-        with open(path, encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
+        with open(events_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                rtype = rec.get("type")
+                data = rec.get("data") or {}
+                if rtype == "run_start":
+                    task = (data.get("task") or "").strip()
+                    if task:
+                        messages.append({"role": "user", "content": task})
+                        saw_user = True
+                elif rtype == "assistant":
+                    content = (data.get("content") or "").strip()
+                    if content:
+                        messages.append({"role": "assistant", "content": content})
     except (json.JSONDecodeError, OSError):
         return None
+    # require at least the user seed from run_start, otherwise the session
+    # never really started and we'd be inventing a transcript
+    return messages if saw_user else None
 
 
 def list_sessions(sessions_dir: Path | None = None) -> list[dict[str, Any]]:

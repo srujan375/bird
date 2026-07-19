@@ -41,6 +41,8 @@ class ToolContext:
     plan: Any | None = None  # tools.plan.PlanState once the model calls plan
     record: Callable[[str, dict], None] | None = None  # session event sink
     bash_categories: tuple[str, ...] = ("search", "test", "lint", "git_read")
+    client: Any | None = None  # llm.wire.openai_compat.OpenAICompatClient — used by web_fetch to ask the model
+    skills: list[Any] | None = None  # skills.Skill list; None = no skills loaded
 
     def emit(self, event_type: str, data: dict[str, Any]) -> None:
         if self.record:

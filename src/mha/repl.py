@@ -9,9 +9,15 @@ mid-session without losing history — pi's cross-provider handoff.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sys
 from pathlib import Path
+
+try:
+    import readline
+except ImportError:  # Windows lacks readline; completion just won't work
+    readline = None
 
 from .activity import attach_printer
 from .context.kg import KG, KGError
@@ -44,8 +50,12 @@ Type a task in plain language, or a command:
   /tools                list the harness tools
   /compact              compact the conversation now
   /clear                start a fresh conversation (same session log)
+  /reload               respawn mha with the latest code/skills, resuming
+                        this session (no need to open a new terminal)
   /session              show session id and paths
-  /sessions             list all past sessions with auto-generated names
+  /sessions [filter]    list past sessions with names; on a tty, prompt to
+                        resume the picked one (filter by substring of name
+                        or id to narrow the list first)
   /continue <id>        resume a previous session by its run-id or name
   /rename <name>        give this session a human label (visible in /sessions)
   /quit                 exit (also: /exit, Ctrl-D)"""
@@ -78,6 +88,7 @@ class Repl:
     def run(self) -> int:
         self.runner.on_delta = self._print_delta
         attach_printer(self.runner.ctx)  # `› tool …` headers while the agent works
+        self._setup_completion()
         # `mha` with no args feels like a continuation of whatever the user was
         # last doing — same chat, same model. An accepted resume announces
         # itself, so only a fresh session needs the banner.
@@ -98,6 +109,38 @@ class Repl:
                     return 0
                 continue
             self._turn(line)
+
+    # Built-in slash commands that always take priority over skill names.
+    # Kept in sync with HELP and _command(); a skill named "model" would be
+    # unreachable via /model, so these are reserved.
+    BUILTIN_COMMANDS = (
+        "/help", "/model", "/kg", "/tools", "/skills", "/compact",
+        "/clear", "/reload", "/session", "/sessions", "/continue", "/rename",
+        "/quit", "/exit",
+    )
+
+    def _setup_completion(self) -> None:
+        """Wire readline Tab completion for /commands and /<skill-name>.
+
+        Only active when the readline module is available (not on Windows
+        unless pyreadline is installed). Completion triggers on Tab after
+        typing / — e.g. `/com<Tab>` expands to /continue, or
+        `/skill-<Tab>` to /skill-creator."""
+        if readline is None:
+            return
+        skills = self.runner.ctx.skills or []
+
+        def completer(text: str, state: int) -> str | None:
+            if not text.startswith("/"):
+                return None
+            candidates = list(self.BUILTIN_COMMANDS)
+            candidates.extend(f"/{s.name}" for s in skills)
+            matches = sorted(c for c in candidates if c.startswith(text))
+            return matches[state] if state < len(matches) else None
+
+        readline.set_completer(completer)
+        readline.set_completer_delims(" \t\n")
+        readline.parse_and_bind("tab: complete")
 
     def _welcome_banner(self) -> str:
         """The first thing the user sees. A session's auto-derived name (from
@@ -143,6 +186,10 @@ class Repl:
         elif cmd == "/tools":
             for t in self.runner.tools.values():
                 print(f"  {t.name:10s} {t.description.split('.')[0]}.")
+        elif cmd == "/skills":
+            self._cmd_skills()
+        elif self._is_skill_command(cmd):
+            self._invoke_skill(cmd[1:], arg)
         elif cmd == "/compact":
             before = estimate_tokens(self.messages)
             self.messages[:] = compact(
@@ -154,6 +201,8 @@ class Repl:
             self.messages.clear()
             self.recorder.event("clear", {})
             print("conversation cleared")
+        elif cmd == "/reload":
+            self._cmd_reload()
         elif cmd == "/session":
             print(f"session {self.run_id}")
             print(f"  events: {self.recorder.run_dir / 'events.jsonl'}")
@@ -161,27 +210,11 @@ class Repl:
                 print(f"  kg:     {self.kg.out_dir}")
             print(f"  ~{estimate_tokens(self.messages)} tokens in context")
         elif cmd == "/sessions":
-            self._cmd_sessions("")
+            self._cmd_sessions(arg)
         elif cmd.startswith("/continue"):
             arg = line[len("/continue"):].strip()
             if not arg:
-                # show the list first, then prompt for a pick
-                sessions = self._list_sessions()
-                if not sessions:
-                    print("no past sessions found")
-                    return None
-                print(f"past sessions ({len(sessions)}):")
-                for i, s in enumerate(sessions, 1):
-                    marker = "*" if s["id"] == self.run_id else " "
-                    print(f" {marker}{i:3d}. [{s['id']}] {s['name']}")
-                try:
-                    choice = input("continue # (empty to cancel): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    return None
-                if not choice or not choice.isdigit() or not 1 <= int(choice) <= len(sessions):
-                    print(f"not a listed number: {choice!r}")
-                    return None
-                self._resume_session(sessions[int(choice) - 1]["id"])
+                self._session_picker()
             else:
                 self._resume_session(arg)
         elif cmd.startswith("/rename"):
@@ -194,6 +227,71 @@ class Repl:
         else:
             print(f"unknown command {cmd} — /help lists commands")
         return None
+
+    def _is_skill_command(self, cmd: str) -> bool:
+        """True when `cmd` (e.g. '/commit-style') names a loaded skill."""
+        if not cmd.startswith("/"):
+            return False
+        name = cmd[1:]
+        skills = self.runner.ctx.skills or []
+        return any(s.name == name for s in skills)
+
+    def _invoke_skill(self, name: str, args: str) -> None:
+        """Load a skill's body into the conversation as a user turn.
+
+        The skill instructions are sent as the user message so the agent
+        follows them for the current task. Optional `args` after the command
+        are appended as the actual task (pi's `/skill:name <args>` pattern)."""
+        skills = self.runner.ctx.skills or []
+        sk = next((s for s in skills if s.name == name), None)
+        if sk is None:
+            print(f"no skill named {name!r} — /skills lists available skills")
+            return
+        self.recorder.event("skill_invoked", {"name": name, "source": sk.source, "args": args})
+        if args:
+            prompt = f"Use the {name} skill for the following task:\n\n{sk.body}\n\nTask: {args}"
+        else:
+            prompt = f"Use the {name} skill:\n\n{sk.body}"
+        self._turn(prompt)
+
+    def _cmd_skills(self) -> None:
+        """List available skills (name + description), mirroring /tools."""
+        skills = self.runner.ctx.skills or []
+        if not skills:
+            print("no skills available")
+            return
+        print(f"skills ({len(skills)}):")
+        for s in skills:
+            tag = f"  [{s.source}]" if s.source != "project" else ""
+            print(f"  /{s.name:20s} {s.description}{tag}")
+
+    def _cmd_reload(self) -> None:
+        """Respawn mha with the latest code/skills, resuming this session.
+
+        The plain REPL is a single process, so reload = re-exec: persist the
+        transcript (in case the last action wasn't a turn, e.g. right after
+        /clear or /model), then replace this process with a fresh `mha chat`
+        that resumes the current run-id. The new process re-imports every
+        module from disk, so code/skill/tool/instruction changes all take
+        effect — no new terminal needed."""
+        save_messages(
+            [m.to_dict() for m in self.messages],
+            self.recorder.run_dir,
+        )
+        self.recorder.event("reload", {"run_id": self.run_id})
+        self.recorder.close()
+        # re-exec: keep the same interpreter, re-run `mha chat` with --resume.
+        # sys.argv[0] is the mha entrypoint under `python -m mha`; fall back to
+        # the running interpreter + `-m mha` so it works either way.
+        exe = sys.executable
+        args = [exe, "-m", "mha", "chat", "--resume", self.run_id]
+        # carry over the repo so the resumed session lands in the same place
+        args += ["--repo", str(self.runner.ctx.repo_root)]
+        # preserve the current model if the user switched mid-session
+        if self.runner.spec.spec != self.registry.aliases.get("default"):
+            args += ["--model", self.runner.spec.spec]
+        print(f"↻ reloading mha — resuming session {self.run_id} …")
+        os.execv(exe, args)
 
     def _cmd_model(self, arg: str) -> None:
         if not arg:
@@ -478,7 +576,46 @@ class Repl:
         return False
 
     def _cmd_sessions(self, arg: str) -> None:
-        """List all past sessions with their auto-generated names."""
+        """List all past sessions with their auto-generated names. With a
+        non-empty arg, filter the list by substring (case-insensitive). On a
+        tty, after listing, offer an interactive picker so the user can
+        resume a session without typing /continue."""
+        sessions = self._list_sessions()
+        if not sessions:
+            print("no past sessions found")
+            return
+        if arg:
+            needle = arg.lower()
+            sessions = [s for s in sessions if needle in s["name"].lower() or needle in s["id"].lower()]
+            if not sessions:
+                print(f"no sessions match {arg!r}")
+                return
+        print(f"past sessions ({len(sessions)}):")
+        width = max((len(s["id"]) for s in sessions), default=0)
+        for i, s in enumerate(sessions, 1):
+            marker = "*" if s["id"] == self.run_id else " "
+            last = f"  | {s['last_event']}" if s["last_event"] else ""
+            print(f" {marker}{i:3d}. [{s['id']:<{width}}] {s['name']}{last}")
+        if not getattr(sys.stdin, "isatty", lambda: False)():
+            print("resume with /continue <id|#>")
+            return
+        try:
+            choice = input("resume # (empty to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not choice:
+            return
+        if not choice.isdigit() or not 1 <= int(choice) <= len(sessions):
+            print(f"not a listed number: {choice!r}")
+            return
+        self._resume_session(sessions[int(choice) - 1]["id"])
+
+    def _session_picker(self) -> None:
+        """Shared /continue picker. Lists past sessions and resumes the
+        user's pick; mirrors the model picker's tty-only prompt so CI never
+        hangs. Returns silently when there's nothing to pick or the user
+        cancels."""
         sessions = self._list_sessions()
         if not sessions:
             print("no past sessions found")
@@ -487,3 +624,17 @@ class Repl:
         for i, s in enumerate(sessions, 1):
             marker = "*" if s["id"] == self.run_id else " "
             print(f" {marker}{i:3d}. [{s['id']}] {s['name']}")
+        if not getattr(sys.stdin, "isatty", lambda: False)():
+            print("pick with /continue <id|#>")
+            return
+        try:
+            choice = input("continue # (empty to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not choice:
+            return
+        if not choice.isdigit() or not 1 <= int(choice) <= len(sessions):
+            print(f"not a listed number: {choice!r}")
+            return
+        self._resume_session(sessions[int(choice) - 1]["id"])

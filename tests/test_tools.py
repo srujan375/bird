@@ -154,13 +154,30 @@ def test_done(ctx):
 
 def test_all_schemas_under_token_budget():
     tools = code_harness_tools(with_kg=True)
-    assert len(tools) == 8
+    assert len(tools) == 11
     wire = json.dumps([t.spec().to_openai() for t in tools])
     approx_tokens = len(wire) / 4
-    assert approx_tokens < 1200, f"schemas ≈ {approx_tokens:.0f} tokens, budget is 1200"
+    # 1600 covers the 11-tool toolset including WebSearch + WebFetch + skill
+    # (~100 tokens added when web tools landed; skill is tiny). The /4
+    # heuristic is loose; the guardrail exists to keep per-turn schema
+    # overhead from eating small-model context windows, not as a hard wall.
+    assert approx_tokens < 1600, f"schemas ≈ {approx_tokens:.0f} tokens, budget is 1600"
 
 
 def test_control_arm_has_no_kg_query():
     names = [t.name for t in code_harness_tools(with_kg=False)]
     assert "kg_query" not in names
-    assert names == ["read", "edit", "write", "bash", "plan", "plan_update", "done"]
+    assert names == [
+        "read", "edit", "write", "bash",
+        "WebSearch", "WebFetch",
+        "plan", "plan_update", "skill", "done",
+    ]
+
+
+def test_offline_control_arm_strips_web_too():
+    # `with_web=False` is the offline-eval knob (no network egress at all).
+    names = [t.name for t in code_harness_tools(with_kg=False, with_web=False)]
+    assert "WebSearch" not in names
+    assert "WebFetch" not in names
+    assert "kg_query" not in names
+    assert names == ["read", "edit", "write", "bash", "plan", "plan_update", "skill", "done"]

@@ -20,7 +20,13 @@ Rules:
 - `bash` allows only read-only search, test runs, linters, and git reads.
 - Verify your change (run tests if available), then call `done` with a short
   summary. You MUST end by calling `done` — never just stop. `done` is
-  blocked while plan steps are still open.
+  `blocked while plan steps are still open.
+- Skills are reusable procedures. The system prompt lists available skills
+  by name with a one-line description under `[skills]`. When a task matches
+  a skill, call `skill {"name": "<skill>"}` to load its full instructions,
+  then follow them. Skills are progressive disclosure — only the index is
+  always in context; the body loads on demand. Prefer a skill over
+  restating a procedure from memory.
 
 Example — find and fix (single edit, no plan needed):
 kg_query {"question": "where is user login handled"}

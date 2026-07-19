@@ -249,3 +249,36 @@ def test_serve_command(monkeypatch, tmp_path):
     feeder.put({"type": "command", "line": "/quit"})
     out.wait_for("bye")
     thread.join(timeout=5)
+
+
+def test_serve_persists_transcript_after_turn(monkeypatch, tmp_path):
+    """serve must persist messages.jsonl after a turn so a /reload respawn
+    can resume the conversation (it never used to)."""
+    from mha.harness.session import load_messages
+
+    feeder, out, thread = run_server(
+        monkeypatch, tmp_path, [Message(role="assistant", content="hello there")]
+    )
+    out.wait_for("ready")
+    feeder.put({"type": "user_input", "text": "hi"})
+    out.wait_for("turn_end")
+    # give the worker a beat to finish writing
+    time.sleep(0.1)
+    rows = load_messages(make_repl(tmp_path, []).recorder.run_dir)
+    assert rows is not None and len(rows) >= 2
+    roles = [r["role"] for r in rows]
+    assert "user" in roles and "assistant" in roles
+    feeder.close()
+    thread.join(timeout=5)
+
+
+def test_serve_reload_emits_run_id(monkeypatch, tmp_path):
+    """/reload asks the UI to respawn serve, handing back the current run_id
+    so the new process can --resume this session."""
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [])
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/reload"})
+    msg = out.wait_for("reload")
+    assert msg["run_id"] == "t"  # make_repl uses run_id="t"
+    feeder.close()
+    thread.join(timeout=5)

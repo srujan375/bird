@@ -34,6 +34,7 @@ import threading
 from typing import Any
 
 from .harness.runner import repair_interrupted
+from .harness.session import save_messages
 from .llm.discovery import discover_models
 from .repl import Repl
 from .tools import Tool, ToolContext, ToolResult
@@ -204,6 +205,10 @@ class Server:
             kg_ready=bool(repl.kg and repl.kg.is_ready()),
             run_id=repl.run_id,
             repo=str(repl.runner.ctx.repo_root),
+            skills=[
+                {"name": s.name, "description": s.description, "source": s.source}
+                for s in (repl.runner.ctx.skills or [])
+            ],
         )
         for raw in sys.stdin:
             raw = raw.strip()
@@ -249,6 +254,12 @@ class Server:
             except Exception as e:  # surface, don't die: the UI owns the terminal
                 self.bridge.emit("turn_end", status="error", summary=str(e), turns=0)
             else:
+                # persist the transcript so a /reload respawn can resume it
+                # (the plain REPL does this too; serve never used to)
+                save_messages(
+                    [m.to_dict() for m in self.repl.messages],
+                    self.repl.recorder.run_dir,
+                )
                 self.bridge.emit(
                     "turn_end",
                     status=result.status,
@@ -262,6 +273,13 @@ class Server:
     def _command(self, line: str) -> bool | None:
         if self.worker and self.worker.is_alive():
             self.bridge.emit("command_output", text="busy: wait for the turn to finish")
+            return None
+        if line.strip() in ("/reload", "/reload-skills"):
+            # The serve process can't reload its own code in place — the TUI
+            # owns the process and respawns `mha serve` fresh from disk. We
+            # hand it the current run_id so the respawn resumes this session
+            # via --resume (transcript is persisted after every turn).
+            self.bridge.emit("reload", run_id=self.repl.run_id)
             return None
         if line.strip() == "/model":
             # bare /model is the picker — the UI renders the selectable list
@@ -279,44 +297,48 @@ class Server:
             )
             return None
         if line.strip() == "/sessions":
-            # delegate to Repl's session listing — it scans .mha/sessions/ and
-            # derives human-readable names from the first user message
+            # bare /sessions is the picker — the UI renders the selectable list
+            # and answers with "/continue <id>". Mirrors /model: the REPL has
+            # the data, but a JSON bridge can't prompt; the TUI does the
+            # interactive picking. We also handle an optional substring filter
+            # by forwarding it to _list_sessions via a direct text match.
             sessions = self.repl._list_sessions()
             if not sessions:
                 self.bridge.emit("command_output", text="no past sessions found")
-            else:
-                for i, s in enumerate(sessions, 1):
-                    marker = "*" if s["name"] == self.repl.run_id else " "
-                    self.bridge.emit(
-                        "command_output",
-                        text=f" {marker}{i:3d}. [{s['id']}] {s['name']}",
-                    )
+                return None
+            current_id = self.repl.run_id
+            self.bridge.emit(
+                "session_list",
+                current=current_id,
+                sessions=[
+                    {"id": s["id"], "name": s["name"], "last_event": s["last_event"]}
+                    for s in sessions
+                ],
+            )
             return None
         if line.startswith("/continue"):
             arg = line[len("/continue"):].strip()
             if not arg:
-                # show the list first, then prompt for a pick
+                # bare /continue: emit the same picker so the TUI can render
+                # it. The TUI answers with "/continue <id>".
                 sessions = self.repl._list_sessions()
                 if not sessions:
                     self.bridge.emit("command_output", text="no past sessions found")
-                else:
-                    for i, s in enumerate(sessions, 1):
-                        marker = "*" if s["name"] == self.repl.run_id else " "
-                        self.bridge.emit(
-                            "command_output",
-                            text=f" {marker}{i:3d}. [{s['id']}] {s['name']}",
-                        )
-                    # ask the user which one to resume — we need a way to get input
-                    # back from the TUI; for now emit a placeholder and let the UI handle it
-                    self.bridge.emit(
-                        "command_output",
-                        text="pick a session number above, or use /continue <id>",
-                    )
+                    return None
+                self.bridge.emit(
+                    "session_list",
+                    current=self.repl.run_id,
+                    sessions=[
+                        {"id": s["id"], "name": s["name"], "last_event": s["last_event"]}
+                        for s in sessions
+                    ],
+                )
                 return None
-            else:
-                # resume by id — delegate to Repl which loads messages and starts fresh
-                self.repl._resume_session(arg)
-                return None
+            # resume by id — delegate to Repl which loads messages and carries
+            # the recorded model.
+            self.repl._resume_session(arg)
+            self.bridge.emit("state", model=self.repl.runner.spec.spec)
+            return None
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             result = self.repl._command(line)

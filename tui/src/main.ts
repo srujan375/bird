@@ -20,6 +20,7 @@ import {
 	Notice,
 	PermissionCard,
 	type PermissionSpec,
+	SessionPicker,
 	Thinking,
 	UserMessage,
 } from "./components.ts";
@@ -47,14 +48,17 @@ function tildify(p: string): string {
 	return p.startsWith(home) ? "~" + p.slice(home.length) : p;
 }
 
-// Mirrors mha's REPL commands (src/mha/repl.py)
+// Mirrors mha's REPL commands (src/mha/repl.py). Skill names from the server
+// are merged in at runtime when the "ready" message arrives (below).
 const SLASH_COMMANDS = [
 	{ name: "help", description: "list commands" },
 	{ name: "model", description: "pick from available models (sets default)" },
 	{ name: "kg", description: "knowledge graph status / build / query" },
 	{ name: "tools", description: "list available tools" },
+	{ name: "skills", description: "list available skills" },
 	{ name: "compact", description: "compact conversation history" },
 	{ name: "clear", description: "start a fresh conversation" },
+	{ name: "reload", description: "respawn mha with latest code/skills (resume this session)" },
 	{ name: "session", description: "show session info" },
 	{ name: "sessions", description: "list all past sessions with names" },
 	{ name: "continue", description: "resume a previous session" },
@@ -167,6 +171,17 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 			setModel(msg.model);
 			const kgNote = msg.kg ? (msg.kg_ready ? "kg ready" : "kg building in background") : "kg off";
 			addToChat(new Notice(`connected · session ${msg.run_id} · ${kgNote}`));
+			// Merge skill names from the server into the autocomplete dropdown
+			// so /<skill-name> appears alongside built-in /commands. The
+			// provider's command list is private, so we rebuild the provider
+			// with built-ins + skills and swap it onto the editor.
+			if (msg.skills?.length) {
+				const skillCmds = msg.skills.map((s) => ({
+					name: s.name,
+					description: s.description || `[${s.source} skill]`,
+				}));
+				editor.setAutocompleteProvider(new CombinedAutocompleteProvider([...SLASH_COMMANDS, ...skillCmds], repo));
+			}
 			break;
 		}
 		case "state":
@@ -205,6 +220,14 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 		case "permission_request": {
 			const spec: PermissionSpec =
 				msg.kind === "bash" ? { kind: "bash", cmd: msg.cmd } : { kind: msg.kind, file: msg.file, lines: msg.lines };
+			// auto-approve mode: skip the card and approve immediately, like
+			// Claude Code's "auto-accept edits" (Shift+Tab). Only edit/write are
+			// gated by the server, so this is exactly the safe subset.
+			if (hint.getAutoApprove()) {
+				bridge?.permission(msg.id, true);
+				addToChat(new Notice(`✓ auto-approved ${msg.kind}`, "success"));
+				break;
+			}
 			const card = new PermissionCard(spec);
 			card.onResolve = (r) => {
 				bridge?.permission(msg.id, r === "approved");
@@ -248,9 +271,36 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 			tui.requestRender();
 			break;
 		}
+		case "session_list": {
+			const picker = new SessionPicker(msg.sessions, msg.current);
+			picker.onDone = (id) => {
+				chat.removeChild(picker);
+				chat.removeChild(pickerSpacer);
+				tui.setFocus(editor);
+				if (id) bridge?.command(`/continue ${id}`);
+				tui.requestRender();
+			};
+			const pickerSpacer = new Spacer(1);
+			chat.addChild(picker);
+			chat.addChild(pickerSpacer);
+			tui.setFocus(picker);
+			tui.requestRender();
+			break;
+		}
 		case "command_output":
 			if (msg.text) addToChat(new Notice(msg.text));
 			break;
+		case "reload": {
+			// serve asked us to respawn it fresh from disk, resuming this
+			// session's transcript so code/skill/tool changes take effect
+			// without a new terminal session.
+			const rid = msg.run_id;
+			addToChat(new Notice("↻ reloading mha — respawning serve with latest code/skills…", "accent"));
+			busy = false;
+			hideThinking();
+			bridge?.restart(rid);
+			break;
+		}
 		case "error":
 			addToChat(new Notice(`⚠ ${msg.message}`, "danger"));
 			break;
@@ -332,6 +382,15 @@ tui.setFocus(editor);
 
 tui.addInputListener((data) => {
 	if (matchesKey(data, Key.ctrl("c"))) shutdown(0);
+	// Shift+Tab toggles auto-approve mode (Claude Code / pi style). Works in any
+	// focus state because it's a global listener that runs before the focused
+	// component. Returns consume:true so the editor never sees the chord.
+	if (matchesKey(data, Key.shift("tab"))) {
+		hint.setAutoApprove(!hint.getAutoApprove());
+		addToChat(new Notice(hint.getAutoApprove() ? "⇧⇥ auto-approve ON — edits applied without asking" : "⇧⇥ auto-approve OFF — each edit asks", hint.getAutoApprove() ? "accent" : "muted"));
+		tui.requestRender();
+		return { consume: true };
+	}
 });
 
 tui.start();

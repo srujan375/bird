@@ -375,3 +375,138 @@ def test_auto_resume_prompt_skipped_with_no_past_sessions(tmp_path, monkeypatch,
     feed(monkeypatch, ["/quit"])
     repl.run()
     assert "continue previous session?" not in capsys.readouterr().out
+
+
+def test_sessions_picker_resumes_chosen_session(tmp_path, monkeypatch, capsys):
+    """/sessions must be interactive on a tty — listing the past sessions is
+    only useful if the user can pick one to resume, the way /model lets them
+    pick from the discovered model list."""
+    repl = make_repl(tmp_path, [])
+    reg = repl.registry
+    reg.providers["fake"] = ProviderConfig(name="fake", base_url="http://x")
+    reg.models["fake:model"] = {"context_window": 32768}
+    reg.models["fake:other"] = {"context_window": 65536}
+    past = _write_past_session(
+        repl.recorder.run_dir.parent,
+        "2024-01-01-other",
+        model="fake:other",
+        name="fix login bug",
+        messages=[Message(role="user", content="how do I fix the login?")],
+    )
+    _write_past_session(
+        repl.recorder.run_dir.parent,
+        "2024-01-02-other",
+        model="fake:model",
+        name="add tests",
+        messages=[Message(role="user", content="add tests please")],
+    )
+    monkeypatch.setattr("sys.stdin", Tty())
+    # answers: decline auto-resume → /sessions → pick #1 (older session) → /quit
+    feed(monkeypatch, ["n", "/sessions", "1", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "past sessions (2)" in out
+    assert "fix login bug" in out
+    assert "add tests" in out
+    assert "resumed session" in out
+    assert "loaded 1 messages" in out
+    assert repl.runner.spec.spec == "fake:other"
+    assert repl.messages[0].content == "how do I fix the login?"
+
+
+def test_sessions_non_tty_does_not_prompt(tmp_path, monkeypatch, capsys):
+    """On a non-tty stdin, /sessions lists and tells the user how to resume
+    explicitly — it must not block on input()."""
+    repl = make_repl(tmp_path, [])
+    _write_past_session(
+        repl.recorder.run_dir.parent,
+        "2024-01-01-other",
+        model="fake:model",
+        name="old",
+        messages=[Message(role="user", content="hi")],
+    )
+    # no Tty() — stdin is not a terminal
+    feed(monkeypatch, ["/sessions", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "past sessions (1)" in out
+    assert "resume with /continue <id|#>" in out
+    assert "resume # (empty to cancel)" not in out
+
+
+def test_sessions_picker_empty_choice_cancels(tmp_path, monkeypatch, capsys):
+    repl = make_repl(tmp_path, [])
+    _write_past_session(
+        repl.recorder.run_dir.parent,
+        "2024-01-01-other",
+        model="fake:model",
+        name="old",
+        messages=[Message(role="user", content="hi")],
+    )
+    monkeypatch.setattr("sys.stdin", Tty())
+    feed(monkeypatch, ["n", "/sessions", "", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "past sessions (1)" in out
+    assert "resumed session" not in out
+    assert repl.messages == []
+
+
+def test_sessions_filter_narrows_list(tmp_path, monkeypatch, capsys):
+    """/sessions <filter> restricts the list to sessions whose name or id
+    contains the substring (case-insensitive), so the picker doesn't drown
+    the user in old runs."""
+    repl = make_repl(tmp_path, [])
+    _write_past_session(
+        repl.recorder.run_dir.parent,
+        "2024-01-01-login",
+        model="fake:model",
+        name="fix login bug",
+        messages=[Message(role="user", content="login help")],
+    )
+    _write_past_session(
+        repl.recorder.run_dir.parent,
+        "2024-01-02-tests",
+        model="fake:model",
+        name="add tests",
+        messages=[Message(role="user", content="tests please")],
+    )
+    # non-tty so the picker doesn't prompt; just checks the filter output
+    feed(monkeypatch, ["/sessions login", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "fix login bug" in out
+    assert "add tests" not in out
+
+
+def test_load_messages_falls_back_to_events_jsonl(tmp_path):
+    """Older mha versions recorded the transcript inline in events.jsonl
+    without ever writing messages.jsonl. /continue must still be able to
+    resume those sessions — load_messages reconstructs the user seed from
+    run_start.data.task and pulls assistant content from assistant events."""
+    import json
+    from mha.harness.session import load_messages
+    run_dir = tmp_path / "legacy_session"
+    run_dir.mkdir()
+    events = [
+        {"seq": 1, "type": "run_start", "data": {"task": "Hey how's it going", "model": "ollama:ornith"}},
+        {"seq": 2, "type": "assistant", "data": {"content": "Hey! What can I help with?"}},
+        {"seq": 3, "type": "reply", "data": {}},
+    ]
+    (run_dir / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    # intentionally no messages.jsonl — this is the legacy shape
+    rows = load_messages(run_dir)
+    assert rows is not None
+    assert [r["role"] for r in rows] == ["user", "assistant"]
+    assert rows[0]["content"] == "Hey how's it going"
+    assert rows[1]["content"] == "Hey! What can I help with?"
+
+
+def test_load_messages_missing_events_returns_none(tmp_path):
+    """If neither messages.jsonl nor events.jsonl exists, /continue can't
+    resume — we must return None so the caller can report a clean error
+    rather than fabricate a transcript."""
+    from mha.harness.session import load_messages
+    run_dir = tmp_path / "empty_session"
+    run_dir.mkdir()
+    assert load_messages(run_dir) is None

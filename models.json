@@ -5,9 +5,9 @@
       "api_key_env": "OPENROUTER_API_KEY"
     },
     "ollama": {
-      "base_url": "http://localhost:11434/v1",
-      "native_url": "http://localhost:11434",
-      "api_key_env": null
+      "base_url": "https://ollama.com/v1",
+      "native_url": "https://ollama.com",
+      "api_key_env": "OLLAMA_API_KEY"
     }
   },
   "models": {
@@ -28,6 +28,21 @@
     },
     "ollama:qwen2.5-coder:7b": {
       "context_window": 32768,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:glm-5.2": {
+      "context_window": 900000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:minimax-m3": {
+      "context_window": 500000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:kimi-k2.7-code": {
+      "context_window": 250000,
       "supports_tools": true,
       "constrained_decoding": false
     },
@@ -63,8 +78,8 @@
     }
   },
   "aliases": {
-    "default": "openrouter:minimax/minimax-m3",
-    "judge": "openrouter:minimax/minimax-m3",
-    "compactor": "openrouter:minimax/minimax-m3"
+    "default": "ollama:glm-5.2",
+    "judge": "ollama:glm-5.2",
+    "compactor": "ollama:glm-5.2"
   }
 }
