@@ -38,6 +38,8 @@ export interface BridgeOptions {
 	repo: string;
 	model?: string;
 	noKg?: boolean;
+	harness?: string;
+	fromArch?: string;
 	onMessage: (msg: ServerMessage) => void;
 	onStderr: (line: string) => void;
 	onExit: (code: number | null) => void;
@@ -69,6 +71,8 @@ export class Bridge {
 		const args = ["-m", "mha", "serve", "--repo", this.opts.repo];
 		if (this.opts.model) args.push("--model", this.opts.model);
 		if (this.opts.noKg) args.push("--no-kg");
+		if (this.opts.harness) args.push("--harness", this.opts.harness);
+		if (this.opts.fromArch) args.push("--from-arch", this.opts.fromArch);
 		if (resume) args.push("--resume", resume);
 		return args;
 	}

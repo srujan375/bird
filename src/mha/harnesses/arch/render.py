@@ -29,12 +29,14 @@ _EDGE_ARROWS = {"sync": "-->", "async": "-.->", "batch": "==>"}
 
 
 def _label(text: str) -> str:
-    return text.replace('"', "'")
+    # str() guard: render must never hard-crash on a stray non-string that
+    # slipped past tool validation (the tool layer is the real gate)
+    return str(text).replace('"', "'")
 
 
 def _ident(text: str) -> str:
     """A mermaid-safe identifier (ER entities, module nodes)."""
-    return re.sub(r"[^A-Za-z0-9_]", "_", text).strip("_") or "X"
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(text)).strip("_") or "X"
 
 
 def toplevel_mermaid(state: ArchState) -> str:

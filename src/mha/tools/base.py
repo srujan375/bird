@@ -44,6 +44,13 @@ class ToolContext:
     client: Any | None = None  # llm.wire.openai_compat.OpenAICompatClient — used by web_fetch to ask the model
     skills: list[Any] | None = None  # skills.Skill list; None = no skills loaded
     arch: Any | None = None  # harnesses.arch.session.ArchSession in arch sessions
+    # lead-harness wiring: the lead's dispatch tools spin up sub-harnesses, so
+    # they need the registry to resolve models and a dir to nest sub-sessions
+    # under; last_bundle is the arch->code seam (the finalized design, stashed
+    # by `architect` and seeded into the `code` sub-session)
+    registry: Any | None = None  # llm.registry.Registry
+    run_dir: Path | None = None  # this session's dir; sub-sessions nest beneath it
+    last_bundle: str | None = None  # seed_context handed from architect to code
 
     def emit(self, event_type: str, data: dict[str, Any]) -> None:
         if self.record:

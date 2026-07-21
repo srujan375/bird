@@ -15,7 +15,9 @@ from .engine.session import SessionRecorder, new_run_id
 from .llm.ollama import Ollama, OllamaError
 from .llm.registry import Registry
 from .llm.wire.openai_compat import OpenAICompatClient
-from .harnesses.code import code_harness_tools
+from .harnesses.handoff import read_seed
+from .harnesses.lead import lead_harness_tools
+from .harnesses.registry import build_runner
 from .tools import ToolContext
 from .skills import load_skills
 
@@ -39,21 +41,36 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if not argv:
-        argv = ["chat"]  # bare `mha` → interactive
+        argv = ["lead"]  # bare `mha` → the front-door lead (interactive)
 
     parser = argparse.ArgumentParser(prog="mha", description="multi-harness agent")
     sub = parser.add_subparsers(dest="command", required=True)
 
     code = sub.add_parser("code", help="run the Code harness on a task")
     code.add_argument("task", help="what to do, in natural language")
+    code.add_argument("--from-arch", default=None, metavar="RUN_ID",
+                      help="seed the code session from a finalized arch bundle ('latest' or a run-id)")
     _add_common(code)
 
     chat = sub.add_parser("chat", help="interactive mode with slash commands (default)")
     chat.add_argument("--tui", action="store_true", help="force the full-screen TUI (error if unavailable)")
     chat.add_argument("--plain", action="store_true", help="force the plain REPL instead of the TUI")
+    chat.add_argument("--from-arch", default=None, metavar="RUN_ID",
+                      help="seed the session from a finalized arch bundle ('latest' or a run-id)")
     _add_common(chat)
 
+    lead = sub.add_parser("lead", help="the front-door agent: chats, researches, and dispatches architect/code")
+    lead.add_argument("task", nargs="?", default=None,
+                      help="one-shot request; omit for an interactive session")
+    lead.add_argument("--tui", action="store_true", help="force the full-screen TUI (error if unavailable)")
+    lead.add_argument("--plain", action="store_true", help="force the plain REPL instead of the TUI")
+    _add_common(lead)
+
     serve = sub.add_parser("serve", help="JSON-lines bridge over stdio (used by the TUI)")
+    serve.add_argument("--harness", default="code", choices=["code", "lead"],
+                       help="which harness to serve (default: code)")
+    serve.add_argument("--from-arch", default=None, metavar="RUN_ID",
+                       help="seed from a finalized arch bundle ('latest' or a run-id)")
     _add_common(serve)
 
     arch = sub.add_parser("arch", help="architecture session in a browser page")
@@ -74,16 +91,41 @@ def main(argv: list[str] | None = None) -> int:
         return _serve_main(args)
     if args.command == "arch":
         return _arch_main(args)
+    if args.command == "lead":
+        if args.task:
+            return _lead_main(args)  # one-shot: route and build, no interactive shell
+        return _interactive_session(args, "lead", tools=lead_harness_tools(with_kg=not args.no_kg))
     if args.command == "chat":
-        # TUI is the default interactive surface when it's installed and we
-        # are on a real terminal; --plain forces the REPL, --tui makes a
-        # missing TUI an error instead of a fallback.
-        if args.tui:
-            return _tui_main(args)
-        if not args.plain and sys.stdin.isatty() and sys.stdout.isatty() and _tui_dir() is not None:
-            return _tui_main(args)
-        return _chat_main(args)
+        seed = _from_arch_seed(args)
+        if isinstance(seed, int):
+            return seed
+        return _interactive_session(args, "code", seed_context=seed)
     return _code_main(args)
+
+
+def _interactive_session(args, harness: str, tools=None, seed_context=None) -> int:
+    """The shared interactive surface: the full-screen TUI when it's installed
+    and we're on a real terminal (--plain forces the REPL; --tui makes a
+    missing TUI an error), else the plain REPL. Same selection for every
+    interactive harness (chat=code, bare mha=lead)."""
+    if getattr(args, "tui", False):
+        return _tui_main(args, harness)
+    if (not getattr(args, "plain", False) and sys.stdin.isatty()
+            and sys.stdout.isatty() and _tui_dir() is not None):
+        return _tui_main(args, harness)
+    return _repl_session(args, harness, tools=tools, seed_context=seed_context)
+
+
+def _from_arch_seed(args):
+    """Resolve --from-arch to seed_context. Returns the seed string, None (no
+    flag), or an int exit code when the bundle can't be found."""
+    if not getattr(args, "from_arch", None):
+        return None
+    seed = read_seed(Path(args.repo).resolve(), args.from_arch)
+    if seed is None:
+        print(f"no finalized architecture bundle found for '{args.from_arch}'", file=sys.stderr)
+        return 2
+    return seed
 
 
 def _kg_main(args) -> int:
@@ -140,7 +182,8 @@ def _setup(args):
     return registry, spec, kg, build_proc, run_id, run_dir
 
 
-def _make_runner(args, registry, spec, kg, recorder, tools=None, **runner_kw) -> Runner:
+def _make_runner(args, registry, spec, kg, recorder, *, harness="code",
+                 tools=None, seed_context=None) -> Runner:
     repo_root = Path(args.repo).resolve()
     ctx = ToolContext(
         repo_root=repo_root,
@@ -148,15 +191,21 @@ def _make_runner(args, registry, spec, kg, recorder, tools=None, **runner_kw) ->
         record=recorder.event,
         client=OpenAICompatClient(),
         skills=load_skills(repo_root),
+        registry=registry,
+        run_dir=recorder.run_dir,
     )
-    return Runner(
+    # all harness construction goes through the registry now — the arch/code/lead
+    # tuning (instructions, toolset, nudges, tracker) lives in HarnessDef, not here
+    return build_runner(
+        harness,
         spec=spec,
         client=OpenAICompatClient(),
         registry=registry,
-        tools=tools if tools is not None else code_harness_tools(with_kg=not args.no_kg),
         ctx=ctx,
         max_turns=args.max_turns,
-        **runner_kw,
+        with_kg=not args.no_kg,
+        tools=tools,
+        seed_context=seed_context,
     )
 
 
@@ -166,10 +215,19 @@ def _code_main(args) -> int:
         return setup
     registry, spec, kg, build_proc, run_id, run_dir = setup
 
+    seed_context = None
+    if getattr(args, "from_arch", None):
+        seed_context = read_seed(Path(args.repo).resolve(), args.from_arch)
+        if seed_context is None:
+            print(f"no finalized architecture bundle found for '{args.from_arch}'", file=sys.stderr)
+            return 2
+
     with SessionRecorder(run_dir) as recorder:
-        runner = _make_runner(args, registry, spec, kg, recorder)
+        runner = _make_runner(args, registry, spec, kg, recorder, seed_context=seed_context)
         attach_printer(runner.ctx)  # `› tool …` headers while the agent works
         print(f"mha code | model={spec.spec} | kg={'off' if args.no_kg else 'on'} | session={run_id}")
+        if seed_context is not None:
+            print(f"seeded from arch bundle: {args.from_arch}")
         if build_proc is not None:
             print("kg: building in background; harness starts now")
         result = runner.run(args.task)
@@ -182,7 +240,8 @@ def _code_main(args) -> int:
     return 0 if result.status == "done" else 1
 
 
-def _chat_main(args) -> int:
+def _repl_session(args, harness: str = "code", tools=None, seed_context=None) -> int:
+    """The plain REPL for any interactive harness (chat=code, bare mha=lead)."""
     from .repl import Repl
 
     setup = _setup(args)
@@ -191,11 +250,12 @@ def _chat_main(args) -> int:
     registry, spec, kg, _build_proc, run_id, run_dir = setup
 
     with SessionRecorder(run_dir) as recorder:
-        runner = _make_runner(args, registry, spec, kg, recorder)
+        runner = _make_runner(args, registry, spec, kg, recorder,
+                              harness=harness, tools=tools, seed_context=seed_context)
         repl = Repl(runner, registry, kg, recorder, run_id)
-        # /reload re-execs `mha chat --resume <run_id>: load the prior session's
-        # transcript + model so the conversation continues on freshly-loaded
-        # code/skills without losing history.
+        # /reload re-execs `mha <cmd> --resume <run_id>`: load the prior
+        # session's transcript + model so the conversation continues on
+        # freshly-loaded code/skills without losing history.
         if getattr(args, "resume", None):
             _resume_into_repl(repl, args.resume, registry)
         return repl.run()
@@ -210,8 +270,15 @@ def _serve_main(args) -> int:
         return setup
     registry, spec, kg, _build_proc, run_id, run_dir = setup
 
+    harness = getattr(args, "harness", "code")
+    seed = _from_arch_seed(args)
+    if isinstance(seed, int):
+        return seed
+    tools = lead_harness_tools(with_kg=not args.no_kg) if harness == "lead" else None
+
     with SessionRecorder(run_dir) as recorder:
-        runner = _make_runner(args, registry, spec, kg, recorder)
+        runner = _make_runner(args, registry, spec, kg, recorder,
+                              harness=harness, tools=tools, seed_context=seed)
         repl = Repl(runner, registry, kg, recorder, run_id)
         # /reload respawns `mha serve` with --resume <old_run_id>: load the
         # previous session's transcript + model so the conversation continues
@@ -227,9 +294,7 @@ def _arch_main(args) -> int:
 
     from .harnesses.arch import harness as arch_def
     from .harnesses.arch.judge import make_judge
-    from .harnesses.arch.render import TRACKER_PREFIX
     from .harnesses.arch.session import ArchSession
-    from .harnesses.arch.tools import arch_harness_tools
     from .http_transport import HttpTransport
     from .repl import Repl
     from .serve import Server
@@ -244,15 +309,7 @@ def _arch_main(args) -> int:
     registry, spec, kg, _build_proc, run_id, run_dir = setup
 
     with SessionRecorder(run_dir) as recorder:
-        runner = _make_runner(
-            args, registry, spec, kg, recorder,
-            tools=arch_harness_tools(with_kg=not args.no_kg),
-            instructions_path=arch_def.INSTRUCTIONS_PATH,
-            mutating_tools=arch_def.MUTATING_TOOLS,
-            tracker=arch_def.arch_tracker,
-            tracker_prefix=TRACKER_PREFIX,
-            explore_nudge=arch_def.EXPLORE_NUDGE,
-        )
+        runner = _make_runner(args, registry, spec, kg, recorder, harness="arch")
         repl = Repl(runner, registry, kg, recorder, run_id)
         resumed_dir = None
         if getattr(args, "resume", None):
@@ -307,6 +364,29 @@ def _arch_main(args) -> int:
         return rc
 
 
+def _lead_main(args) -> int:
+    """One-shot lead: route the task (architect → code / code) and report.
+    The interactive lead goes through _interactive_session, not here."""
+    setup = _setup(args)
+    if isinstance(setup, int):
+        return setup
+    registry, spec, kg, build_proc, run_id, run_dir = setup
+
+    with SessionRecorder(run_dir) as recorder:
+        runner = _make_runner(
+            args, registry, spec, kg, recorder,
+            harness="lead", tools=lead_harness_tools(with_kg=not args.no_kg),
+        )
+        attach_printer(runner.ctx)
+        print(f"mha lead | model={spec.spec} | kg={'off' if args.no_kg else 'on'} | session={run_id}")
+        if build_proc is not None:
+            print("kg: building in background")
+        result = runner.run(args.task)
+
+    print(f"\n[{result.status}] {result.summary}")
+    return 0 if result.status == "done" else 1
+
+
 def _resume_into_repl(repl, run_id: str, registry: "Registry") -> Path | None:
     """Load a prior session's transcript into an existing Repl; returns the
     resumed session's directory (None if nothing matched).
@@ -353,9 +433,9 @@ def _tui_dir() -> Path | None:
     return None
 
 
-def _tui_main(args) -> int:
+def _tui_main(args, harness: str = "code") -> int:
     """Exec the pi-tui frontend; it spawns `mha serve` back over stdio for
-    the actual harness."""
+    the actual harness. The harness selection flows through to that serve."""
     import subprocess
 
     tui_dir = _tui_dir()
@@ -371,6 +451,10 @@ def _tui_main(args) -> int:
         cmd += ["--model", args.model]
     if args.no_kg:
         cmd.append("--no-kg")
+    if harness != "code":
+        cmd += ["--harness", harness]
+    if getattr(args, "from_arch", None):
+        cmd += ["--from-arch", args.from_arch]
     return subprocess.run(cmd, cwd=tui_dir).returncode
 
 

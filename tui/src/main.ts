@@ -37,6 +37,8 @@ function argValue(flag: string): string | undefined {
 const DEMO = argv.includes("--demo");
 const NO_KG = argv.includes("--no-kg");
 const MODEL_ARG = argValue("--model");
+const HARNESS_ARG = argValue("--harness");
+const FROM_ARCH_ARG = argValue("--from-arch");
 let repo = resolve(argValue("--repo") ?? process.cwd());
 // `npm start` runs inside tui/ — the agent should work on the enclosing repo
 if (basename(repo) === "tui" && existsSync(join(dirname(repo), "pyproject.toml"))) {
@@ -321,6 +323,8 @@ if (!DEMO) {
 		repo,
 		model: MODEL_ARG,
 		noKg: NO_KG,
+		harness: HARNESS_ARG,
+		fromArch: FROM_ARCH_ARG,
 		onMessage,
 		onStderr: (line) => addToChat(new Notice(line, "danger")),
 		onExit: (code) => {

@@ -376,20 +376,47 @@ class FlowTool(Tool):
         return _confirm(action, session)
 
 
+def _as_str(owner: str, key: str, val: Any) -> str:
+    if not isinstance(val, str):
+        raise ToolError(
+            f"{owner} field {key!r} must be a plain string, not {type(val).__name__}. "
+            f'Describe it as text (e.g. "contactId"), not an object or array.'
+        )
+    return val
+
+
+def _as_str_opt(owner: str, key: str, val: Any) -> str | None:
+    return None if val is None else _as_str(owner, key, val)
+
+
+def _as_str_list(owner: str, key: str, val: Any) -> list[str]:
+    if not isinstance(val, list) or any(not isinstance(x, str) for x in val):
+        found = (
+            next((type(x).__name__ for x in val if not isinstance(x, str)), "ok")
+            if isinstance(val, list) else type(val).__name__
+        )
+        raise ToolError(
+            f"{owner} field {key!r} must be a list of plain strings "
+            f'(e.g. ["firstName", "email"]) — found a {found}. Flatten each item to '
+            f"one string; do not pass objects."
+        )
+    return list(val)
+
+
 _FACET_BUILDERS = {
     "api": ("endpoints", lambda a: ApiFacet(
         endpoints=[_build(Endpoint, e, ("route", "method", "request", "response", "auth"))
                    for e in a.get("endpoints", [])])),
     "store": ("entities + access_patterns", lambda a: StoreFacet(
         entities=[_build(Entity, e, ("name", "keys")) for e in a.get("entities", [])],
-        access_patterns=list(a.get("access_patterns", [])),
-        retention=a.get("retention"),
-        migration_risk=a.get("migration_risk"))),
+        access_patterns=_as_str_list("store facet", "access_patterns", a.get("access_patterns", [])),
+        retention=_as_str_opt("store facet", "retention", a.get("retention")),
+        migration_risk=_as_str_opt("store facet", "migration_risk", a.get("migration_risk")))),
     "queue": ("messages", lambda a: QueueFacet(
         messages=[_build(QueueMessage, m, ("name", "schema", "ordering", "delivery"))
                   for m in a.get("messages", [])])),
     "service": ("interface", lambda a: ServiceFacet(
-        interface=list(a.get("interface", [])),
+        interface=_as_str_list("service facet", "interface", a.get("interface", [])),
         modules=[_build(Module, m, ("name", "purpose")) for m in a["modules"]]
         if a.get("modules") else None)),
     "llm": ("tasks", lambda a: LlmFacet(
@@ -399,16 +426,106 @@ _FACET_BUILDERS = {
     "infra": ("units + state_locality", lambda a: InfraFacet(
         units=[_build(DeployUnit, u, ("name", "components", "scaling_policy"))
                for u in a.get("units", [])],
-        state_locality=a.get("state_locality", ""))),
+        state_locality=_as_str_opt("infra facet", "state_locality", a.get("state_locality")) or "")),
 }
+
+# dataclass annotations are strings here (from __future__ import annotations),
+# so we match on the annotation text to type-check tool input
+_STR_ANNS = {"str", "str|None"}
+_STRLIST_ANNS = {"list[str]"}
 
 
 def _build(cls: type, d: dict[str, Any], required: tuple[str, ...]) -> Any:
     for req in required:
         if req not in d or d[req] in ("", [], None):
             raise ToolError(f"{cls.__name__} needs {req!r} (got: {sorted(d)}).")
-    fields = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-    return cls(**{k: v for k, v in d.items() if k in fields})
+    dfields = cls.__dataclass_fields__  # type: ignore[attr-defined]
+    kw: dict[str, Any] = {}
+    for k, v in d.items():
+        if k not in dfields:
+            continue
+        ann = str(dfields[k].type).replace(" ", "")
+        if v is not None and ann in _STR_ANNS:
+            v = _as_str(cls.__name__, k, v)
+        elif ann in _STRLIST_ANNS:
+            v = _as_str_list(cls.__name__, k, v)
+        kw[k] = v
+    return cls(**kw)
+
+
+# Fully-specified item schemas. An underspecified {"type": "object"} was the main
+# cause of repeated expand failures — the model had to guess every field name and
+# only learned the shape from error messages. Each item now states its fields,
+# which are required, and a concrete example.
+_STR_ARR = {"type": "array", "items": {"type": "string"}}
+
+_ENDPOINT_ITEM = {
+    "type": "object",
+    "properties": {
+        "route": {"type": "string", "description": "path, e.g. /contacts/search"},
+        "method": {"type": "string", "description": "HTTP verb: GET/POST/PUT/DELETE"},
+        "request": {"type": "string", "description": "request shape, one line, e.g. '{q, page, agentId?}'"},
+        "response": {"type": "string", "description": "response shape, one line, e.g. '{results[], nextCursor}'"},
+        "auth": {"type": "string", "description": "authorization rule, e.g. 'org admin/owner'"},
+        "errors": {**_STR_ARR, "description": "error cases, e.g. ['403 not admin', '400 bad query']"},
+        "idempotency": {"type": "string"},
+        "pagination": {"type": "string", "description": "e.g. 'cursor (searchAfter)'"},
+    },
+    "required": ["route", "method", "request", "response", "auth"],
+}
+_ENTITY_ITEM = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "entity/collection name, e.g. 'CrmContact'"},
+        "keys": {"type": "string", "description": "primary/partition key(s) as text, e.g. 'organisationId + _id'"},
+        "fields": {**_STR_ARR, "description": "field NAMES as plain strings, e.g. ['firstName', 'primaryEmail'] — not objects"},
+        "indexes": {**_STR_ARR, "description": "indexes as text, e.g. ['atlas-search: name,email', 'org+chatbot']"},
+    },
+    "required": ["name", "keys"],
+}
+_MESSAGE_ITEM = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "schema": {"type": "string", "description": "payload shape, one line"},
+        "ordering": {"type": "string", "description": "e.g. 'per-key FIFO' or 'none'"},
+        "delivery": {"type": "string", "description": "e.g. 'at-least-once'"},
+        "dlq_policy": {"type": "string"},
+    },
+    "required": ["name", "schema", "ordering", "delivery"],
+}
+_MODULE_ITEM = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "purpose": {"type": "string", "description": "what this module does, one line"},
+    },
+    "required": ["name", "purpose"],
+}
+_TASK_ITEM = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "model_tier": {"type": "string", "description": "e.g. 'frontier', 'local-8b'"},
+        "prompt_contract": {"type": "string", "description": "inputs -> outputs, one line"},
+        "context_strategy": {"type": "string"},
+        "fallback": {"type": "string", "description": "what happens on failure/timeout"},
+        "guardrails": {"type": "string"},
+        "eval_hook": {"type": "string"},
+        "cost_envelope": {"type": "string"},
+    },
+    "required": ["name", "model_tier", "prompt_contract", "context_strategy", "fallback", "guardrails"],
+}
+_UNIT_ITEM = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "deploy unit, e.g. 'search-api pod'"},
+        "components": {**_STR_ARR, "description": "component ids this unit runs"},
+        "scaling_policy": {"type": "string", "description": "e.g. 'HPA on CPU 70%, 2-10 replicas'"},
+        "region": {"type": "string"},
+    },
+    "required": ["name", "components", "scaling_policy"],
+}
 
 
 class ExpandTool(Tool):
@@ -424,18 +541,26 @@ class ExpandTool(Tool):
     parameters = {
         "type": "object",
         "properties": {
-            "component_id": {"type": "string"},
-            "endpoints": {"type": "array", "items": {"type": "object"}},
-            "entities": {"type": "array", "items": {"type": "object"}},
-            "access_patterns": {"type": "array", "items": {"type": "string"}},
-            "retention": {"type": "string"},
-            "migration_risk": {"type": "string"},
-            "messages": {"type": "array", "items": {"type": "object"}},
-            "interface": {"type": "array", "items": {"type": "string"}},
-            "modules": {"type": "array", "items": {"type": "object"}},
-            "tasks": {"type": "array", "items": {"type": "object"}},
-            "units": {"type": "array", "items": {"type": "object"}},
-            "state_locality": {"type": "string"},
+            "component_id": {"type": "string", "description": "the component to expand (take the next one from the tracker's risk order)"},
+            "endpoints": {"type": "array", "items": _ENDPOINT_ITEM,
+                          "description": "api/gateway: the HTTP contract (one item per endpoint)"},
+            "entities": {"type": "array", "items": _ENTITY_ITEM,
+                         "description": "store/cache: the data entities (one item per entity/collection)"},
+            "access_patterns": {**_STR_ARR,
+                                "description": "store/cache: how the data is queried, e.g. ['search by name prefix within org']"},
+            "retention": {"type": "string", "description": "store/cache: how long the data lives"},
+            "migration_risk": {"type": "string", "description": "store/cache: risk of changing this schema later"},
+            "messages": {"type": "array", "items": _MESSAGE_ITEM,
+                         "description": "queue: the messages carried (one item per message type)"},
+            "interface": {**_STR_ARR,
+                          "description": "service/job/ui: exposed operations, e.g. ['search(q, scope) -> results']"},
+            "modules": {"type": "array", "items": _MODULE_ITEM,
+                        "description": "service/job/ui: internal modules (optional)"},
+            "tasks": {"type": "array", "items": _TASK_ITEM,
+                      "description": "llm: the model tasks (one item per task)"},
+            "units": {"type": "array", "items": _UNIT_ITEM,
+                      "description": "infra: deploy units (one item per unit)"},
+            "state_locality": {"type": "string", "description": "infra: where state lives (stateless / which store)"},
         },
         "required": ["component_id"],
         "additionalProperties": False,

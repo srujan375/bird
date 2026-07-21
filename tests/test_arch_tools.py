@@ -210,6 +210,38 @@ def test_full_session_to_finalize(tmp_path):
     assert events[-1]["state"]["components"]["db"]["facet"]["facet_kind"] == "store"
 
 
+def test_expand_rejects_non_string_fields_cleanly(tmp_path):
+    # a model passing structured objects where the schema wants strings must get
+    # a clean, recoverable error — not an opaque TypeError from rendering — and
+    # the component's facet must stay unset (no half-applied mutation)
+    broker = FakeBroker([(True, "")])
+    ctx, session, _ = make_ctx(tmp_path, broker=broker)
+    build_toplevel(ctx)
+    ok(ArchDoneTool(), ctx, summary="top level ready")
+    assert session.state.phase == "expand"
+
+    # fields as a list of objects (e.g. an Atlas index field spec)
+    out = err(ExpandTool(), ctx, component_id="db",
+              entities=[{"name": "contacts", "keys": "id",
+                         "fields": [{"name": "firstName", "type": "string"}]}],
+              access_patterns=["by name"])
+    assert "fields" in out and "list of plain strings" in out
+    assert session.state.components["db"].facet is None  # nothing half-applied
+
+    # keys as an object
+    out = err(ExpandTool(), ctx, component_id="db",
+              entities=[{"name": "contacts", "keys": {"primary": "id"}}],
+              access_patterns=["by name"])
+    assert "keys" in out and "must be a plain string" in out
+    assert session.state.components["db"].facet is None
+
+    # a valid string-only expand still works
+    ok(ExpandTool(), ctx, component_id="db",
+       entities=[{"name": "contacts", "keys": "id", "fields": ["firstName", "email"]}],
+       access_patterns=["by name"], retention="forever")
+    assert session.state.components["db"].facet.facet_kind == "store"
+
+
 def test_toplevel_rejection_returns_feedback_same_turn(tmp_path):
     broker = FakeBroker([(False, "drop the worker pool")])
     ctx, session, _ = make_ctx(tmp_path, broker=broker)

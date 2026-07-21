@@ -172,6 +172,7 @@ class Runner:
         tracker: Callable[[ToolContext], str | None] | None = None,
         tracker_prefix: str | None = None,
         explore_nudge: str | None = None,
+        seed_context: str | None = None,
     ):
         self.spec = spec
         self.client = client
@@ -190,6 +191,10 @@ class Runner:
         self.tracker = tracker or _plan_tracker
         self.tracker_prefix = tracker_prefix or PLAN_TRACKER_PREFIX
         self.explore_nudge = explore_nudge or EXPLORE_NUDGE
+        # stable reference material seeded into the system prompt (survives
+        # compaction, which always keeps messages[:2]) — e.g. the arch handoff
+        # doc the lead hands a code sub-session
+        self.seed_context = seed_context
 
     def run(self, task: str) -> RunResult:
         messages = [
@@ -225,6 +230,8 @@ class Runner:
         parts.append(orientation or _shallow_tree(self.ctx.repo_root))
         if self.ctx.skills:
             parts.append(render_index(self.ctx.skills))
+        if self.seed_context:
+            parts.append(self.seed_context)
         return "\n\n".join(p for p in parts if p)
 
     def _strip_tracker(self, messages: list[Message]) -> None:
