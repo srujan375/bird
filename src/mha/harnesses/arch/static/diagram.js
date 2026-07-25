@@ -1,16 +1,17 @@
-/* Hand-built SVG diagram for the Workbench hero pane.
+/* Hand-built SVG diagram for the paper canvas.
    Layered top-down layout over the structured arch state — no Mermaid on the
-   page; every node is a live DOM element (click-to-select, NEW pulse, pan/zoom). */
+   page. Every node is a live paper card (click-to-open, changed-halo, pan/zoom);
+   store/infra/service facets drill into ER / deployment / module views. */
 "use strict";
 
 const Diagram = (() => {
   const NS = "http://www.w3.org/2000/svg";
-  const NODE_W = 156, NODE_H = 52, GAP_X = 46, GAP_Y = 78, PAD = 30;
+  const NODE_W = 190, NODE_H = 76, GAP_X = 54, GAP_Y = 88, PAD = 40;
 
   let svg, viewport;                       // <svg> and the pan/zoom <g>
   let scale = 1, tx = 0, ty = 0;
   let contentBox = { w: 0, h: 0 };
-  let onSelect = null;
+  let onSelect = null, onDrill = null;
 
   function el(tag, attrs = {}, ...children) {
     const node = document.createElementNS(NS, tag);
@@ -18,11 +19,28 @@ const Diagram = (() => {
     for (const c of children) node.append(c);
     return node;
   }
-
-  function text(content, x, y, cls = "") {
-    const t = el("text", { x, y, class: cls });
+  function text(content, x, y, cls = "", anchor = "start") {
+    const t = el("text", { x, y, class: cls, "text-anchor": anchor });
     t.textContent = content;
     return t;
+  }
+  function trunc(s, n) { s = String(s || ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+  // What a component's expanded facet contains — surfaced as a badge on the node.
+  function facetInfo(facet) {
+    if (!facet) return null;
+    const k = facet.facet_kind;
+    const n = (a) => (facet[a] || []).length;
+    const label = {
+      api: `${n("endpoints")} endpoints`,
+      store: `${n("entities")} entities`,
+      queue: `${n("messages")} messages`,
+      service: n("modules") ? `${n("modules")} modules` : `${n("interface")} exposed`,
+      llm: `${n("tasks")} tasks`,
+      infra: `${n("units")} units`,
+    }[k] || "expanded";
+    const drillable = k === "store" || k === "infra" || (k === "service" && n("modules") > 0);
+    return { label, drillable };
   }
 
   /* ---- layout: longest-path ranks, cycle-tolerant ---- */
@@ -73,114 +91,104 @@ const Diagram = (() => {
 
   /* ---- pieces ---- */
   function nodeGroup(comp, p, flags) {
-    const g = el("g", {
-      class: "node" + (comp.existing ? " existing" : "") +
-        (flags.selected ? " selected" : "") + (flags.isNew ? " new" : ""),
-      transform: `translate(${p.x},${p.y})`,
-      "data-id": comp.id,
-    });
-    if (flags.isNew) {
-      const ring = el("rect", {
-        class: "pulse", x: -4, y: -4, width: NODE_W + 8, height: NODE_H + 8,
-        rx: 10, style: "transform-origin: center; transform-box: fill-box;",
-      });
-      g.append(ring);
+    const cls = "node" + (comp.existing ? " existing" : "") +
+      (flags.selected ? " selected" : "") + (flags.changed ? " changed" : "");
+    const fi = facetInfo(comp.facet);
+    const g = el("g", { class: cls + (fi ? " expanded" : ""), transform: `translate(${p.x},${p.y})`, "data-id": comp.id });
+    if (flags.changed) {
+      g.append(el("rect", { class: "n-halo", x: -4, y: -4, width: NODE_W + 8, height: NODE_H + 8, rx: 13 }));
+      g.append(el("rect", { class: "pulse", x: -4, y: -4, width: NODE_W + 8, height: NODE_H + 8, rx: 13 }));
     }
-    g.append(el("rect", { width: NODE_W, height: NODE_H, rx: 8 }));
-    const name = comp.name.length > 20 ? comp.name.slice(0, 19) + "…" : comp.name;
-    g.append(text(name, NODE_W / 2, 22, "name"));
-    g.append(text(comp.kind, NODE_W / 2, 38, "kind"));
-    g.querySelectorAll("text").forEach((t) => {
-      t.setAttribute("text-anchor", "middle");
-      t.setAttribute("font-size", t.classList.contains("kind") ? "10" : "12");
-    });
-    if (flags.isNew) {
-      const badge = el("g", { class: "badge", transform: `translate(${NODE_W - 30},-8)` });
-      badge.append(el("rect", { width: 34, height: 15, rx: 7 }));
-      badge.append(text("NEW", 17, 11));
-      badge.querySelector("text").setAttribute("text-anchor", "middle");
-      g.append(badge);
+    if (fi) g.append(el("rect", { class: "n-depth", x: 5, y: 5, width: NODE_W, height: NODE_H, rx: 10 }));
+    g.append(el("rect", { class: "n-box", width: NODE_W, height: NODE_H, rx: 10 }));
+    g.append(text(comp.kind, 15, 22, "n-kind"));
+    g.append(text(trunc(comp.name, fi ? 18 : 22), 15, 43, "n-name"));
+    if (comp.responsibility) g.append(text(trunc(comp.responsibility, 30), 15, 61, "n-sub"));
+    if (fi) {
+      const txt = (fi.drillable ? "⤢ " : "") + fi.label;
+      const w = txt.length * 5.6 + 14;
+      const pill = el("g", { class: "n-facet" + (fi.drillable ? " drill" : ""),
+        transform: `translate(${NODE_W - w - 8},8)` });
+      pill.append(el("rect", { width: w, height: 17, rx: 8 }));
+      pill.append(text(txt, 8, 12, "n-facet-t"));
+      pill.append(el("title", {}, document.createTextNode(
+        fi.drillable ? `${fi.label} — click to view internals` : fi.label)));
+      if (fi.drillable) pill.addEventListener("click", (e) => { e.stopPropagation(); if (onDrill) onDrill(comp.id); });
+      g.append(pill);
+    } else if (flags.owes) {
+      const dot = el("circle", { class: "n-owe", cx: NODE_W - 13, cy: 13, r: 3.5 });
+      dot.append(el("title", {}, document.createTextNode("owes a facet")));
+      g.append(dot);
     }
-    g.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (onSelect) onSelect(comp.id);
-    });
+    g.addEventListener("click", (e) => { e.stopPropagation(); if (onSelect) onSelect(comp.id); });
     return g;
   }
 
-  function edgeGroup(conn, pos) {
+  function edgeGroup(conn, pos, changed) {
     const a = pos[conn.src], b = pos[conn.dst];
     if (!a || !b) return null;
     let x1, y1, x2, y2;
-    if (b.y > a.y) {              // downward: bottom-center -> top-center
+    if (b.y > a.y) {              // downward
       x1 = a.x + NODE_W / 2; y1 = a.y + NODE_H;
-      x2 = b.x + NODE_W / 2; y2 = b.y - 5;
-    } else if (b.y < a.y) {       // upward: top-center -> bottom-center
+      x2 = b.x + NODE_W / 2; y2 = b.y - 6;
+    } else if (b.y < a.y) {       // upward
       x1 = a.x + NODE_W / 2; y1 = a.y;
-      x2 = b.x + NODE_W / 2; y2 = b.y + NODE_H + 5;
-    } else {                      // same rank: side to side
-      const leftToRight = b.x > a.x;
-      x1 = a.x + (leftToRight ? NODE_W : 0); y1 = a.y + NODE_H / 2;
-      x2 = b.x + (leftToRight ? -5 : NODE_W + 5); y2 = b.y + NODE_H / 2;
+      x2 = b.x + NODE_W / 2; y2 = b.y + NODE_H + 6;
+    } else {                      // same rank
+      const ltr = b.x > a.x;
+      x1 = a.x + (ltr ? NODE_W : 0); y1 = a.y + NODE_H / 2;
+      x2 = b.x + (ltr ? -6 : NODE_W + 6); y2 = b.y + NODE_H / 2;
     }
-    const g = el("g", { class: `edge ${conn.kind || "sync"}` });
-    g.append(el("line", { x1, y1, x2, y2, "marker-end": "url(#arrow)" }));
+    const g = el("g", { class: `edge ${conn.kind || "sync"}${changed ? " changed" : ""}` });
+    g.append(el("line", { x1, y1, x2, y2, "marker-end": `url(#${changed ? "arrow-hl" : "arrow"})` }));
     let label = conn.label || "";
     if (conn.kind === "async" && conn.mechanism) label += ` · ${conn.mechanism}`;
     if (label) {
       const mx = (x1 + x2) / 2, my = (y1 + y2) / 2 - 3;
-      const w = label.length * 6 + 8;
-      g.append(el("rect", { class: "lbl-bg", x: mx - w / 2, y: my - 10, width: w, height: 14 }));
-      const t = text(label, mx, my + 1);
-      t.setAttribute("text-anchor", "middle");
-      g.append(t);
+      const w = label.length * 6 + 10;
+      g.append(el("rect", { class: "lbl-bg", x: mx - w / 2, y: my - 10, width: w, height: 15, rx: 3 }));
+      g.append(text(label, mx, my + 1, "lbl", "middle"));
     }
     return g;
   }
 
-  function arrowDefs() {
-    const marker = el("marker", {
-      id: "arrow", viewBox: "0 0 10 10", refX: 9, refY: 5,
-      markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse",
-    });
-    marker.append(el("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "var(--fg)" }));
-    return el("defs", {}, marker);
+  function marker(id, color) {
+    const m = el("marker", { id, viewBox: "0 0 8 8", refX: 6, refY: 3,
+      markerWidth: 8, markerHeight: 8, orient: "auto" });
+    m.append(el("path", { d: "M0,0 L6,3 L0,6 Z", fill: color }));
+    return m;
+  }
+  function defs() {
+    return el("defs", {},
+      marker("arrow", "var(--edge)"),
+      marker("arrow-hl", "var(--hl)"));
   }
 
   /* ---- drill-in views (facet-natural diagrams) ---- */
-  function grid(items, itemW, itemH, gapX, gapY, perRow) {
-    return items.map((item, i) => ({
-      item,
-      x: PAD + (i % perRow) * (itemW + gapX),
-      y: PAD + Math.floor(i / perRow) * (itemH + gapY),
-    }));
+  function grid(items, itemW, gapX, perRow) {
+    return items.map((item, i) => ({ item, col: i % perRow, row: Math.floor(i / perRow), x: PAD + (i % perRow) * (itemW + gapX) }));
   }
 
   function storeView(facet) {
     const g = el("g");
-    const perRow = 3, W = 190;
+    const perRow = 3, W = 200;
+    const ents = facet.entities || [];
+    const cells = grid(ents, W, 40, perRow);
     let maxH = 0;
-    const cells = grid(facet.entities || [], W, 1, 34, 34, perRow);
-    for (const { item: ent, x } of cells) {
-      const fields = ent.fields || [];
-      const h = 26 + Math.max(fields.length, 1) * 16 + 8;
-      maxH = Math.max(maxH, h);
-    }
-    cells.forEach((cell, i) => {
-      cell.y = PAD + Math.floor(i / perRow) * (maxH + 34);
-    });
+    for (const ent of ents) maxH = Math.max(maxH, 28 + Math.max((ent.fields || []).length, 1) * 17 + 8);
+    cells.forEach((c) => { c.y = PAD + c.row * (maxH + 40); });
     for (const { item: ent, x, y } of cells) {
       const fields = ent.fields || [];
-      const h = 26 + Math.max(fields.length, 1) * 16 + 8;
+      const h = 28 + Math.max(fields.length, 1) * 17 + 8;
       const eg = el("g", { class: "entity", transform: `translate(${x},${y})` });
-      eg.append(el("rect", { class: "box", width: W, height: h, rx: 6 }));
-      eg.append(el("rect", { class: "hdr", width: W, height: 24, rx: 6 }));
-      eg.append(text(`${ent.name}  (${ent.keys})`, 8, 16, "title"));
-      fields.forEach((f, i) => eg.append(text(f, 12, 42 + i * 16)));
+      eg.append(el("rect", { class: "e-box", width: W, height: h, rx: 8 }));
+      eg.append(el("rect", { class: "e-hdr", width: W, height: 26, rx: 8 }));
+      eg.append(text(`${ent.name}  ·  ${ent.keys}`, 10, 18, "e-title"));
+      fields.forEach((f, i) => eg.append(text(trunc(f, 26), 12, 46 + i * 17, "e-field")));
       g.append(eg);
     }
     const rows = Math.ceil(cells.length / perRow) || 1;
-    contentBox = { w: perRow * (190 + 34) + PAD, h: rows * (maxH + 34) + PAD };
+    contentBox = { w: perRow * (W + 40) + PAD, h: rows * (maxH + 40) + PAD };
     return g;
   }
 
@@ -189,42 +197,38 @@ const Diagram = (() => {
     let y = PAD, maxW = 0;
     for (const unit of facet.units || []) {
       const members = unit.components || [];
-      const w = Math.max(240, members.length * 120 + 30);
+      const w = Math.max(260, members.length * 128 + 32);
       const ug = el("g", { class: "unit", transform: `translate(${PAD},${y})` });
-      ug.append(el("rect", { width: w, height: 84, rx: 8 }));
-      ug.append(text(`${unit.name} — ${unit.scaling_policy}`, 10, 18, "utitle"));
+      ug.append(el("rect", { class: "u-box", width: w, height: 92, rx: 10 }));
+      ug.append(text(`${unit.name}  —  ${unit.scaling_policy || "scaling n/a"}`, 12, 20, "u-title"));
       members.forEach((cid, i) => {
-        const mg = el("g", { class: "node", transform: `translate(${14 + i * 120},32)` });
-        mg.append(el("rect", { width: 106, height: 36, rx: 6 }));
-        const t = text(cid, 53, 22);
-        t.setAttribute("text-anchor", "middle");
-        t.setAttribute("font-size", "11");
-        mg.append(t);
+        const mg = el("g", { transform: `translate(${16 + i * 128},34)` });
+        mg.append(el("rect", { class: "m-box", width: 112, height: 40, rx: 7 }));
+        mg.append(text(trunc(cid, 15), 56, 24, "m-name", "middle"));
         ug.append(mg);
       });
       g.append(ug);
       maxW = Math.max(maxW, w);
-      y += 104;
+      y += 112;
     }
     contentBox = { w: maxW + PAD * 2, h: y + PAD };
     return g;
   }
 
-  function serviceView(comp, facet) {
+  function serviceView(facet) {
     const g = el("g");
     const mods = facet.modules || [];
-    const cells = grid(mods, 180, 46, 26, 26, 3);
+    const cells = grid(mods, 190, 30, 3);
+    cells.forEach((c) => { c.y = PAD + c.row * 76; });
     for (const { item: m, x, y } of cells) {
-      const mg = el("g", { class: "node", transform: `translate(${x},${y})` });
-      mg.append(el("rect", { width: 180, height: 46, rx: 8 }));
-      const t1 = text(m.name, 90, 19); t1.setAttribute("text-anchor", "middle");
-      const t2 = text(m.purpose, 90, 35, "kind"); t2.setAttribute("text-anchor", "middle");
-      t2.setAttribute("font-size", "10"); t1.setAttribute("font-size", "12");
-      mg.append(t1, t2);
+      const mg = el("g", { class: "mod", transform: `translate(${x},${y})` });
+      mg.append(el("rect", { class: "m-box", width: 190, height: 54, rx: 9 }));
+      mg.append(text(trunc(m.name, 24), 14, 24, "m-name"));
+      mg.append(text(trunc(m.purpose, 30), 14, 42, "m-purpose"));
       g.append(mg);
     }
     const rows = Math.ceil(mods.length / 3) || 1;
-    contentBox = { w: 3 * 206 + PAD * 2, h: rows * 72 + PAD * 2 };
+    contentBox = { w: 3 * 220 + PAD * 2, h: rows * 76 + PAD * 2 };
     return g;
   }
 
@@ -232,16 +236,16 @@ const Diagram = (() => {
   function applyTransform() {
     viewport.setAttribute("transform", `translate(${tx},${ty}) scale(${scale})`);
   }
-
   function fit() {
     const box = svg.getBoundingClientRect();
     if (!contentBox.w || !box.width) { scale = 1; tx = ty = 0; applyTransform(); return; }
-    scale = Math.min(box.width / contentBox.w, box.height / contentBox.h, 1.4);
+    const topInset = 52, pad = 20;   // leave room for the canvas toolbar; never clip
+    const availW = box.width - pad * 2, availH = box.height - topInset - pad;
+    scale = Math.min(availW / contentBox.w, availH / contentBox.h, 1.35);
     tx = (box.width - contentBox.w * scale) / 2;
-    ty = Math.max((box.height - contentBox.h * scale) / 2, 6);
+    ty = topInset + Math.max((availH - contentBox.h * scale) / 2, 0);
     applyTransform();
   }
-
   function zoom(factor) {
     const box = svg.getBoundingClientRect();
     const cx = box.width / 2, cy = box.height / 2;
@@ -251,52 +255,75 @@ const Diagram = (() => {
     scale = next;
     applyTransform();
   }
-
   function initPan() {
-    let dragging = false, sx = 0, sy = 0;
+    // Capture the pointer only once a real drag starts — otherwise a captured
+    // pointer redirects the click away from the node and selection never fires.
+    let dragging = false, moved = false, downX = 0, downY = 0, sx = 0, sy = 0;
     svg.addEventListener("pointerdown", (e) => {
-      dragging = true; sx = e.clientX - tx; sy = e.clientY - ty;
-      svg.setPointerCapture(e.pointerId);
+      dragging = true; moved = false; downX = e.clientX; downY = e.clientY;
+      sx = e.clientX - tx; sy = e.clientY - ty;
     });
     svg.addEventListener("pointermove", (e) => {
       if (!dragging) return;
+      if (!moved) {
+        if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) < 4) return;
+        moved = true;                                     // real drag → pan
+        try { svg.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+      }
       tx = e.clientX - sx; ty = e.clientY - sy;
       applyTransform();
     });
-    svg.addEventListener("pointerup", () => { dragging = false; });
+    const stop = () => { dragging = false; moved = false; };
+    svg.addEventListener("pointerup", stop);
+    svg.addEventListener("pointercancel", stop);
+    svg.addEventListener("wheel", (e) => { e.preventDefault(); zoom(e.deltaY < 0 ? 1.1 : 1 / 1.1); }, { passive: false });
   }
 
   /* ---- public API ---- */
-  function init(svgEl, selectCb) {
+  function init(svgEl, selectCb, drillCb) {
     svg = svgEl;
     onSelect = selectCb;
+    onDrill = drillCb;
     viewport = el("g");
-    svg.append(arrowDefs(), viewport);
+    svg.append(defs(), viewport);
     initPan();
   }
 
+  function edgeChanged(conn, changed) {
+    if (!changed) return false;
+    if (changed.kind === "component") return conn.src === changed.id || conn.dst === changed.id;
+    if (changed.kind === "connect") {
+      const cid = String(changed.id || "").toLowerCase();
+      return cid.includes(String(conn.src).toLowerCase()) && cid.includes(String(conn.dst).toLowerCase());
+    }
+    return false;
+  }
+
   function render(state, opts = {}) {
-    // opts: {changedId, selectedId, drillId} — throws on failure; caller keeps last-good
+    // opts: {changed:{kind,id}, selectedId, drillId, oweSet} — throws on failure; caller keeps last good.
     const comps = state.components || {};
     const next = el("g");
-    if (opts.drillId && comps[opts.drillId] && comps[opts.drillId].facet) {
-      const comp = comps[opts.drillId];
-      const facet = comp.facet;
+    const drill = opts.drillId && comps[opts.drillId] && comps[opts.drillId].facet ? comps[opts.drillId] : null;
+    if (drill) {
+      const f = drill.facet;
       let view = null;
-      if (facet.facet_kind === "store") view = storeView(facet);
-      else if (facet.facet_kind === "infra") view = infraView(facet);
-      else if (facet.facet_kind === "service" && facet.modules) view = serviceView(comp, facet);
+      if (f.facet_kind === "store") view = storeView(f);
+      else if (f.facet_kind === "infra") view = infraView(f);
+      else if (f.facet_kind === "service" && f.modules) view = serviceView(f);
       if (view) next.append(view);
-    } else {
+    } else if (Object.keys(comps).length) {
       const pos = positions(comps, state.connections || []);
       for (const conn of state.connections || []) {
-        const e = edgeGroup(conn, pos);
+        const e = edgeGroup(conn, pos, edgeChanged(conn, opts.changed));
         if (e) next.append(e);
       }
+      const owe = opts.oweSet || new Set();
+      const changedId = opts.changed && opts.changed.kind === "component" ? opts.changed.id : null;
       for (const id of Object.keys(comps)) {
         next.append(nodeGroup(comps[id], pos[id], {
           selected: id === opts.selectedId,
-          isNew: id === opts.changedId,
+          changed: id === changedId,
+          owes: owe.has(id),
         }));
       }
     }

@@ -135,6 +135,20 @@ def risk_ordered_pending(state: ArchState) -> list:
 
 
 def _next_hint(state: ArchState) -> str:
+    if state.phase == "brainstorm":
+        v = state.sketchbook.active_variant()
+        if v is None or not v.nodes:
+            return (
+                "sketch a rough shape from the requirements — `variant` to name an idea, "
+                "then `node`/`link`. Offer the user a couple of rival shapes to react to."
+            )
+        missing = state.brief.missing()
+        tail = f" (brief still needs: {', '.join(missing)})" if missing else ""
+        return (
+            f"brainstorming '{v.name}' ({len(v.nodes)} node(s)): deepen/collapse/splice "
+            f"freely, spin up rival variants, talk it through. `promote` when you and the "
+            f"user land on one{tail}."
+        )
     if state.phase == "intake":
         missing = state.brief.missing()
         if missing:
@@ -168,6 +182,8 @@ def _next_hint(state: ArchState) -> str:
 
 def tracker(state: ArchState) -> str:
     """The pinned tracker — re-rendered into the conversation every turn."""
+    if state.phase == "brainstorm":
+        return _brainstorm_tracker(state)
     happy = len(state.happy_flows())
     lines = [
         f"{TRACKER_PREFIX} — pinned; phase: {state.phase}]",
@@ -185,5 +201,23 @@ def tracker(state: ArchState) -> str:
     if blocking:
         items = "; ".join(f"{q.id}: {q.question[:60]}" for q in blocking)
         lines.append(f"BLOCKING questions open: {items}")
+    lines.append(f"next: {_next_hint(state)}")
+    return "\n".join(lines)
+
+
+def _brainstorm_tracker(state: ArchState) -> str:
+    book = state.sketchbook
+    lines = [f"{TRACKER_PREFIX} — pinned; phase: brainstorm]"]
+    if book.variants:
+        parts = []
+        for v in book.variants.values():
+            tag = " ◀ active" if v.id == book.active else ""
+            if v.status == "archived":
+                tag = " (archived)"
+            parts.append(f"{v.name} [{len(v.nodes)}n/{len(v.links)}e]{tag}")
+        lines.append("variants: " + " · ".join(parts))
+    else:
+        lines.append("variants: none yet")
+    lines.append(f"brief: scope={state.brief.scope or '?'} · goal={'set' if state.brief.goal else '?'}")
     lines.append(f"next: {_next_hint(state)}")
     return "\n".join(lines)

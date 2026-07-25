@@ -49,6 +49,7 @@ class ReadTool(Tool):
 
 class EditTool(Tool):
     name = "edit"
+    requires_permission = True
     description = (
         "Replace text in a file. old_text must appear EXACTLY ONCE in the file; "
         "copy it verbatim from read output, including whitespace."
@@ -92,6 +93,7 @@ class EditTool(Tool):
 
 class WriteTool(Tool):
     name = "write"
+    requires_permission = True
     description = "Create or overwrite a file with the given content."
     parameters = {
         "type": "object",

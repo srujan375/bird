@@ -69,6 +69,7 @@ def run_arch_interactive(
         server = Server(repl, transport=transport)  # wires ctx.record -> transport + gates
 
         arch = ArchSession(run_dir=run_dir)
+        arch.state.phase = "brainstorm"  # fresh sessions open on the loose sketch layer
         arch.broker = server.broker
         arch.judge = make_judge(registry, client)
 

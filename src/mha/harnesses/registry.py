@@ -110,9 +110,18 @@ def build_runner(
 ) -> Runner:
     """Construct a Runner tuned for the named harness. `tools` overrides the
     def's factory — used by harnesses (lead) whose tools need injected deps
-    the factory can't supply from (with_kg, with_web) alone."""
+    the factory can't supply from (with_kg, with_web) alone.
+
+    Every mutating tool is wrapped with ctx.broker here, which is the only
+    place that can cover *all* runners: the CLI's, and the ones the lead's
+    `code` dispatch builds mid-session. Gating in the Server instead meant
+    dispatched sub-sessions were born ungated.
+    """
+    from ..permissions import gate_tools
+
     d = get(name)
     resolved = tools if tools is not None else d.tools(with_kg=with_kg, with_web=with_web)
+    resolved = gate_tools(resolved, ctx.broker)
     return Runner(
         spec=spec,
         client=client,

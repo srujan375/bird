@@ -51,6 +51,11 @@ class ToolContext:
     registry: Any | None = None  # llm.registry.Registry
     run_dir: Path | None = None  # this session's dir; sub-sessions nest beneath it
     last_bundle: str | None = None  # seed_context handed from architect to code
+    # permissions.Broker — duck: .request(payload) -> (approved, feedback).
+    # build_runner wraps every requires_permission tool with it, so a sub-harness
+    # forked from this ctx inherits the gate. None = ungated (library/test use);
+    # every cli.py entry point sets one.
+    broker: Any | None = None
 
     def emit(self, event_type: str, data: dict[str, Any]) -> None:
         if self.record:
@@ -73,6 +78,11 @@ class Tool:
     name: str = ""
     description: str = ""
     parameters: dict[str, Any] = {}
+    # True on anything that can change the user's repo. build_runner wraps
+    # these with the session's permission broker. Declared here rather than in
+    # a name list elsewhere so a new mutating tool is gated by default, at the
+    # point someone writes it.
+    requires_permission: bool = False
 
     def spec(self) -> ToolSpec:
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)

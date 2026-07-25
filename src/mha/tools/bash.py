@@ -144,6 +144,11 @@ def _check_segment(head: str, tokens: list[str], categories: tuple[str, ...]) ->
 
 class BashTool(Tool):
     name = "bash"
+    # the category allowlist below constrains *what* may run; it is not consent.
+    # An allowed category still writes (a test can rewrite fixtures, a git read
+    # can be widened), and a gate on edit/write that a heredoc walks around is
+    # not a gate.
+    requires_permission = True
     description = (
         "Run a read-only shell command: search (rg/grep/find/ls/cat), tests (pytest, "
         "npm test), linters, git reads. File changes must use edit/write."

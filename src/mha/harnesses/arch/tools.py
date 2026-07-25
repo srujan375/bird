@@ -11,6 +11,7 @@ user's feedback.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ...tools import Tool, ToolContext, ToolError, ToolResult
@@ -20,6 +21,7 @@ from ...tools.skill import SkillTool
 from ...tools.web import WebFetchTool, WebSearchTool
 from . import render
 from .session import ArchSession
+from .sketch import DEPTHS, SketchLink, SketchNode, Variant
 from .state import (
     KINDS,
     CONNECTION_KINDS,
@@ -75,6 +77,12 @@ def _guard_toplevel_unlocked(session: ArchSession, what: str) -> None:
     """component/connect are propose-phase tools."""
     state = session.state
     _guard_not_finalized(session)
+    if state.phase == "brainstorm":
+        raise ToolError(
+            f"you're brainstorming — {what} is a strict tool. Sketch loosely with "
+            "`node`/`link`/`splice`, then `promote` the shape you land on; promotion "
+            "seeds the strict components for you to tighten here."
+        )
     if state.phase == "intake":
         missing = state.brief.missing()
         raise ToolError(
@@ -89,8 +97,414 @@ def _guard_toplevel_unlocked(session: ArchSession, what: str) -> None:
         )
 
 
+def _guard_brainstorm(session: ArchSession, what: str) -> None:
+    """The loose sketch tools only run in the brainstorm phase — once a variant
+    is promoted the sketch is committed and the strict tools take over."""
+    _guard_not_finalized(session)
+    if session.state.phase != "brainstorm":
+        raise ToolError(
+            f"{what} is a brainstorming tool, but the sketch is committed (phase "
+            f"'{session.state.phase}'). Edit the strict design with `component`/`connect`"
+            + (" or `amend_toplevel`." if session.state.phase in POST_APPROVAL_PHASES else ".")
+        )
+
+
+def _active_variant(session: ArchSession) -> Variant:
+    v = session.state.sketchbook.active_variant()
+    if v is None:
+        raise ToolError(
+            "no active variant — start one with `variant` (give it a name), then add "
+            "nodes. Sketching a couple of rival variants first is encouraged."
+        )
+    return v
+
+
+def _slug(text: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", str(text).strip().lower()).strip("-")
+    return s or "node"
+
+
+# loose sketch `kind` hint -> strict KIND at promotion; anything else -> service
+_KIND_MAP = {
+    "db": "store", "database": "store", "datastore": "store", "storage": "store",
+    "mq": "queue", "broker": "queue", "bus": "queue", "stream": "queue", "topic": "queue",
+    "frontend": "ui", "web": "ui", "client": "ui", "spa": "ui",
+    "model": "llm", "ai": "llm", "agent": "llm",
+    "worker": "job", "cron": "job", "batch": "job",
+    "endpoint": "api", "rest": "api", "http": "api",
+    "3rd-party": "external", "third-party": "external", "vendor": "external",
+    "component": "service", "module": "service", "idea": "service",
+}
+
+
+def _strict_kind(loose: str) -> str:
+    k = (loose or "").strip().lower()
+    if k in KINDS:
+        return k
+    return _KIND_MAP.get(k, "service")
+
+
+def _promote(session: ArchSession, variant: Variant) -> tuple[int, int]:
+    """Replay a chosen variant into the strict ArchState: nodes -> draft
+    Components (trace left empty for the model to fill in propose), links ->
+    Connections. Rivals are archived (their rejected_reason is the ADR gold).
+    Bypasses validation deliberately — these are drafts, tightened in propose."""
+    state = session.state
+    book = state.sketchbook
+    for x in book.variants.values():
+        if x.id == variant.id:
+            x.status = "chosen"
+        elif x.status != "archived":
+            x.status = "archived"
+    book.active = variant.id
+
+    idmap: dict[str, str] = {}
+    used: set[str] = set()
+    for nid in variant.nodes:
+        base = _slug(nid)
+        cid, i = base, 2
+        while cid in used or cid in state.components:
+            cid, i = f"{base}-{i}", i + 1
+        used.add(cid)
+        idmap[nid] = cid
+    for nid, node in variant.nodes.items():
+        cid = idmap[nid]
+        state.components[cid] = Component(
+            id=cid,
+            name=node.label or cid,
+            kind=_strict_kind(node.kind),
+            responsibility=(node.note or node.detail or "").strip(),
+            trace=[],
+            existing=False,
+        )
+    seen: set[tuple[str, str, str]] = set()
+    added = 0
+    for ln in variant.links:
+        s, d = idmap.get(ln.src), idmap.get(ln.dst)
+        if not s or not d:
+            continue
+        key = (s, d, ln.label)
+        if key in seen:
+            continue
+        seen.add(key)
+        state.connections.append(Connection(
+            src=s, dst=d,
+            label=ln.label or "calls",
+            kind=ln.kind if ln.kind in CONNECTION_KINDS else "sync",
+        ))
+        added += 1
+    state.phase = "propose"
+    return len(variant.nodes), added
+
+
 def _confirm(action: str, session: ArchSession) -> ToolResult:
     return ToolResult(output=f"{action}\nnext: {render._next_hint(session.state)}")
+
+
+# ============================ the loose sketch layer ============================
+# Brainstorming primitives. No validation — you're sketching on a napkin. Several
+# variants of the same feature can coexist; `promote` commits one into the strict
+# ArchState. See sketch.py for the model these mutate.
+
+
+class VariantTool(Tool):
+    name = "variant"
+    description = (
+        "Create, select, or archive a candidate architecture (a variant). Several "
+        "coexist for the same feature; the active one is what node/link/splice edit. "
+        "Offer the user rival shapes early. Archive a loser with a rejected_reason — "
+        "that reasoning is the ADR gold that survives into the handoff doc."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Optional; auto-assigned v1, v2, ..."},
+            "name": {"type": "string", "description": "e.g. 'synchronous', 'event-driven'"},
+            "summary": {"type": "string", "description": "the idea/tradeoff this take explores, one line"},
+            "select": {"type": "boolean", "description": "make it the active variant (default true)"},
+            "archive": {"type": "boolean", "description": "retire it as a rejected alternative"},
+            "rejected_reason": {"type": "string", "description": "why it lost — recorded on archive"},
+        },
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_brainstorm(session, "`variant`")
+        book = session.state.sketchbook
+        if args.get("archive"):
+            vid = (args.get("id") or "").strip()
+            v = book.variants.get(vid)
+            if v is None:
+                known = ", ".join(book.variants) or "none"
+                raise ToolError(f"no variant {vid!r} to archive (known: {known}).")
+            v.status = "archived"
+            if args.get("rejected_reason"):
+                v.rejected_reason = args["rejected_reason"]
+            if book.active == vid:
+                book.active = next(
+                    (k for k, x in book.variants.items() if x.status != "archived"), None
+                )
+            session.touched("variant", vid)
+            return _confirm(f"Archived variant {vid} ({v.name}).", session)
+        vid = (args.get("id") or f"v{len(book.variants) + 1}").strip()
+        v = book.variants.get(vid)
+        if v is None:
+            v = Variant(id=vid, name=args.get("name", vid), summary=args.get("summary", ""))
+            book.variants[vid] = v
+            action = f"Started variant {vid}: {v.name}."
+        else:
+            if "name" in args:
+                v.name = args["name"]
+            if "summary" in args:
+                v.summary = args["summary"]
+            v.status = "draft"
+            action = f"Updated variant {vid}."
+        if args.get("select", True) and v.status != "archived":
+            book.active = vid
+        session.touched("variant", vid)
+        return _confirm(action, session)
+
+
+class NodeTool(Tool):
+    name = "node"
+    description = (
+        "Add, update, or remove a box in the active variant. Loose: `kind` is a free "
+        "hint (service/store/queue/ui/llm/idea/...), nothing is validated — you're "
+        "sketching. remove:true deletes it (and any links touching it)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "short, stable handle for the box"},
+            "label": {"type": "string", "description": "display name"},
+            "kind": {"type": "string", "description": "free hint, e.g. 'store', 'queue', 'idea'"},
+            "note": {"type": "string", "description": "what it is / why it's here"},
+            "remove": {"type": "boolean"},
+        },
+        "required": ["id"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_brainstorm(session, "`node`")
+        v = _active_variant(session)
+        nid = args["id"].strip()
+        if args.get("remove"):
+            if nid not in v.nodes:
+                raise ToolError(f"node {nid!r} is not in variant {v.id}.")
+            v.nodes.pop(nid)
+            v.links = [ln for ln in v.links if nid not in (ln.src, ln.dst)]
+            action = f"Removed node {nid}."
+        else:
+            node = v.nodes.get(nid)
+            if node is None:
+                node = SketchNode(
+                    id=nid, label=args.get("label", nid),
+                    kind=args.get("kind", "component"), note=args.get("note", ""),
+                )
+                v.nodes[nid] = node
+                action = f"Added node {nid} ({node.kind})."
+            else:
+                for k in ("label", "kind", "note"):
+                    if k in args:
+                        setattr(node, k, args[k])
+                action = f"Updated node {nid}."
+        session.touched("node", nid)
+        return _confirm(action, session)
+
+
+class LinkTool(Tool):
+    name = "link"
+    description = (
+        "Add, update, or remove an edge in the active variant. Missing endpoints are "
+        "auto-created as stub nodes (fast sketching). `kind` is a free hint "
+        "(sync/async/batch). remove:true drops the edge."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "src": {"type": "string"},
+            "dst": {"type": "string"},
+            "label": {"type": "string", "description": "what the edge means, e.g. 'writes', 'emits'"},
+            "kind": {"type": "string", "description": "sync / async / batch (free hint)"},
+            "note": {"type": "string"},
+            "remove": {"type": "boolean"},
+        },
+        "required": ["src", "dst"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_brainstorm(session, "`link`")
+        v = _active_variant(session)
+        src, dst = args["src"].strip(), args["dst"].strip()
+        label = args.get("label")
+        idx = v.link_index(src, dst, label)
+        if args.get("remove"):
+            if idx < 0:
+                raise ToolError(f"no edge {src} -> {dst}" + (f" labeled {label!r}" if label else "") + ".")
+            v.links.pop(idx)
+            action = f"Removed edge {src} -> {dst}."
+        elif idx >= 0:
+            ln = v.links[idx]
+            for k in ("label", "kind", "note"):
+                if k in args:
+                    setattr(ln, k, args[k])
+            action = f"Updated edge {src} -> {dst}."
+        else:
+            created = []
+            for ref in (src, dst):
+                if ref not in v.nodes:
+                    v.nodes[ref] = SketchNode(id=ref, label=ref)
+                    created.append(ref)
+            v.links.append(SketchLink(
+                src=src, dst=dst, label=args.get("label", ""),
+                kind=args.get("kind", "sync"), note=args.get("note", ""),
+            ))
+            action = f"Linked {src} -> {dst}."
+            if created:
+                action += f" (created stub node(s): {', '.join(created)})"
+        session.touched("link", f"{src}->{dst}")
+        return _confirm(action, session)
+
+
+class SpliceTool(Tool):
+    name = "splice"
+    description = (
+        "Insert a new node between two existing ones: creates the node and rewires "
+        "src -> new -> dst, dropping the direct src -> dst edge (its kind/label carry "
+        "onto src -> new). The 'add an intermediate step' move — a cache, queue, or "
+        "gateway between two boxes."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "src": {"type": "string", "description": "existing node the edge leaves"},
+            "dst": {"type": "string", "description": "existing node the edge enters"},
+            "id": {"type": "string", "description": "id for the new node in between"},
+            "label": {"type": "string"},
+            "kind": {"type": "string", "description": "free hint for the new node"},
+            "note": {"type": "string"},
+        },
+        "required": ["src", "dst", "id"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_brainstorm(session, "`splice`")
+        v = _active_variant(session)
+        src, dst, nid = args["src"].strip(), args["dst"].strip(), args["id"].strip()
+        for ref in (src, dst):
+            if ref not in v.nodes:
+                raise ToolError(f"node {ref!r} is not in variant {v.id} — splice needs both ends to exist.")
+        if nid in v.nodes:
+            raise ToolError(f"node {nid!r} already exists; pick a new id for the inserted node.")
+        v.nodes[nid] = SketchNode(
+            id=nid, label=args.get("label", nid),
+            kind=args.get("kind", "component"), note=args.get("note", ""),
+        )
+        idx = v.link_index(src, dst)
+        old = v.links.pop(idx) if idx >= 0 else None
+        carry_kind = old.kind if old else "sync"
+        v.links.append(SketchLink(src=src, dst=nid, label=(old.label if old else ""), kind=carry_kind))
+        v.links.append(SketchLink(src=nid, dst=dst, label="", kind=carry_kind))
+        session.touched("node", nid)
+        return _confirm(f"Spliced {nid} between {src} and {dst}.", session)
+
+
+class DepthTool(Tool):
+    name = "depth"
+    description = (
+        "Set a node's depth — the fidelity slider. RAISE it (stub -> sketch -> "
+        "detailed) to flesh out internals in `detail`, or LOWER it to collapse a node "
+        "back toward a bare box. Reducing depth is a first-class simplification move, "
+        "not an undo — collapsing to stub clears the internal detail."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "node_id": {"type": "string"},
+            "level": {"type": "string", "enum": list(DEPTHS)},
+            "detail": {"type": "string", "description": "the internal sketch at sketch/detailed depth"},
+        },
+        "required": ["node_id", "level"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_brainstorm(session, "`depth`")
+        v = _active_variant(session)
+        nid = args["node_id"].strip()
+        node = v.nodes.get(nid)
+        if node is None:
+            raise ToolError(f"node {nid!r} is not in variant {v.id}.")
+        level = args["level"]
+        if level not in DEPTHS:
+            raise ToolError(f"level must be one of {', '.join(DEPTHS)}.")
+        node.depth = level
+        if level == "stub":
+            node.detail = ""  # collapsing clears the internal sketch
+        elif "detail" in args:
+            node.detail = args["detail"]
+        session.touched("node", nid)
+        return _confirm(f"{nid} depth -> {level}.", session)
+
+
+class PromoteTool(Tool):
+    name = "promote"
+    description = (
+        "Commit a variant: mark it chosen, archive the rivals, and seed the strict "
+        "design (components + connections) from its sketch — then you tighten each in "
+        "propose. Requires the brief to be complete first: the requirements only have "
+        "to be settled here, at promotion, not up front."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "variant_id": {"type": "string", "description": "which variant (default: the active one)"},
+        },
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        state = session.state
+        _guard_not_finalized(session)
+        if state.phase != "brainstorm":
+            raise ToolError(
+                f"promote only runs from brainstorm (phase is '{state.phase}'). The "
+                "shape is already committed."
+            )
+        book = state.sketchbook
+        vid = (args.get("variant_id") or book.active or "").strip()
+        v = book.variants.get(vid) if vid else None
+        if v is None:
+            raise ToolError("no variant to promote — name one with `variant` and sketch it first.")
+        if not v.nodes:
+            raise ToolError(f"variant {v.id} ({v.name}) has no nodes yet — sketch it before promoting.")
+        missing = state.brief.missing()
+        if missing:
+            raise ToolError(
+                f"before promoting, the brief still needs: {', '.join(missing)}. These are "
+                "the load-bearing facts the build depends on — ask the user, record them "
+                "with `brief`, then promote."
+            )
+        n_comp, n_conn = _promote(session, v)
+        session.touched()
+        return ToolResult(
+            output=(
+                f"Promoted '{v.name}': seeded {n_comp} component(s) and {n_conn} "
+                "connection(s) into the strict design; phase -> propose. Now give each "
+                "component a `trace` (which brief goal it serves) and a one-line "
+                "responsibility, add the key `flow`(s) and the major `decide` decision(s), "
+                "then call `done` for the user's top-level approval."
+            )
+        )
 
 
 class BriefTool(Tool):
@@ -340,6 +754,11 @@ class FlowTool(Tool):
         session = _session(ctx)
         state = session.state
         _guard_not_finalized(session)
+        if state.phase == "brainstorm":
+            raise ToolError(
+                "flows come after you `promote` a shape — while brainstorming, sketch "
+                "paths loosely with `node`/`link`/`splice`."
+            )
         if state.phase == "intake":
             raise ToolError("flows are locked until the brief is complete — call `brief` first.")
         fid = args["id"].strip()
@@ -570,7 +989,7 @@ class ExpandTool(Tool):
         session = _session(ctx)
         state = session.state
         _guard_not_finalized(session)
-        if state.phase in ("intake", "propose", "toplevel_review"):
+        if state.phase in ("brainstorm", "intake", "propose", "toplevel_review"):
             raise ToolError(
                 "expand is locked until the top level is approved — finish the top "
                 "level and call `done` to request the user's approval."
@@ -807,6 +1226,11 @@ class ArchDoneTool(Tool):
         summary = args["summary"]
         if state.phase == "finalized":
             raise ToolError("the session is already finalized.")
+        if state.phase == "brainstorm":
+            raise ToolError(
+                "you're still brainstorming — there's no phase to close here. When you "
+                "and the user agree on a shape, call `promote` to commit it (not `done`)."
+            )
         if state.phase == "intake":
             raise ToolError(
                 f"the brief still needs: {', '.join(state.brief.missing())}. Call `brief` "
@@ -824,6 +1248,15 @@ class ArchDoneTool(Tool):
         missing = state.toplevel_missing()
         if missing:
             raise ToolError("the top level still owes: " + "; ".join(missing) + ".")
+        blocking = state.blocking_questions()
+        if blocking:
+            items = "; ".join(f"{q.id}: {q.question}" for q in blocking)
+            raise ToolError(
+                f"{len(blocking)} blocking question(s) still open: {items}. Top-level "
+                "approval cannot be requested until they are resolved — ask the user in "
+                "your reply, record their answers with `answer`, and end your turn. Call "
+                "`done` again only once every blocking question is answered."
+            )
         state.phase = "toplevel_review"
         session.touched()
         approved, feedback = session.request_gate(
@@ -909,6 +1342,7 @@ def arch_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool
     if with_web:
         tools.extend([WebSearchTool(), WebFetchTool()])
     tools.extend([
+        VariantTool(), NodeTool(), LinkTool(), SpliceTool(), DepthTool(), PromoteTool(),
         BriefTool(), ComponentTool(), ConnectTool(), FlowTool(), ExpandTool(),
         DecideTool(), AskTool(), AnswerTool(), AmendTool(), SkillTool(),
         ArchDoneTool(),

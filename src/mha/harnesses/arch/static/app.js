@@ -1,25 +1,35 @@
-/* A3 Workbench — event-driven UI over the arch harness protocol.
-   One SSE connection in; POST /input, /permission, /interrupt out.
-   Late joiners are replayed by the server, so refresh rebuilds everything. */
+/* mha arch — "Paper direction" client over the arch harness protocol.
+   One SSE connection in; POST /input, /permission, /interrupt out. The server
+   replays late joiners (ready + latest arch_state + buffered transcript), so a
+   refresh rebuilds everything. The event contract is unchanged from A3 — only
+   the surfaces are new: header · hero canvas · right drawer · component card ·
+   finalize modal · bottom chat. */
 "use strict";
 
 const S = {
-  conn: "connecting",      // connecting | connected | disconnected | complete
+  conn: "connecting",          // connecting | connected | disconnected | complete
   ready: null,
-  arch: null,              // latest arch_state event
-  changed: null,           // {kind, id} from the latest arch_state
-  transcript: [],          // {t:"user"|"agent"|"notice"|"turn", ...}
-  stream: null,            // in-flight agent text
+  arch: null,                  // latest arch_state event
+  changed: null,               // {kind, id} from the latest arch_state
+  transcript: [],              // {t:"user"|"agent"|"notice"|"turn", ...}
+  stream: null,                // in-flight agent text
   running: false,
-  permission: null,        // pending toplevel_approval / finalize request
+  turnError: null,             // message for the error banner
+  lastUserText: "",
+  permission: null,            // pending toplevel_approval / finalize request
   artifacts: [],
   finalized: false,
-  tab: "transcript",
-  detail: null,            // component id open in the Components tab
-  selected: null,          // component id highlighted in the diagram
-  drill: null,             // component id whose facet fills the hero pane
   draft: "",
+
+  drawerOpen: false,
+  drawerSection: "decisions",  // decisions | questions | flows
+  decisionId: null,            // options detail open in the drawer
+
+  selected: null,              // component scoped into the chat (also highlighted in the diagram)
+  drill: null,                 // component whose facet fills the hero
+  drillChanged: false,
   lastCount: -1,
+  chatH: 300,                  // resizable bottom-chat height (px)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -28,12 +38,16 @@ function h(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "class") node.className = v;
+    else if (k === "html") node.innerHTML = v;
     else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
-    else node.setAttribute(k, v);
+    else if (v === true) node.setAttribute(k, "");
+    else if (v !== false && v != null) node.setAttribute(k, v);
   }
-  for (const c of children) if (c != null) node.append(c);
+  for (const c of children) if (c != null && c !== false) node.append(c);
   return node;
 }
+
+function state() { return (S.arch && S.arch.state) || null; }
 
 /* ================= event intake ================= */
 
@@ -47,20 +61,22 @@ function noticeFor(call) {
   let arg = "";
   try {
     const a = JSON.parse(call.arguments_json || "{}");
-    arg = a.id || a.component_id || a.src && `${a.src} → ${a.dst}` || a.topic ||
+    arg = a.id || a.component_id || (a.src && `${a.src} → ${a.dst}`) || a.topic ||
       a.path || a.question || a.query || a.url || a.name || "";
   } catch { /* leave arg empty */ }
   const glyph = NOTICE_GLYPHS[call.name] || "·";
-  return `${glyph} ${call.name}${arg ? " " + String(arg).slice(0, 70) : ""}`;
+  return `${glyph} ${call.name}${arg ? " " + String(arg).slice(0, 72) : ""}`;
 }
 
 function onHarnessEvent(ev) {
   const { event, data } = ev;
   if (event === "run_start") {
-    S.transcript.push({ t: "user", text: data.task || "" });
+    const task = data.task || "";
+    if (task) { S.transcript.push({ t: "user", text: task }); S.lastUserText = task; }
     S.running = true;
     S.stream = "";
-    renderComposer(); renderPill(); renderTranscriptIfActive();
+    S.turnError = null;
+    renderChat(); paint(); renderHeader();
   } else if (event === "assistant_delta") {
     if (S.stream === null) S.stream = "";
     S.stream += data.text || "";
@@ -68,16 +84,14 @@ function onHarnessEvent(ev) {
   } else if (event === "assistant") {
     if (data.content) S.transcript.push({ t: "agent", text: data.content });
     S.stream = S.running ? "" : null;
-    for (const call of data.tool_calls || []) {
-      S.transcript.push({ t: "notice", text: noticeFor(call) });
-    }
-    renderTranscriptIfActive();
+    for (const call of data.tool_calls || []) S.transcript.push({ t: "notice", text: noticeFor(call) });
+    renderChat();
   } else if (event === "tool_result" && data.is_error) {
-    S.transcript.push({ t: "notice", err: true, text: `✗ ${data.name} — see agent's next step` });
-    renderTranscriptIfActive();
+    S.transcript.push({ t: "notice", err: true, text: `✗ ${data.name} — see the agent's next step` });
+    renderChat();
   } else if (event === "abort") {
-    S.transcript.push({ t: "notice", err: true, text: `✗ aborted: ${data.reason}` });
-    renderTranscriptIfActive();
+    S.transcript.push({ t: "notice", err: true, text: `✗ aborted: ${data.reason || ""}` });
+    renderChat();
   }
 }
 
@@ -86,7 +100,7 @@ function onEvent(ev) {
     case "ready":
       S.ready = ev;
       if (S.conn !== "complete") S.conn = "connected";
-      renderStatus(); renderRail(); renderPill(); renderComposer();
+      paint(); renderHeader(); renderChat();
       break;
     case "harness_event":
       onHarnessEvent(ev);
@@ -98,7 +112,6 @@ function onEvent(ev) {
         S.finalized = true;
         S.conn = "complete";
         S.permission = null;
-        showOverlay();
       }
       renderAll();
       break;
@@ -106,19 +119,23 @@ function onEvent(ev) {
       if (ev.kind === "toplevel_approval" || ev.kind === "finalize") {
         S.permission = ev;
         if (ev.kind === "finalize") S.artifacts = ev.artifacts || [];
-        renderComposer();
+        renderChat();
       }
       break;
     case "turn_end":
       S.running = false;
       if (S.stream) S.transcript.push({ t: "agent", text: S.stream });
       S.stream = null;
-      S.transcript.push({ t: "turn", status: ev.status });
-      renderComposer(); renderPill(); renderTranscriptIfActive();
+      S.transcript.push({
+        t: "turn", status: ev.status,
+        message: ev.status === "error" ? (S.turnError || "the turn failed") : null,
+      });
+      paint(); renderChat(); renderHeader();
       break;
     case "error":
-      S.transcript.push({ t: "notice", err: true, text: `✗ ${ev.message}` });
-      renderTranscriptIfActive();
+      S.turnError = ev.message || "the turn failed";
+      S.transcript.push({ t: "notice", err: true, text: `✗ ${ev.message || "error"}` });
+      renderChat();
       break;
     case "bye":
       if (!S.finalized) disconnect();
@@ -129,31 +146,34 @@ function onEvent(ev) {
 function connect() {
   const es = new EventSource("/events");
   es.onmessage = (e) => onEvent(JSON.parse(e.data));
-  es.onerror = () => {
-    es.close();
-    if (!S.finalized) disconnect();
-  };
+  es.onerror = () => { es.close(); if (!S.finalized) disconnect(); };
 }
 
 function disconnect() {
   S.conn = "disconnected";
   S.running = false;
-  $("banner").hidden = false;
-  renderStatus(); renderComposer(); renderPill();
+  paint(); renderChat(); renderHeader();
 }
 
 /* ================= actions ================= */
 
 async function post(path, body) {
-  try {
-    await fetch(path, { method: "POST", body: JSON.stringify(body || {}) });
-  } catch { /* surfaced via connection state */ }
+  try { await fetch(path, { method: "POST", body: JSON.stringify(body || {}) }); }
+  catch { /* surfaced via connection state */ }
 }
 
 function sendMessage(text) {
   if (!text.trim()) return;
+  if (S.permission) { respond(false, text.trim()); return; }  // reply during a gate = refine (request changes)
+  let out = text.trim();
+  const st = state();                       // scope the message to the selected component, if any
+  if (S.selected && st && st.components[S.selected]) {
+    const c = st.components[S.selected];
+    out = `About ${c.name} (${c.id}): ${out}`;
+  }
   S.draft = "";
-  post("/input", { text });
+  S.lastUserText = out;
+  post("/input", { text: out });
 }
 
 function respond(approved, feedback) {
@@ -161,413 +181,335 @@ function respond(approved, feedback) {
   if (!req) return;
   S.permission = null;
   S.running = true;
+  S.draft = "";
   post("/permission", { id: req.id, approved, feedback: feedback || "" });
-  renderComposer(); renderPill();
+  paint(); renderChat();
 }
 
-/* ================= regions ================= */
+/* ================= header ================= */
 
-function renderStatus() {
-  if (S.ready) {
-    $("sb-model").textContent = S.ready.model || "—";
-    const repo = S.ready.repo || "—";
-    $("sb-repo").textContent = repo.split("/").slice(-2).join("/");
-    $("sb-session").textContent = S.ready.run_id || "—";
-  }
-  const chip = $("sb-conn");
-  const labels = {
-    connecting: "Connecting…", connected: "Connected",
-    disconnected: "Disconnected", complete: "Session complete",
-  };
-  chip.className = `chip conn ${S.conn}`;
-  chip.lastElementChild.textContent = labels[S.conn];
+function sessionTitle() {
+  const st = state();
+  if (st && st.brief && st.brief.goal) return st.brief.goal;
+  const u = S.transcript.find((x) => x.t === "user");
+  if (u && u.text) return u.text;
+  return "Architecture session";
 }
 
-function renderPill() {
-  const pill = $("d-live");
-  let mode = "connecting", label = "connecting";
-  if (S.conn === "disconnected") { mode = "stale"; label = "stale"; }
-  else if (S.conn === "complete") { mode = "live"; label = "final"; }
-  else if (S.conn === "connected") {
-    if (S.running) { mode = "updating"; label = "updating"; }
-    else { mode = "live"; label = "live"; }
-  }
-  pill.className = `pill ${mode}`;
-  pill.lastElementChild.textContent = label;
-  $("d-cue").textContent =
-    S.changed ? `last change · ${S.changed.kind} ${S.changed.id}` : "";
+function renderHeader() {
+  $("brand").textContent = sessionTitle();
+  const r = S.ready || {};
+  $("m-model").textContent = `architect · ${r.model || "—"}`;
+  const repo = r.repo || "";
+  $("m-repo").textContent = repo ? repo.split("/").slice(-2).join("/") : "—";
+  $("m-session").textContent = r.run_id ? `sess ${r.run_id}` : "—";
+  const labels = { connecting: "Connecting…", connected: "Live", disconnected: "Disconnected", complete: "Complete" };
+  $("conn-label").textContent = labels[S.conn];
 }
 
-function state() { return (S.arch && S.arch.state) || null; }
+function paint() {
+  const app = $("app");
+  app.dataset.conn = S.conn;
+  app.dataset.run = S.running ? "running" : "idle";
+  app.dataset.drawer = S.drawerOpen ? "open" : "closed";
+  $("conn-lost").hidden = S.conn !== "disconnected";
+  $("ro-badge").hidden = !S.finalized;
+}
+
+/* ================= diagram ================= */
+
+function oweSet() {
+  const st = state(), s = new Set();
+  if (st) for (const o of st.obligations || []) if (o.status === "pending") s.add(o.component_id);
+  return s;
+}
 
 function renderDiagram() {
   const st = state();
   const count = st ? Object.keys(st.components).length : 0;
-  $("dempty").style.display = count ? "none" : "flex";
-  if (!count) return;
+  const drilling = !!(S.drill && st && st.components[S.drill] && st.components[S.drill].facet);
+  $("empty").hidden = count > 0 || drilling;
+  if (!st) { $("crumb").hidden = true; return; }
   try {
-    Diagram.render(st, {
-      changedId: S.changed && S.changed.kind === "component" ? S.changed.id : null,
-      selectedId: S.selected,
-      drillId: S.drill,
-    });
-    $("derror").hidden = true;
-    if (count !== S.lastCount || S.drillChanged) {
-      Diagram.fit();
-      S.lastCount = count;
-      S.drillChanged = false;
+    // Always render (an empty state clears the viewport — no stale nodes left behind).
+    Diagram.render(st, { changed: S.changed, selectedId: S.selected, drillId: S.drill, oweSet: oweSet() });
+    $("render-error").hidden = true;
+    if ((count > 0 || drilling) && (count !== S.lastCount || S.drillChanged)) {
+      Diagram.fit(); S.lastCount = count; S.drillChanged = false;
     }
   } catch (err) {
-    $("derror").hidden = false;
-    $("derror-msg").textContent = String(err);
+    $("render-error").hidden = false;
+    $("render-error-msg").textContent = String(err);
   }
-  const crumb = $("d-crumb");
-  crumb.textContent = S.drill ? `← system / ${S.drill}` : "";
+  if (drilling) {
+    $("crumb").hidden = false;
+    $("crumb-name").textContent = st.components[S.drill].name;
+  } else {
+    $("crumb").hidden = true;
+  }
 }
 
 function setDrill(id) {
   S.drill = id;
   S.drillChanged = true;
-  renderDiagram();
+  renderAll();
 }
 
-function renderRail() {
-  const st = state();
-  const dl = $("rail-session");
-  dl.replaceChildren(
-    h("dt", {}, "model"), h("dd", {}, (S.ready && S.ready.model) || "—"),
-    h("dt", {}, "session"), h("dd", {}, (S.ready && S.ready.run_id) || "—"),
-    h("dt", {}, "phase"), h("dd", {}, (S.arch && S.arch.phase) || "—"),
-  );
-  const counts = tabCounts();
-  const jump = $("rail-jump");
-  jump.replaceChildren(
-    h("a", { class: "active" }, h("span", {}, "Diagram")),
-    ...[["components", "Components"], ["decisions", "Decisions"],
-        ["questions", "Questions"], ["flows", "Flows"]].map(([key, label]) =>
-      h("a", { onclick: () => switchTab(key) },
-        h("span", {}, label), h("span", { class: "n" }, String(counts[key])))
-    ),
-  );
-  const pending = st ? (st.obligations || []).filter((o) => o.status === "pending") : [];
-  $("rail-obligations-block").hidden = pending.length === 0;
-  $("rail-obligations").replaceChildren(
-    ...pending.map((o, i) =>
-      h("li", { class: i === 0 ? "head" : "" }, `${o.component_id} (${o.facet})`))
-  );
+/* ================= right drawer ================= */
+
+function qStatus(q) {
+  if (q.resolution === "answered" || q.answer) return "answered";
+  if (q.blocking) return "blocking";
+  return "open";
 }
 
-/* ---- dock ---- */
-
-function tabCounts() {
+function drawerCounts() {
   const st = state();
   return {
-    components: st ? Object.keys(st.components).length : 0,
     decisions: st ? st.decisions.length : 0,
     questions: st ? st.questions.length : 0,
     flows: st ? st.flows.length : 0,
   };
 }
 
-function switchTab(tab) {
-  S.tab = tab;
-  if (tab !== "components") S.detail = null;
-  renderDock();
+function renderDrawerTab() {
+  const st = state();
+  $("drawer-tab-count").textContent = String(st ? st.decisions.length : 0);
+  const blocking = st && st.questions.some((q) => qStatus(q) === "blocking" && !q.resolution);
+  $("drawer-tab-flag").hidden = !blocking;
 }
 
-function renderTabs() {
-  const counts = tabCounts();
-  const defs = [
-    ["transcript", "Transcript", null],
-    ["components", "Components", counts.components],
-    ["decisions", "Decisions", counts.decisions],
-    ["questions", "Questions", counts.questions],
-    ["flows", "Flows", counts.flows],
-  ];
-  $("dock-tabs").replaceChildren(
-    ...defs.map(([key, label, n]) =>
-      h("button", { class: key === S.tab ? "active" : "", onclick: () => switchTab(key) },
-        label, n ? h("span", { class: "n" }, String(n)) : null))
-  );
+function openDrawer(section) {
+  S.drawerOpen = true;
+  if (section) S.drawerSection = section;
+  S.decisionId = null;
+  renderAll();
 }
+function closeDrawer() { S.drawerOpen = false; paint(); }
 
-function renderDock() {
-  renderTabs();
-  const body = $("dock-body");
-  if (S.tab === "transcript") return renderTranscript(body);
-  if (S.tab === "components") {
-    return S.detail ? renderComponentDetail(body, S.detail) : renderComponents(body);
+function drawerDecisions() {
+  const st = state();
+  if (!st || !st.decisions.length) return h("div", { class: "drawer-empty" }, "No decisions recorded yet.");
+  const wrap = h("div", { class: "drawer-body-inner" });
+  const box = h("div", { style: "display:flex;flex-direction:column;gap:12px" });
+  for (const d of st.decisions) {
+    box.append(h("div", { class: "pcard click", onclick: () => { S.decisionId = d.id; renderDrawer(); } },
+      h("div", { class: "plabel" }, d.category),
+      h("div", { class: "ptitle" }, `${d.topic} → ${d.choice}`),
+      d.status === "deferred" ? h("span", { class: "tag" }, "deferred") : null,
+      d.rationale ? h("div", { class: "psub" }, d.rationale) : null));
   }
-  if (S.tab === "decisions") return renderDecisions(body);
-  if (S.tab === "questions") return renderQuestions(body);
-  if (S.tab === "flows") return renderFlows(body);
+  wrap.append(box);
+  return wrap;
 }
 
-/* transcript */
+function drawerDecisionDetail() {
+  const st = state();
+  const d = st && st.decisions.find((x) => x.id === S.decisionId);
+  if (!d) { S.decisionId = null; return drawerDecisions(); }
+  const wrap = h("div", { style: "display:flex;flex-direction:column;gap:12px" });
+  wrap.append(h("button", { class: "detail-back", onclick: () => { S.decisionId = null; renderDrawer(); } },
+    h("span", {}, "←"), h("span", {}, "Decisions")));
+  wrap.append(h("div", { class: "plabel" }, d.category));
+  wrap.append(h("div", { style: "font-family:var(--serif);font-size:16px;font-weight:600;color:var(--ink)" }, d.topic));
+  const row = h("div", { class: "opt-row" });
+  for (const o of d.options || []) {
+    const chosen = o.name === d.choice;
+    const opt = h("div", { class: "opt" + (chosen ? " chosen" : " dim") });
+    opt.append(h("div", { class: "opt-name" },
+      h("span", {}, o.name),
+      chosen ? h("span", { class: "opt-chosen" }, "chosen") : null));
+    for (const p of o.pros || []) opt.append(h("div", { class: "pro" }, `＋ ${p}`));
+    for (const c of o.cons || []) opt.append(h("div", { class: "con" }, `− ${c}`));
+    row.append(opt);
+  }
+  if ((d.options || []).length) wrap.append(row);
+  wrap.append(h("div", { class: "plabel", style: "margin-top:2px" }, "Rationale"));
+  wrap.append(h("div", { style: "font-size:12.5px;color:var(--ink);line-height:1.55" }, d.rationale || "—"));
+  return wrap;
+}
 
-function transcriptNode(item) {
+function drawerQuestions() {
+  const st = state();
+  if (!st || !st.questions.length) return h("div", { class: "drawer-empty" }, "No open questions.");
+  const box = h("div", { style: "display:flex;flex-direction:column;gap:12px" });
+  const LABELS = { blocking: "blocking · unanswered", answered: "answered", open: "non-blocking" };
+  for (const q of st.questions) {
+    const s = qStatus(q);
+    const card = h("div", { class: "pcard" + (s === "answered" ? " answered" : "") });
+    card.append(h("div", { class: `qdot ${s}` }, LABELS[s]));
+    card.append(h("div", { class: "ptitle", style: "font-weight:500" }, q.question));
+    if (s === "blocking") card.append(h("div", { class: "pfoot" }, "Gates finalize until answered."));
+    else if (q.answer) card.append(h("div", { class: "psub" }, q.answer));
+    box.append(card);
+  }
+  return box;
+}
+
+function drawerFlows() {
+  const st = state();
+  if (!st || !st.flows.length) return h("div", { class: "drawer-empty" }, "No flows recorded yet.");
+  const box = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
+  for (const f of st.flows) {
+    const flow = h("div", { class: "flow" });
+    flow.append(h("div", { class: "fhead" },
+      h("span", { class: "fname" }, f.name),
+      h("span", { class: "tag" }, f.kind)));
+    const ol = h("ol", { class: "fsteps" });
+    (f.steps || []).forEach((s, i) => {
+      ol.append(h("li", {},
+        h("span", { class: "faint" }, `${i + 1}. `),
+        h("code", {}, `${s.src} → ${s.dst}`), ` — ${s.action}`,
+        s.note ? h("span", { class: "faint" }, `  (${s.note})`) : null));
+    });
+    flow.append(ol);
+    box.append(flow);
+  }
+  return box;
+}
+
+function renderDrawer() {
+  const d = $("drawer");
+  const counts = drawerCounts();
+  const titles = { decisions: "Decisions", questions: "Open Questions", flows: "Flows" };
+  const head = h("div", { class: "drawer-head" },
+    h("div", { class: "dh-title" }, S.decisionId ? "Decision" : titles[S.drawerSection]),
+    h("button", { class: "dh-close", onclick: closeDrawer }, "✕"));
+  const seg = h("div", { class: "seg" },
+    ...[["decisions", "Decisions"], ["questions", "Questions"], ["flows", "Flows"]].map(([k, label]) =>
+      h("button", {
+        class: (S.drawerSection === k && !S.decisionId) ? "active" : "",
+        onclick: () => { S.drawerSection = k; S.decisionId = null; renderDrawer(); },
+      }, label, h("span", { class: "n" }, String(counts[k])))));
+  let body;
+  if (S.drawerSection === "decisions") body = S.decisionId ? drawerDecisionDetail() : drawerDecisions();
+  else if (S.drawerSection === "questions") body = drawerQuestions();
+  else body = drawerFlows();
+  d.replaceChildren(head, seg, h("div", { class: "drawer-body" }, body));
+}
+
+/* ================= component selection (scopes the chat) ================= */
+
+function focusComposer() {
+  const ta = document.querySelector('#composer textarea:not([disabled])');
+  if (!ta) return;
+  ta.focus();
+  const n = ta.value.length;
+  try { ta.setSelectionRange(n, n); } catch { /* ignore */ }
+  ta.dispatchEvent(new Event("input"));
+}
+
+function canSendNow() {
+  return S.conn === "connected" && !S.running && !S.permission && !S.finalized;
+}
+
+function isDrillable(c) {
+  const f = c && c.facet;
+  return !!f && (f.facet_kind === "store" || f.facet_kind === "infra" ||
+    (f.facet_kind === "service" && (f.modules || []).length));
+}
+
+function selectComp(id) {
+  // Click a node to scope the chat to it; click the same node again to clear.
+  S.selected = (S.selected === id) ? null : id;
+  renderDiagram();
+  renderComposer();
+  if (S.selected) focusComposer();
+}
+
+function clearSelection() {
+  S.selected = null;
+  renderDiagram();
+  renderComposer();
+}
+
+function expandComp(c) {
+  // A clear, complete instruction — sent straight to the agent (not scope-prefixed).
+  const msg = `Please expand the "${c.name}" (${c.id}) component and detail its ${c.kind} internals.`;
+  if (canSendNow()) { S.lastUserText = msg; post("/input", { text: msg }); }
+  else { S.draft = msg; renderComposer(); focusComposer(); }
+}
+
+function scopeChip(c) {
+  const chip = h("div", { class: "scope-chip" });
+  chip.append(h("span", { class: "sc-label" }, "Asking about"));
+  chip.append(h("span", { class: "sc-name" }, h("span", { class: "sc-kind" }, c.kind), c.name));
+  if (isDrillable(c)) chip.append(h("button", { class: "sc-act", onclick: () => setDrill(c.id) }, "View internals"));
+  if (!c.facet) chip.append(h("button", { class: "sc-act", onclick: () => expandComp(c) }, "Expand"));
+  chip.append(h("button", { class: "sc-clear", title: "Clear selection", onclick: clearSelection }, "✕"));
+  return chip;
+}
+
+/* ================= approval / finalize gate (non-blocking banner) ================= */
+/* Renders above the composer, so the diagram stays fully visible. The agent's turn
+   is still open — replying refines (routes as feedback); the button confirms. */
+
+function gateBar() {
+  const isFinal = S.permission.kind === "finalize";
+  const bar = h("div", { class: "gate" });
+  bar.append(h("div", { class: "gate-text" },
+    h("b", {}, isFinal ? "Ready to finalize" : "Top-level design ready for approval"),
+    h("span", { class: "gate-sub" }, isFinal
+      ? " — writes the handoff bundle and ends the session."
+      : " — approve to move on to expanding components, or reply below to refine.")));
+  bar.append(h("button", { class: "gate-btn" + (isFinal ? " finalize" : ""), onclick: () => respond(true) },
+    isFinal ? "Finalize" : "Approve"));
+  return bar;
+}
+
+/* ================= bottom chat ================= */
+
+function logNode(item) {
   if (item.t === "user") {
-    return h("div", { class: "t-user" }, h("div", { class: "who" }, "you"),
-      h("div", { class: "msg" }, item.text));
+    return h("div", { class: "turn you" },
+      h("div", { class: "avatar you" }, "you"),
+      h("div", { class: "bubble" }, h("div", { class: "msg" }, item.text)));
   }
   if (item.t === "agent") {
-    return h("div", { class: "t-agent" }, h("div", { class: "who" }, "agent"),
-      h("div", { class: "msg" }, item.text));
+    return h("div", { class: "turn" },
+      h("div", { class: "avatar" }, "A"),
+      h("div", { class: "bubble" }, h("div", { class: "msg" }, item.text)));
   }
   if (item.t === "notice") {
-    return h("div", { class: "t-notice" + (item.err ? " err" : "") }, item.text);
+    return h("div", { class: "notice" + (item.err ? " err" : "") }, item.text);
   }
-  return h("div", { class: "t-turn" }, `turn ${item.status}`);
+  // turn boundary
+  if (item.status === "error") {
+    return h("div", { class: "errbanner" },
+      h("span", {}, `Turn failed — ${item.message}. `),
+      h("span", { class: "retry", onclick: () => S.lastUserText && post("/input", { text: S.lastUserText }) }, "Retry"));
+  }
+  if (item.status === "interrupted") {
+    return h("div", { class: "divider" }, h("span", {}, "turn interrupted"));
+  }
+  return null; // completed turns need no marker
 }
 
-function renderTranscript(body) {
-  const wrap = h("div", { id: "transcript" }, ...S.transcript.map(transcriptNode));
+function renderLog() {
+  const log = $("log");
+  const nodes = S.transcript.map(logNode).filter(Boolean);
   if (S.stream !== null) {
     const msg = h("div", { class: "msg" }, S.stream);
-    msg.append(h("span", { class: "caret" }));
-    wrap.append(h("div", { class: "t-agent", id: "streaming" },
-      h("div", { class: "who" }, "agent"), msg));
+    msg.append(h("span", { class: "caret" }, "▍"));
+    nodes.push(h("div", { class: "turn", id: "streaming" },
+      h("div", { class: "avatar" }, "A"),
+      h("div", { class: "bubble" }, msg)));
   }
-  body.replaceChildren(wrap);
-  body.scrollTop = body.scrollHeight;
-}
-
-function renderTranscriptIfActive() {
-  if (S.tab === "transcript") renderTranscript($("dock-body"));
+  log.replaceChildren(...nodes);
+  log.scrollTop = log.scrollHeight;
 }
 
 function updateStream() {
-  if (S.tab !== "transcript") return;
-  const node = document.getElementById("streaming");
-  if (!node) return renderTranscriptIfActive();
+  const node = $("streaming");
+  if (!node) return renderLog();
   const msg = node.querySelector(".msg");
   msg.firstChild.textContent = S.stream;
-  const body = $("dock-body");
-  body.scrollTop = body.scrollHeight;
+  const log = $("log");
+  log.scrollTop = log.scrollHeight;
 }
 
-/* components */
-
-function componentState(id) {
-  const st = state();
-  if (S.changed && S.changed.kind === "component" && S.changed.id === id) return "changed";
-  if (st && (st.obligations || []).some((o) => o.component_id === id && o.status === "pending")) {
-    return "owes facet";
-  }
-  return "stable";
-}
-
-function connCounts(id) {
-  const st = state();
-  if (!st) return [0, 0];
-  const out = st.connections.filter((c) => c.src === id).length;
-  const inn = st.connections.filter((c) => c.dst === id).length;
-  return [out, inn];
-}
-
-function renderComponents(body) {
-  const st = state();
-  if (!st || !Object.keys(st.components).length) {
-    body.replaceChildren(h("p", { class: "muted" }, "No components yet."));
-    return;
-  }
-  body.replaceChildren(h("ul", { class: "rowlist" },
-    ...Object.values(st.components).map((c) => {
-      const cs = componentState(c.id);
-      const [out, inn] = connCounts(c.id);
-      return h("li", { class: "click", onclick: () => { S.detail = c.id; S.selected = c.id; renderDock(); renderDiagram(); } },
-        h("code", {}, c.id),
-        h("span", { class: "tag" }, c.kind),
-        h("span", { class: "tag" + (cs !== "stable" ? " ink" : "") }, cs),
-        h("span", { class: "grow muted" }, c.responsibility),
-        h("span", { class: "muted mono" }, `${out} out · ${inn} in`),
-        h("span", { class: "muted" }, "›"));
-    })));
-}
-
-function facetSection(c) {
-  const f = c.facet;
-  if (!f) return null;
-  const sec = h("section", {});
-  sec.append(h("div", { class: "label" }, `${f.facet_kind} facet`));
-  const table = (heads, rows) => {
-    const t = h("table", { class: "kvtable" });
-    t.append(h("tr", {}, ...heads.map((x) => h("th", {}, x))));
-    for (const r of rows) t.append(h("tr", {}, ...r.map((x) => h("td", {}, x))));
-    return t;
-  };
-  if (f.facet_kind === "api") {
-    sec.append(table(["method", "route", "auth", "errors"],
-      f.endpoints.map((e) => [e.method, e.route, e.auth, (e.errors || []).join(", ")])));
-  } else if (f.facet_kind === "store") {
-    sec.append(table(["entity", "keys", "fields"],
-      f.entities.map((e) => [e.name, e.keys, (e.fields || []).join(", ")])));
-    for (const p of f.access_patterns || []) sec.append(h("div", { class: "muted" }, `access: ${p}`));
-    if (f.retention) sec.append(h("div", { class: "muted" }, `retention: ${f.retention}`));
-  } else if (f.facet_kind === "queue") {
-    sec.append(table(["message", "delivery", "ordering", "schema"],
-      f.messages.map((m) => [m.name, m.delivery, m.ordering, m.schema])));
-  } else if (f.facet_kind === "llm") {
-    sec.append(table(["task", "tier", "contract", "fallback"],
-      f.tasks.map((t) => [t.name, t.model_tier, t.prompt_contract, t.fallback])));
-  } else if (f.facet_kind === "service") {
-    for (const i of f.interface || []) sec.append(h("div", {}, `exposes: ${i}`));
-    for (const m of f.modules || []) sec.append(h("div", { class: "muted" }, `module ${m.name}: ${m.purpose}`));
-  } else if (f.facet_kind === "infra") {
-    sec.append(table(["unit", "components", "scaling"],
-      f.units.map((u) => [u.name, (u.components || []).join(", "), u.scaling_policy])));
-    if (f.state_locality) sec.append(h("div", { class: "muted" }, `state: ${f.state_locality}`));
-  }
-  const drillable = f.facet_kind === "store" || f.facet_kind === "infra" ||
-    (f.facet_kind === "service" && f.modules);
-  if (drillable) {
-    sec.append(h("button", { onclick: () => setDrill(c.id), style: "margin-top:6px" },
-      "View internals in diagram"));
-  }
-  return sec;
-}
-
-function renderComponentDetail(body, id) {
-  const st = state();
-  const c = st && st.components[id];
-  if (!c) { S.detail = null; return renderComponents(body); }
-  const wrap = h("div", { class: "detail" });
-  wrap.append(h("button", { class: "back", onclick: () => { S.detail = null; S.selected = null; renderDock(); renderDiagram(); } },
-    "← All components"));
-  wrap.append(h("h3", {}, h("code", {}, c.id), h("span", { class: "tag" }, c.kind),
-    h("span", { class: "tag" + (componentState(id) !== "stable" ? " ink" : "") }, componentState(id))));
-  const purpose = h("section", {});
-  purpose.append(h("div", { class: "label" }, "Purpose"), h("div", {}, c.responsibility));
-  if (c.tech) purpose.append(h("div", { class: "muted" }, `tech: ${c.tech}`));
-  if (c.data_owned) purpose.append(h("div", { class: "muted" }, `owns: ${c.data_owned}`));
-  if (c.failure_notes) purpose.append(h("div", { class: "muted" }, `on failure: ${c.failure_notes}`));
-  wrap.append(purpose);
-  const fs = facetSection(c);
-  if (fs) wrap.append(fs);
-
-  const edges = st.connections.filter((x) => x.src === id || x.dst === id);
-  const conns = h("section", {});
-  conns.append(h("div", { class: "label" }, `Connections (${edges.length})`));
-  for (const e of edges) {
-    conns.append(h("div", {},
-      h("span", { class: "tag" }, e.src === id ? "out" : "in"), " ",
-      h("code", {}, `${e.src} → ${e.dst}`), ` ${e.label} (${e.kind})`));
-  }
-  wrap.append(conns);
-
-  const related = st.decisions.filter((d) =>
-    (d.topic + " " + d.rationale).toLowerCase().includes(id.toLowerCase()));
-  if (related.length) {
-    const sec = h("section", {});
-    sec.append(h("div", { class: "label" }, "Related decisions"));
-    for (const d of related) sec.append(h("div", {}, `${d.topic} → ${d.choice}`));
-    wrap.append(sec);
-  }
-  const qs = st.questions.filter((q) => q.question.toLowerCase().includes(id.toLowerCase()));
-  if (qs.length) {
-    const sec = h("section", {});
-    sec.append(h("div", { class: "label" }, "Open questions"));
-    for (const q of qs) sec.append(h("div", {}, q.question));
-    wrap.append(sec);
-  }
-  body.replaceChildren(wrap);
-}
-
-/* decisions / questions / flows */
-
-function renderDecisions(body) {
-  const st = state();
-  if (!st || !st.decisions.length) {
-    return body.replaceChildren(h("p", { class: "muted" }, "No decisions recorded yet."));
-  }
-  body.replaceChildren(h("ul", { class: "rowlist" }, ...st.decisions.map((d) =>
-    h("li", {},
-      h("span", {}, d.topic),
-      h("span", { class: "tag ink" }, d.choice),
-      d.status === "deferred" ? h("span", { class: "tag" }, "deferred") : null,
-      h("span", { class: "grow muted" }, d.rationale),
-      h("span", { class: "tag" }, d.category)))));
-}
-
-function renderQuestions(body) {
-  const st = state();
-  if (!st || !st.questions.length) {
-    return body.replaceChildren(h("p", { class: "muted" }, "No open questions."));
-  }
-  body.replaceChildren(h("ul", { class: "rowlist" }, ...st.questions.map((q) =>
-    h("li", {},
-      h("code", {}, q.id),
-      h("span", { class: "grow" }, q.question),
-      q.blocking && !q.resolution ? h("span", { class: "tag ink" }, "blocking") : null,
-      h("span", { class: "tag" }, q.resolution || "open"),
-      q.answer ? h("span", { class: "muted grow" }, q.answer) : null))));
-}
-
-function renderFlows(body) {
-  const st = state();
-  if (!st || !st.flows.length) {
-    return body.replaceChildren(h("p", { class: "muted" }, "No flows recorded yet."));
-  }
-  const wrap = h("div", {});
-  for (const f of st.flows) {
-    const sec = h("section", { style: "margin-bottom:12px" });
-    sec.append(h("div", {}, h("b", {}, f.name), " ", h("span", { class: "tag" }, f.kind)));
-    const ol = h("ol", { style: "margin:4px 0 0 22px" });
-    for (const s of f.steps) {
-      ol.append(h("li", {}, h("code", {}, `${s.src} → ${s.dst}`), ` — ${s.action}`,
-        s.note ? h("span", { class: "muted" }, `  (${s.note})`) : null));
-    }
-    sec.append(ol);
-    wrap.append(sec);
-  }
-  body.replaceChildren(wrap);
-}
-
-/* ---- composer ---- */
-
-function renderComposer() {
-  const bar = $("commandbar");
-  if (S.finalized) {
-    bar.replaceChildren(h("div", { class: "lockbar" }, "Session finalized — read-only"));
-    return;
-  }
-  if (S.permission) {
-    const isFinal = S.permission.kind === "finalize";
-    const card = h("div", { class: "decision" });
-    card.append(h("div", { class: "dtitle" },
-      isFinal ? "Finalize architecture?" : "Approve the top-level design?"));
-    if (S.permission.summary) card.append(h("div", { class: "dsummary" }, S.permission.summary));
-    if (isFinal && S.artifacts.length) {
-      card.append(h("div", { class: "muted mono" }, `writes: ${S.artifacts.join("  ·  ")}`));
-    }
-    const feedback = h("div", { class: "feedback" }, );
-    const ta = h("textarea", { placeholder: "What should change?" });
-    feedback.append(ta, h("button", { onclick: () => respond(false, ta.value) }, "Send feedback"));
-    feedback.hidden = true;
-    card.append(h("div", { class: "actions" },
-      h("button", { class: "approve", onclick: () => respond(true) },
-        isFinal ? "Finalize architecture" : "Approve top level"),
-      h("button", { class: "changes", onclick: () => { feedback.hidden = !feedback.hidden; ta.focus(); } },
-        "Request changes")), feedback);
-    bar.replaceChildren(card);
-    return;
-  }
-  if (S.conn === "connecting") {
-    bar.replaceChildren(h("div", { class: "lockbar" }, "Connecting to session…"));
-    return;
-  }
-  if (S.conn === "disconnected") {
-    bar.replaceChildren(h("div", { class: "lockbar" }, "Disconnected — input locked ",
-      h("button", { onclick: () => location.reload() }, "Reconnect")));
-    return;
-  }
-  if (S.running) {
-    bar.replaceChildren(h("div", { class: "running" },
-      h("span", { class: "muted" }, "Agent is working — sending paused"),
-      h("button", { class: "interrupt", onclick: () => post("/interrupt") }, "Interrupt")));
-    return;
-  }
-  const ta = h("textarea", { placeholder: "Reply to the agent…", rows: "1" });
+function composerField(placeholder) {
+  const ta = h("textarea", { placeholder, rows: "1" });
   ta.value = S.draft;
   ta.addEventListener("input", () => {
     S.draft = ta.value;
@@ -575,50 +517,142 @@ function renderComposer() {
     ta.style.height = Math.min(ta.scrollHeight, 132) + "px";
   });
   ta.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage(ta.value);
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(ta.value); }
   });
-  const box = h("div", {});
-  box.append(
-    h("div", { class: "composer" }, ta,
-      h("button", { class: "send", onclick: () => sendMessage(ta.value) }, "Send")),
-    h("div", { class: "hint" }, "⏎ send · ⇧⏎ newline"),
-  );
-  bar.replaceChildren(box);
+  return ta;
+}
+
+function renderComposer() {
+  const bar = $("composer");
+
+  if (S.finalized) {
+    const paths = S.artifacts.length ? S.artifacts : null;
+    const body = h("div", { class: "c-body" });
+    if (paths) {
+      body.append("Handoff bundle written to ");
+      paths.forEach((p, i) => {
+        body.append(h("code", {}, p));
+        if (i < paths.length - 2) body.append(", ");
+        else if (i === paths.length - 2) body.append(" and ");
+      });
+      body.append(". Next: run ", h("code", {}, "mha code"), " to start building against this design.");
+    } else {
+      body.append("The handoff bundle was written (paths printed in the CLI). Next: run ", h("code", {}, "mha code"), ".");
+    }
+    bar.replaceChildren(h("div", { class: "complete" },
+      h("div", { class: "c-title" }, "Session complete"), body));
+    return;
+  }
+
+  const inner = h("div", { class: "composer-inner" });
+
+  if (S.permission) {
+    const isFinal = S.permission.kind === "finalize";
+    inner.append(gateBar());
+    const ta = composerField(isFinal ? "Reply to refine — or Finalize above…" : "Reply to refine the design — or Approve above…");
+    inner.append(
+      h("div", { class: "field" }, ta, h("button", { class: "send", onclick: () => sendMessage(ta.value) }, "Send")),
+      h("div", { class: "hint" }, isFinal ? "⏎ reply to refine · Finalize ends the session" : "⏎ reply to refine · Approve to continue"));
+    bar.replaceChildren(inner);
+    ta.focus();
+    return;
+  }
+  if (S.conn === "connecting") {
+    inner.append(h("div", { class: "locknote" }, h("span", { class: "spinner" }), "Connecting to the session…"));
+    bar.replaceChildren(inner);
+    return;
+  }
+  if (S.conn === "disconnected") {
+    inner.append(h("div", { class: "locknote" }, "Disconnected — ",
+      h("span", { class: "retry", style: "text-decoration:underline;cursor:pointer;color:var(--accent)", onclick: () => location.reload() }, "reconnect")));
+    bar.replaceChildren(inner);
+    return;
+  }
+  if (S.running) {
+    const field = h("div", { class: "field locked" },
+      h("textarea", { rows: "1", disabled: true, placeholder: "Sending disabled while the agent works…" }),
+      h("button", { class: "interrupt", onclick: () => post("/interrupt") }, "Interrupt"));
+    inner.append(field);
+    bar.replaceChildren(inner);
+    return;
+  }
+
+  const st = state();
+  const selC = S.selected && st && st.components[S.selected];
+  if (selC) inner.append(scopeChip(selC));
+  const ta = composerField(selC ? `Ask about ${selC.name}…` : "Message the agent…");
+  inner.append(
+    h("div", { class: "field" }, ta, h("button", { class: "send", onclick: () => sendMessage(ta.value) }, "Send")),
+    h("div", { class: "hint" }, selC ? "⏎ send · scoped to this component" : "⏎ send · ⇧⏎ newline"));
+  bar.replaceChildren(inner);
   ta.focus();
 }
 
-/* ---- overlay ---- */
+function renderChat() { renderLog(); renderComposer(); }
 
-function showOverlay() {
-  $("overlay-paths").replaceChildren(
-    ...(S.artifacts.length ? S.artifacts : ["(paths printed in the CLI)"])
-      .map((p) => h("li", {}, p)));
-  $("overlay").hidden = false;
+/* ---- resizable chat panel (drag the top edge, VSCode-terminal style) ---- */
+
+function clampChatH(px) {
+  const min = 108;                                   // handle + composer
+  const max = Math.max(min, window.innerHeight - 62 - 140); // keep header + a usable stage
+  return Math.round(Math.max(min, Math.min(px, max)));
+}
+
+function applyChatH() {
+  $("chat").style.height = S.chatH + "px";
+  try { Diagram.fit(); } catch { /* keep last-good */ }
+}
+
+function initChatResize() {
+  const stored = parseInt(localStorage.getItem("mha_arch_chat_h") || "", 10);
+  S.chatH = clampChatH(Number.isFinite(stored) ? stored : Math.round(window.innerHeight * 0.32));
+  applyChatH();
+
+  const handle = $("chat-resize");
+  let dragging = false, startY = 0, startH = 0;
+  handle.addEventListener("pointerdown", (e) => {
+    dragging = true; startY = e.clientY; startH = S.chatH;
+    try { handle.setPointerCapture(e.pointerId); } catch { /* non-capturable pointer */ }
+    $("app").classList.add("resizing");
+    e.preventDefault();
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    S.chatH = clampChatH(startH - (e.clientY - startY));  // drag up → taller
+    $("chat").style.height = S.chatH + "px";              // fit() rides the ResizeObserver
+  });
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    $("app").classList.remove("resizing");
+    try { localStorage.setItem("mha_arch_chat_h", String(S.chatH)); } catch { /* private mode */ }
+    try { Diagram.fit(); } catch { /* keep last-good */ }
+  };
+  handle.addEventListener("pointerup", end);
+  handle.addEventListener("pointercancel", end);
+  window.addEventListener("resize", () => { S.chatH = clampChatH(S.chatH); applyChatH(); });
 }
 
 /* ================= boot ================= */
 
 function renderAll() {
-  renderStatus(); renderPill(); renderDiagram(); renderRail(); renderDock(); renderComposer();
+  paint();
+  renderHeader();
+  renderDiagram();
+  renderDrawerTab();
+  if (S.drawerOpen) renderDrawer();
+  renderChat();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  Diagram.init($("dsvg"), (id) => {
-    S.selected = id;
-    S.detail = id;
-    S.tab = "components";
-    renderDock(); renderDiagram();
-  });
-  $("d-fit").addEventListener("click", () => Diagram.fit());
-  new ResizeObserver(() => Diagram.fit()).observe($("dpane"));
-  $("d-in").addEventListener("click", () => Diagram.zoomIn());
-  $("d-out").addEventListener("click", () => Diagram.zoomOut());
-  $("d-crumb").addEventListener("click", () => setDrill(null));
-  $("banner-reconnect").addEventListener("click", () => location.reload());
-  $("overlay-dismiss").addEventListener("click", () => { $("overlay").hidden = true; });
+  Diagram.init($("dsvg"), (id) => selectComp(id), (id) => setDrill(id));
+  $("z-fit").addEventListener("click", () => Diagram.fit());
+  $("z-in").addEventListener("click", () => Diagram.zoomIn());
+  $("z-out").addEventListener("click", () => Diagram.zoomOut());
+  $("crumb").addEventListener("click", () => setDrill(null));
+  $("drawer-tab").addEventListener("click", () => openDrawer());
+  new ResizeObserver(() => Diagram.fit()).observe($("canvas"));
+  initChatResize();
   renderAll();
   connect();
 });

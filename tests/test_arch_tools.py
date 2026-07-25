@@ -327,13 +327,29 @@ def test_blocking_question_gates_finalize(tmp_path):
     broker = FakeBroker([(True, "")])
     ctx, session, _ = make_ctx(tmp_path, broker=broker)
     build_toplevel(ctx, scope="internal")
-    ok(AskTool(), ctx, question="which region?", blocking=True)
-    ok(ArchDoneTool(), ctx, summary="ready")
+    ok(ArchDoneTool(), ctx, summary="ready")          # top level approved (no blocking qs yet)
     expand_owed(ctx)
+    ok(AskTool(), ctx, question="which region?", blocking=True)   # surfaces during expand
     out = err(ArchDoneTool(), ctx, summary="finalize?")
     assert "blocking questions unresolved" in out and "which region?" in out
     ok(AnswerTool(), ctx, id="q1", answer="us-east-1")
     assert session.state.blocking_questions() == []
+
+
+def test_blocking_question_gates_toplevel_approval(tmp_path):
+    # Approval must not be requested while a blocking question is open.
+    broker = FakeBroker([(True, "")])
+    ctx, session, _ = make_ctx(tmp_path, broker=broker)
+    build_toplevel(ctx, scope="internal")
+    ok(AskTool(), ctx, question="which region?", blocking=True)
+    out = err(ArchDoneTool(), ctx, summary="ready")
+    assert "blocking question" in out and "which region?" in out
+    assert session.state.phase == "propose"           # gate did not advance
+    assert broker.requests == []                        # approval was never requested
+    ok(AnswerTool(), ctx, id="q1", answer="us-east-1")
+    ok(ArchDoneTool(), ctx, summary="ready")            # now it proceeds to approval
+    assert session.state.phase == "expand"
+    assert broker.requests and broker.requests[0]["kind"] == "toplevel_approval"
 
 
 def test_amend_toplevel_gates_and_structural_flag(tmp_path):
@@ -370,9 +386,10 @@ def test_persistence_and_resume(tmp_path):
 
 def test_toolset_composition(tmp_path):
     names = [t.name for t in arch_harness_tools()]
-    assert names == ["read", "kg_query", "WebSearch", "WebFetch", "brief", "component",
-                     "connect", "flow", "expand", "decide", "ask", "answer",
-                     "amend_toplevel", "skill", "done"]
+    assert names == ["read", "kg_query", "WebSearch", "WebFetch",
+                     "variant", "node", "link", "splice", "depth", "promote",
+                     "brief", "component", "connect", "flow", "expand", "decide",
+                     "ask", "answer", "amend_toplevel", "skill", "done"]
     for absent in ("edit", "write", "bash", "plan"):
         assert absent not in names
     names = [t.name for t in arch_harness_tools(with_kg=False, with_web=False)]

@@ -17,14 +17,15 @@ STATIC_DIR = Path(__file__).with_name("static")
 
 # structured-state mutations count as progress for the engine's explore nudge
 MUTATING_TOOLS = frozenset({
+    "variant", "node", "link", "splice", "depth", "promote",
     "brief", "component", "connect", "flow", "expand", "decide",
     "ask", "answer", "amend_toplevel",
 })
 
 EXPLORE_NUDGE = (
-    "[system notice] {n} turns without recording anything. Record structure NOW "
-    "(brief / component / connect / flow / decide), or give the user your "
-    "question as a reply."
+    "[system notice] {n} turns without recording anything. Sketch or record structure "
+    "NOW (variant / node / link while brainstorming; brief / component / flow / decide "
+    "once promoted), or give the user your question as a reply."
 )
 
 

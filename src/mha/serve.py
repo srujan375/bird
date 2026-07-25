@@ -25,15 +25,18 @@ for the arch harness's browser page.
 
 Turns run in a worker thread so inbound stays responsive for permission
 responses and interrupts. Interrupts take effect at the next harness event
-or streamed token, whichever comes first. Permission gating wraps
-the mutating tools (edit/write) — bash stays ungated because it is already
-category-allowlisted to read-only commands (decision #10).
+or streamed token, whichever comes first.
+
+Permission gating itself lives in mha.permissions and attaches at runner
+construction, not here — a Server only supplies the broker (and, for a Repl
+built without one, retro-fits the gate as a safety net). See that module for
+why: gating in this file left `mha code`, the plain REPL, and every
+lead-dispatched sub-session ungated.
 """
 
 from __future__ import annotations
 
 import contextlib
-import difflib
 import io
 import json
 import sys
@@ -43,12 +46,19 @@ from typing import Any, Callable, Protocol
 from .engine.runner import repair_interrupted
 from .engine.session import save_messages
 from .llm.discovery import discover_models
+from .permissions import (  # re-exported: importers still say mha.serve.GatedTool
+    DIFF_CONTEXT_LINES,
+    MAX_DIFF_LINES,
+    GatedTool,
+    PermissionBroker,
+    _diff_lines,
+    gate_tools,
+    permission_payload,
+)
 from .repl import Repl
 from .tools import Tool, ToolContext, ToolResult
 
-PERMISSION_TOOLS = {"edit", "write"}
-DIFF_CONTEXT_LINES = 2
-MAX_DIFF_LINES = 40
+_permission_payload = permission_payload  # back-compat alias
 
 
 class _Interrupted(Exception):
@@ -114,123 +124,31 @@ class StdioTransport:
                 self.emit({"type": "error", "message": f"unknown message type: {kind!r}"})
 
 
-class PermissionBroker:
-    """Blocks a worker-thread tool call until the UI answers. The answer is
-    (approved, feedback); feedback carries "Request changes" text on
-    rejection of the arch gates and is empty otherwise."""
-
-    def __init__(self, emit: Callable[..., None]) -> None:
-        self._emit = emit
-        self._lock = threading.Lock()
-        self._next_id = 0
-        self._pending: dict[int, tuple[threading.Event, list[Any]]] = {}
-
-    def request(self, payload: dict[str, Any]) -> tuple[bool, str]:
-        with self._lock:
-            self._next_id += 1
-            req_id = self._next_id
-            done = threading.Event()
-            slot: list[Any] = [False, ""]
-            self._pending[req_id] = (done, slot)
-        self._emit("permission_request", id=req_id, **payload)
-        done.wait()
-        with self._lock:
-            self._pending.pop(req_id, None)
-        return slot[0], slot[1]
-
-    def resolve(self, req_id: int, approved: bool, feedback: str = "") -> None:
-        with self._lock:
-            entry = self._pending.get(req_id)
-        if entry:
-            done, slot = entry
-            slot[0] = approved
-            slot[1] = feedback
-            done.set()
-
-    def deny_all(self) -> None:
-        with self._lock:
-            entries = list(self._pending.values())
-        for done, slot in entries:
-            slot[0] = False
-            slot[1] = ""
-            done.set()
-
-
-def _diff_lines(old: str, new: str, n: int = DIFF_CONTEXT_LINES) -> list[dict[str, str]]:
-    kinds = {"+": "add", "-": "del", " ": "ctx"}
-    out: list[dict[str, str]] = []
-    for line in difflib.unified_diff(
-        old.splitlines(), new.splitlines(), n=n, lineterm=""
-    ):
-        if line.startswith(("---", "+++", "@@")):
-            continue
-        out.append({"kind": kinds.get(line[:1], "ctx"), "text": line})
-        if len(out) >= MAX_DIFF_LINES:
-            out.append({"kind": "ctx", "text": "… (diff truncated)"})
-            break
-    return out
-
-
-def _permission_payload(name: str, args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    if name == "edit":
-        return {
-            "kind": "edit",
-            "file": args.get("path", "?"),
-            "lines": _diff_lines(args.get("old_text", ""), args.get("new_text", "")),
-        }
-    if name == "write":
-        path = args.get("path", "?")
-        content = args.get("content", "")
-        old = ""
-        with contextlib.suppress(Exception):
-            p = ctx.resolve_path(path)
-            if p.is_file():
-                old = p.read_text(encoding="utf-8", errors="replace")
-        return {"kind": "write", "file": path, "lines": _diff_lines(old, content)}
-    return {"kind": "bash", "cmd": args.get("command", name)}
-
-
-class GatedTool(Tool):
-    """Wraps a tool so execution waits for UI approval."""
-
-    def __init__(self, inner: Tool, broker: PermissionBroker):
-        self.inner = inner
-        self.broker = broker
-        self.name = inner.name
-        self.description = inner.description
-        self.parameters = inner.parameters
-
-    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        payload = _permission_payload(self.name, args, ctx)
-        approved, _feedback = self.broker.request(payload)
-        if not approved:
-            ctx.emit("permission_denied", {"tool": self.name, "args": args})
-            return ToolResult(
-                output=(
-                    f"The user DENIED permission for this {self.name}. Do not retry "
-                    "the same change; ask the user or try a different approach."
-                ),
-                details={"denied": True},
-                is_error=True,
-            )
-        return self.inner.execute(args, ctx)
-
-
 class Server:
     """The pump. Transport-agnostic: session logic only."""
 
-    def __init__(self, repl: Repl, transport: Transport | None = None):
+    def __init__(
+        self,
+        repl: Repl,
+        transport: Transport | None = None,
+        broker: PermissionBroker | None = None,
+    ):
         self.repl = repl
         self.transport = transport or StdioTransport()
-        self.broker = PermissionBroker(self._emit)
+        # cli.py builds the broker first (the runner has to be gated at
+        # construction) and hands it in; bind now that the transport exists.
+        self.broker = broker or PermissionBroker()
+        self.broker.bind(self._emit)
         self.cancel = threading.Event()
         self.worker: threading.Thread | None = None
 
         runner = repl.runner
-        # gate mutating tools
-        for name in list(runner.tools):
-            if name in PERMISSION_TOOLS:
-                runner.tools[name] = GatedTool(runner.tools[name], self.broker)
+        # Safety net for a Repl built without a broker on its ctx (tests,
+        # embedders). gate_tools skips anything already wrapped, so a runner
+        # gated at build time is untouched here.
+        runner.ctx.broker = self.broker
+        for name, tool in list(runner.tools.items()):
+            runner.tools[name] = gate_tools([tool], self.broker)[0]
 
         # tee harness events to the UI; honor interrupts between events
         recorder_event = repl.recorder.event

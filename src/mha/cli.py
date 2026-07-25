@@ -50,6 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     code.add_argument("task", help="what to do, in natural language")
     code.add_argument("--from-arch", default=None, metavar="RUN_ID",
                       help="seed the code session from a finalized arch bundle ('latest' or a run-id)")
+    code.add_argument("-y", "--yes", action="store_true",
+                      help="auto-approve every edit/write/bash (unattended runs; "
+                           "without it a tty prompts and a non-tty refuses)")
     _add_common(code)
 
     chat = sub.add_parser("chat", help="interactive mode with slash commands (default)")
@@ -64,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
                       help="one-shot request; omit for an interactive session")
     lead.add_argument("--tui", action="store_true", help="force the full-screen TUI (error if unavailable)")
     lead.add_argument("--plain", action="store_true", help="force the plain REPL instead of the TUI")
+    lead.add_argument("-y", "--yes", action="store_true",
+                      help="one-shot mode: auto-approve every edit/write/bash the "
+                           "dispatched code sub-session makes")
     _add_common(lead)
 
     serve = sub.add_parser("serve", help="JSON-lines bridge over stdio (used by the TUI)")
@@ -182,8 +188,23 @@ def _setup(args):
     return registry, spec, kg, build_proc, run_id, run_dir
 
 
+def _headless_broker(args):
+    """The broker for a one-shot run. --yes approves everything; on a real
+    terminal we prompt; otherwise deny with a reason — a gate nobody can
+    answer must not default to yes."""
+    from .permissions import AutoApproveBroker, ConsoleBroker, DenyBroker
+
+    if getattr(args, "yes", False):
+        return AutoApproveBroker()
+    if sys.stdin.isatty():
+        return ConsoleBroker()
+    return DenyBroker(
+        "no interactive terminal to approve it — re-run with --yes to auto-approve"
+    )
+
+
 def _make_runner(args, registry, spec, kg, recorder, *, harness="code",
-                 tools=None, seed_context=None) -> Runner:
+                 tools=None, seed_context=None, broker=None) -> Runner:
     repo_root = Path(args.repo).resolve()
     ctx = ToolContext(
         repo_root=repo_root,
@@ -193,6 +214,10 @@ def _make_runner(args, registry, spec, kg, recorder, *, harness="code",
         skills=load_skills(repo_root),
         registry=registry,
         run_dir=recorder.run_dir,
+        # gating happens in build_runner, so the broker must be on the ctx
+        # before the runner is built — and it rides the ctx into any
+        # sub-harness the lead dispatches
+        broker=broker,
     )
     # all harness construction goes through the registry now — the arch/code/lead
     # tuning (instructions, toolset, nudges, tracker) lives in HarnessDef, not here
@@ -223,7 +248,8 @@ def _code_main(args) -> int:
             return 2
 
     with SessionRecorder(run_dir) as recorder:
-        runner = _make_runner(args, registry, spec, kg, recorder, seed_context=seed_context)
+        runner = _make_runner(args, registry, spec, kg, recorder,
+                              seed_context=seed_context, broker=_headless_broker(args))
         attach_printer(runner.ctx)  # `› tool …` headers while the agent works
         print(f"mha code | model={spec.spec} | kg={'off' if args.no_kg else 'on'} | session={run_id}")
         if seed_context is not None:
@@ -242,6 +268,7 @@ def _code_main(args) -> int:
 
 def _repl_session(args, harness: str = "code", tools=None, seed_context=None) -> int:
     """The plain REPL for any interactive harness (chat=code, bare mha=lead)."""
+    from .permissions import ConsoleBroker
     from .repl import Repl
 
     setup = _setup(args)
@@ -250,8 +277,10 @@ def _repl_session(args, harness: str = "code", tools=None, seed_context=None) ->
     registry, spec, kg, _build_proc, run_id, run_dir = setup
 
     with SessionRecorder(run_dir) as recorder:
+        # the REPL runs turns on the main thread, so the prompt is just input()
         runner = _make_runner(args, registry, spec, kg, recorder,
-                              harness=harness, tools=tools, seed_context=seed_context)
+                              harness=harness, tools=tools, seed_context=seed_context,
+                              broker=ConsoleBroker())
         repl = Repl(runner, registry, kg, recorder, run_id)
         # /reload re-execs `mha <cmd> --resume <run_id>`: load the prior
         # session's transcript + model so the conversation continues on
@@ -262,8 +291,9 @@ def _repl_session(args, harness: str = "code", tools=None, seed_context=None) ->
 
 
 def _serve_main(args) -> int:
+    from .permissions import PermissionBroker
     from .repl import Repl
-    from .serve import serve
+    from .serve import Server
 
     setup = _setup(args)
     if isinstance(setup, int):
@@ -277,15 +307,19 @@ def _serve_main(args) -> int:
     tools = lead_harness_tools(with_kg=not args.no_kg) if harness == "lead" else None
 
     with SessionRecorder(run_dir) as recorder:
+        # broker before runner: build_runner gates on it. The Server binds its
+        # emit sink once the transport is up.
+        broker = PermissionBroker()
         runner = _make_runner(args, registry, spec, kg, recorder,
-                              harness=harness, tools=tools, seed_context=seed)
+                              harness=harness, tools=tools, seed_context=seed,
+                              broker=broker)
         repl = Repl(runner, registry, kg, recorder, run_id)
         # /reload respawns `mha serve` with --resume <old_run_id>: load the
         # previous session's transcript + model so the conversation continues
         # on freshly-loaded code/skills without losing history.
         if getattr(args, "resume", None):
             _resume_into_repl(repl, args.resume, registry)
-        return serve(repl)
+        return Server(repl, broker=broker).run()
 
 
 def _arch_main(args) -> int:
@@ -296,6 +330,7 @@ def _arch_main(args) -> int:
     from .harnesses.arch.judge import make_judge
     from .harnesses.arch.session import ArchSession
     from .http_transport import HttpTransport
+    from .permissions import PermissionBroker
     from .repl import Repl
     from .serve import Server
 
@@ -309,7 +344,12 @@ def _arch_main(args) -> int:
     registry, spec, kg, _build_proc, run_id, run_dir = setup
 
     with SessionRecorder(run_dir) as recorder:
-        runner = _make_runner(args, registry, spec, kg, recorder, harness="arch")
+        # arch mounts no gated tools (it designs, it doesn't touch the repo);
+        # the broker is here for its two human phase gates — see
+        # ArchSession.request_gate
+        broker = PermissionBroker()
+        runner = _make_runner(args, registry, spec, kg, recorder, harness="arch",
+                              broker=broker)
         repl = Repl(runner, registry, kg, recorder, run_id)
         resumed_dir = None
         if getattr(args, "resume", None):
@@ -319,7 +359,7 @@ def _arch_main(args) -> int:
             static_dir=arch_def.STATIC_DIR,
             stop_when=lambda e: e.get("type") == "arch_state" and e.get("phase") == "finalized",
         )
-        server = Server(repl, transport=transport)
+        server = Server(repl, transport=transport, broker=broker)
 
         # the arch session: restored state on resume, persisted to THIS run
         if resumed_dir is not None:
@@ -327,6 +367,7 @@ def _arch_main(args) -> int:
             arch.run_dir = run_dir
         else:
             arch = ArchSession(run_dir=run_dir)
+            arch.state.phase = "brainstorm"  # fresh sessions open on the loose sketch layer
         arch.broker = server.broker
         arch.judge = make_judge(registry, OpenAICompatClient())
 
@@ -376,6 +417,9 @@ def _lead_main(args) -> int:
         runner = _make_runner(
             args, registry, spec, kg, recorder,
             harness="lead", tools=lead_harness_tools(with_kg=not args.no_kg),
+            # the lead mounts nothing gated, but its `code` dispatch inherits
+            # this broker through the forked ctx
+            broker=_headless_broker(args),
         )
         attach_printer(runner.ctx)
         print(f"mha lead | model={spec.spec} | kg={'off' if args.no_kg else 'on'} | session={run_id}")

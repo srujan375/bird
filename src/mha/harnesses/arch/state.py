@@ -12,11 +12,15 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from .sketch import Sketchbook
+
 Mode = Literal["system", "feature"]
 Phase = Literal[
+    "brainstorm",
     "intake", "propose", "toplevel_review", "expand", "challenge", "resolved", "finalized"
 ]
 PHASES: tuple[str, ...] = (
+    "brainstorm",
     "intake", "propose", "toplevel_review", "expand", "challenge", "resolved", "finalized"
 )
 
@@ -315,6 +319,7 @@ class ArchState:
     mode: str = "system"
     phase: str = "intake"
     brief: Brief = field(default_factory=Brief)
+    sketchbook: Sketchbook = field(default_factory=Sketchbook)
     components: dict[str, Component] = field(default_factory=dict)
     connections: list[Connection] = field(default_factory=list)
     flows: list[Flow] = field(default_factory=list)
@@ -346,6 +351,14 @@ class ArchState:
             missing.append("a happy flow covering the primary goal")
         if not self.decisions:
             missing.append("at least one major decision with alternatives")
+        # promoted-from-brainstorm components arrive as drafts (no trace / bare
+        # responsibility); they must be tightened before the top level is approved.
+        untightened = sorted(
+            c.id for c in self.components.values()
+            if not c.existing and (not c.trace or not c.responsibility.strip())
+        )
+        if untightened:
+            missing.append("trace + responsibility for: " + ", ".join(untightened))
         return missing
 
     # ---- validation (ValueError text goes to the model verbatim) ----
@@ -498,6 +511,7 @@ class ArchState:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArchState":
         state = cls(mode=d.get("mode", "system"), phase=d.get("phase", "intake"))
+        state.sketchbook = Sketchbook.from_dict(d.get("sketchbook"))
         b = d.get("brief", {})
         state.brief = Brief(
             goal=b.get("goal", ""),
