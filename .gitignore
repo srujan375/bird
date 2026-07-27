@@ -10,3 +10,8 @@ node_modules/
 multi-harness architecture.excalidraw
 tui/node_modules
 .playwright-mcp/
+
+# local design/handover material — kept on disk, not in the repo
+Arch Canvas Handover.pdf
+Arch harness React redesign/
+docs/
