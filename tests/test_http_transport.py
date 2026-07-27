@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import socket
 import threading
 import time
 
@@ -66,6 +67,9 @@ class SseReader:
         self.cv = threading.Condition()
         self.conn = http.client.HTTPConnection(host, port, timeout=10)
         self.conn.request("GET", "/events")
+        # grab the socket now: SSE answers `Connection: close`, so getresponse()
+        # hands ownership to the response and leaves conn.sock None
+        self.sock = self.conn.sock
         self.resp = self.conn.getresponse()
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
@@ -73,7 +77,10 @@ class SseReader:
     def _read(self):
         try:
             while True:
-                line = self.resp.fp.readline()
+                fp = self.resp.fp
+                if fp is None:
+                    return  # closed under us
+                line = fp.readline()
                 if not line:
                     return
                 line = line.strip()
@@ -96,7 +103,22 @@ class SseReader:
                 self.cv.wait(remaining)
 
     def close(self):
+        """Close like a browser tab does — the server must actually notice.
+
+        Order matters: shutdown() unblocks the reader (closing the buffered
+        reader first would block on the in-flight read until its socket
+        timeout), and only once that thread has unwound can both references to
+        the socket be dropped. Closing just `conn` leaves the response holding
+        one, and the fd — so the server keeps writing into a live socket.
+        """
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+        self.thread.join(timeout=2)
+        self.resp.close()
         self.conn.close()
+        self.sock.close()
 
 
 def test_static_serving_and_traversal_guard(served):
@@ -190,5 +212,59 @@ def test_stop_when_ends_run(tmp_path):
     time.sleep(0.05)
     transport.emit({"type": "arch_state", "phase": "propose", "state": {}})
     assert not done.is_set()
+    transport.emit({"type": "arch_state", "phase": "finalized", "state": {}})
+    assert done.wait(timeout=5)
+
+
+def _finalizing(static, **kw):
+    return HttpTransport(
+        static_dir=static,
+        stop_when=lambda e: e.get("type") == "arch_state" and e.get("phase") == "finalized",
+        **kw,
+    )
+
+
+def _static(tmp_path):
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text("x", encoding="utf-8")
+    return static
+
+
+def test_linger_keeps_serving_until_the_page_closes(tmp_path):
+    """A finalized design is still worth reading, so stop_when starts a read
+    window instead of pulling the plug. It closes when the last page does."""
+    transport = _finalizing(_static(tmp_path), linger=30.0)
+    done = threading.Event()
+
+    def run():
+        transport.run(Handlers())
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    time.sleep(0.05)
+    host, port = transport._server.server_address[:2]
+    reader = SseReader(host, port)
+
+    transport.emit({"type": "arch_state", "phase": "finalized", "state": {}})
+    # a reader is attached, so the server stays up well past the old 0.3s death
+    assert not done.wait(timeout=1.5)
+    assert request(host, port, "GET", "/")[0] == 200
+
+    reader.close()
+    assert done.wait(timeout=10)  # noticed by the linger's poke, not the 15s ping
+
+
+def test_linger_gives_up_when_nobody_is_reading(tmp_path):
+    """No page attached (headless, --no-open) — nothing to linger for."""
+    transport = _finalizing(_static(tmp_path), linger=30.0)
+    done = threading.Event()
+
+    def run():
+        transport.run(Handlers())
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    time.sleep(0.05)
     transport.emit({"type": "arch_state", "phase": "finalized", "state": {}})
     assert done.wait(timeout=5)

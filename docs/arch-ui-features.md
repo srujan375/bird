@@ -1,123 +1,157 @@
-# Architecture Harness — Page Feature Spec
+# The Architecture Workbench — what the page does
 
-Functional spec for the architecture-harness web page. Layout, styling, and visual
-design are entirely the designer's call — this document only fixes **what the page
-contains and what it must do**.
+The page `mha arch` serves. Companion to `docs/arch-state-schema.md`, which owns
+the state and the wire; this document owns behaviour — what the user sees, what
+they can change, and which of it never leaves the browser.
 
-## Context
+Source: `arch-ui/` (Vite + React 18 + TS + `@xyflow/react` + Zustand), built into
+`src/mha/harnesses/arch/static/`. **The build output is committed on purpose** —
+`mha arch` has to work for someone who has never installed Node. Rebuild and
+commit `index.html` and `assets/*` together; `tests/test_packaging.py` fails if
+they drift apart.
 
-`mha arch "<what to build>"` starts an interactive architecture session: an agent
-designs a system architecture in a ReAct loop while the user watches and steers.
-The process serves a local web page and opens it in the browser; the initial prompt
-is already running as the first turn when the page loads. The entire session then
-happens in the page: the user chats with the agent, watches the architecture
-diagram assemble and change live, reviews decisions, and finally approves
-("finalizes") the architecture — which writes a handoff bundle consumed later by
-the code harness.
+> Rewritten 2026-07-25. The version before this described a Mermaid-rendering
+> page with a phase-gated `done`; both are gone. Mermaid is still generated
+> server-side, but only for the handoff bundle and the tests — the page draws
+> from structured state, which is what makes a node clickable and editable.
 
-One user, localhost only, one session per page.
+## The one principle
 
-## What the harness does (server side, for context)
+`ArchState` is the single source of truth. The canvas is a **projection** of it
+plus one client-owned overlay. Anything the user changes that belongs to the
+architecture is sent back as the tool-equivalent mutation; anything that is only
+about *looking at* the architecture never leaves the browser.
 
-- Runs a chat loop: agent proposes/revises architecture, user replies, repeat.
-- The agent does not draw the diagram directly. It mutates a structured state via
-  tools: add/update/remove **components**, **connections** between them, and
-  **decisions** (choice + rationale) / **open questions**. The server renders that
-  state to Mermaid diagram source and pushes it to the page after every change.
-- Updates arrive **mid-turn**: during one agent turn the diagram may update several
-  times as components are added one by one, while the agent's narration streams in
-  parallel.
-- The agent may also read the repo, query its knowledge graph, and do web research
-  mid-turn (surfaced to the page only as activity notices).
-- When the agent believes the architecture is complete it attempts to finish; this
-  is **gated on the user**: the page must ask Finalize vs. Request changes. Request
-  changes returns the user's feedback to the loop; Finalize ends the session and
-  writes the handoff bundle to disk.
-- The user can interrupt a running turn at any time.
-- The session is persisted server-side and resumable; the page doesn't manage this.
-
-## Page contents (functional inventory)
-
-### 1. Diagram view
-- Renders the current architecture diagram from Mermaid source pushed by the server.
-- Re-renders on every state update, including several times within one agent turn.
-- A state update replaces the whole diagram (no client-side diffing needed), but a
-  subtle cue for what just changed is welcome.
-- Needs: an empty state (session just started, nothing designed yet), a
-  render-failure state (bad diagram source — show the error, keep the last good
-  render), and basic zoom/pan or fit-to-view for larger graphs.
-
-### 2. Chat / transcript
-- Full conversation history: user messages and agent replies.
-- Agent text arrives as a **token stream** (many small deltas per turn) — must
-  render progressively, not after the turn ends.
-- Tool activity appears between agent text as compact notices, e.g. "added
-  component `api-gateway`", "connected `worker` → `queue`", "decision recorded",
-  "searched the web", "read `src/mha/runner.py`". These are glanceable status
-  lines, not full chat bubbles.
-- Turn boundaries are explicit events; show when a turn ends and its status
-  (completed / interrupted / error).
-
-### 3. Decisions & open questions panel
-- Running list of recorded decisions: topic, the choice made, rationale.
-- Separate list of open questions the agent has flagged for the user.
-- Both update live as the agent records them; clicking/selecting one ideally
-  highlights or relates to the diagram, but that's optional in v1.
-
-### 4. Message input
-- Text input to send the next user message (multi-line capable).
-- While a turn is running, sending is unavailable — instead the user gets an
-  **Interrupt** control (stop the current turn).
-- After an interrupt or error, input is available again.
-
-### 5. Finalize flow
-- Triggered by the server (a blocking request event), not by a always-visible
-  button: when the agent proposes completion, the page surfaces a decision moment
-  with two actions:
-  - **Finalize** — approve; session ends.
-  - **Request changes** — with a text field; feedback is sent back and the loop
-    continues.
-- After finalizing: a terminal "session complete" state showing that the handoff
-  bundle was written (file paths provided by the server) and the suggested next
-  step (`mha code`). Page becomes read-only.
-
-### 6. Status / session info
-- Somewhere visible: model in use, repo path, session name/id, and live connection
-  status (connected / reconnecting / server gone).
-
-## Event-driven behavior (what makes the UI change)
-
-The page holds one server-sent-events connection and POSTs user actions back.
-Every UI change is driven by one of these events:
-
-| Event | Page behavior |
+| Owned by the server (`store/session.ts`) | Owned by the browser (`store/canvas.ts`) |
 |---|---|
-| `ready` | Populate status info (model, repo, session id); enable UI |
-| `assistant_delta` | Append streamed text to the in-progress agent message |
-| tool activity events | Add a compact activity notice to the transcript |
-| `arch_state` | Re-render diagram; refresh decisions/open-questions panel |
-| `permission_request` (finalize) | Enter the Finalize / Request-changes decision moment |
-| `turn_end` | Close out the agent message; show turn status; re-enable input |
-| `error` | Show a non-fatal error notice |
-| connection lost / `bye` | Show disconnected state; disable input |
+| components, connections, flows, decisions, questions, concerns, obligations, the sketchbook | node positions and pins, viewport, which layer/variant is showing, rail tab, dialog size + which component is open |
+| replaced wholesale by every `arch_state` event | persisted to `localStorage["mha_arch_canvas:<run_id>"]`, never touched by an event |
 
-User actions the page sends: send message, interrupt, finalize-approve,
-finalize-reject (with feedback text).
+That split is why a mid-turn state push can add five components without moving a
+card the user dragged, and why a refresh comes back to the same viewport.
 
-## States to design for
+## Shell
 
-1. Connecting / first load (initial turn may already be streaming).
-2. Agent turn in progress: text streaming + diagram updating simultaneously.
-3. Idle: waiting for user input between turns.
-4. Empty diagram (before the first component exists).
-5. Finalize decision pending.
-6. Interrupted turn.
-7. Error (turn failed) and disconnected (server exited).
-8. Finalized / read-only session complete.
+Top bar (44px): goal · Sketch/Design switcher · phase · Tidy up · model · repo ·
+connection dot. Centre: the canvas. Right rail (380px): Chat · Concerns ·
+Decisions · Questions · Flows. No page scroll — every region owns its own.
 
-## Explicitly out of scope (v1)
+## The two layers
 
-- Editing the diagram directly on a canvas (drag boxes, rename nodes) — future.
-- Multiple sessions, session switching, or resume UI.
-- Auth, multi-user, remote access.
-- Mobile layouts (desktop browser is the target).
+The harness keeps a loose **sketch** layer and a strict **design** layer live at
+the same time, so the page draws both:
+
+- **Sketch** — the active variant's nodes and links, drawn provisionally
+  (dashed, dimmer). Rival variants are tabs; an archived one stays readable
+  because its `rejected_reason` is the ADR gold. A `use this shape` button
+  promotes the variant on the canvas without a model turn.
+- **Design** — components and connections. `existing: true` renders dashed and
+  dimmed (brownfield background). A pending obligation puts a dot on the card;
+  thinness puts a `thin · N` pill on it; an open concern puts a severity dot.
+
+The switcher follows the session (design once anything is promoted) until the
+user picks a side, after which their choice sticks. Both layers keep their own
+positions, because ids can collide across them.
+
+## Layout, and why nothing moves
+
+`layout.ts` is a small layered layout (longest-path layering + two barycentre
+sweeps) — no ELK, no dependency. It places **only ids it has never seen**,
+treating everything already positioned as an immovable obstacle. Dropping a node
+pins it. `Tidy up` is the only thing that ever re-flows the graph, and it is a
+button, never automatic.
+
+## The component dialog
+
+Opening a component (`⤢`, double-click, or `E`) mounts a dialog over a dimmed
+canvas. **The system graph never reflows** — positions are user-owned, so growing
+a card in place would shove hand-placed neighbours, and internals need more room
+than a card's footprint anyway.
+
+One shell — header, facet-dependent tabs, dashed port chips naming the real
+inbound/outbound neighbours (click one to walk there), footer, resize grip,
+`Full canvas` — and `facet.facet_kind` picks the body:
+
+| Facet | Body |
+|---|---|
+| `store` | ER canvas: entity cards with keys, fields, indexes |
+| `service` | module cards |
+| `queue` | message contract cards, each with its DLQ |
+| `api` | endpoint table grouped by route |
+| `infra` | deployment frames holding component ids |
+| `llm` | task chain: prompt → context → guardrails → fallback |
+
+Every body renders straight from `arch_state`, so a dialog left open while the
+architect runs `expand` fills in underneath the user without closing.
+
+Two things are deliberately **not** drawn, because the schema does not record
+them: edges between service modules (a `Module` is a name and a purpose —
+nothing says what calls what), and ER relations as fact (they are inferred from
+`*_id` field names, and the canvas says so). Drawing them would be inventing
+architecture, which is the one thing this page must never do.
+
+A component with no facet opens the same dialog on an `Internals` tab: its
+responsibility, why it owes depth if it does, and an **Expand this component**
+action that posts the instruction to `/input`. An `external` component says
+instead that its internals are not ours to design.
+
+## What the user can change
+
+Edits apply optimistically and then POST to `/mutate`. If the harness refuses,
+the canvas rolls back visibly and the reason lands in the rail — the page must
+never show something the harness does not believe.
+
+| Action | Sent as | Notes |
+|---|---|---|
+| Move a node | nothing | overlay only; pins it |
+| Rename · edit responsibility, tech, data owned, trace, failure notes | `component` | ids are immutable; a rename changes `name` only |
+| Accept / overrule a concern | `concern` | **overruling requires the reason** — that sentence is what the code harness inherits |
+| Promote a sketch variant | `promote` | replacing an already-seeded shape asks twice |
+| Expand a component | `/input` | it is a request to the architect, not a mutation |
+
+Creating and deleting components stay agent-only in v1: the user edits what
+exists and asks for the rest.
+
+## Events
+
+One SSE connection to `/events`; POSTs to `/input`, `/permission`, `/interrupt`,
+`/mutate`. Late joiners are replayed by the server, so a refresh rebuilds
+everything from scratch.
+
+| Event | Page behaviour |
+|---|---|
+| `ready` | model, repo, run id; restore this run's overlay |
+| `assistant_delta` | append to the in-flight message, progressively |
+| `harness_event` tool calls | one compact activity line per call (`+ component`, `→ connect`, `◆ decide`, `▸ expand`, `⚑ concern`, `⌕ kg_query`) |
+| `arch_state` | replace server truth wholesale; ring what `changed` for ~2s; never re-fit, never move a placed node; open dialogs refresh in place |
+| `permission_request` | a **banner**, not a modal — the canvas stays visible and the composer stays live, because replying *is* "request changes" |
+| `turn_end` | close the message, show status, re-enable input |
+| `error` · `bye`/drop | inline notice; disconnect veil that explains itself and **never captures the pointer**, so the canvas still pans |
+
+## Gates
+
+Both human gates are banners above the composer. The finalize gate lists open
+blockers and says plainly that finalizing records them as overruled with
+whatever the user types — and what they type is what gets recorded, verbatim.
+
+Approving is one button; replying instead is requesting changes. Neither gate
+blocks reading the design.
+
+## States to keep working
+
+Connecting (first turn already streaming) · turn in progress (text streaming
+while nodes land) · idle · empty sketch · empty design · dialog open, filled ·
+dialog open, empty facet · dialog filling live mid-turn · pending mutation ·
+rejected mutation rolled back · top-level gate · finalize gate · interrupted ·
+turn error · disconnected · finalized read-only.
+
+**Finalized** means: the canvas still pans, zooms and opens dialogs; every edit
+affordance and the composer are gone; the rail shows the bundle paths and
+`mha code` as the next step. A finalized session is never shown as disconnected,
+even after the server exits.
+
+## Not built
+
+Left tool rail, sticky notes, annotations, freehand, `⌘K` palette (handover
+phase 2) · L2 module chains (phase 5, needs a schema delta) · flow playback and
+PNG export (phase 6). See `docs/arch-remaining-work.md`.

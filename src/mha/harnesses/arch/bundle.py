@@ -5,7 +5,11 @@ separately). Until then finalize writes two artifacts behind this one
 function: architecture.json (the full ArchState) and architecture.md (a
 generated top-level doc + per-component contract sheets + decision log).
 Replace write_bundle when the schema lands; nothing else may know the
-bundle's shape. The KG seed is not built yet (same parking lot).
+bundle's shape.
+
+The bundle's other half is the KG seed (`kg_seed.py`), written at the same
+moment: the markdown is what the next session *reads*, the graph is what it
+can *ask*.
 """
 
 from __future__ import annotations
@@ -77,7 +81,65 @@ def _markdown(state: ArchState) -> str:
         for q in open_qs:
             lines.append(f"- {q.id}: {q.question}")
         lines.append("")
+
+    lines += _concerns_section(state)
+    lines += _rivals_section(state)
+
+    gaps = state.gaps()
+    if gaps:
+        lines += [
+            "## Known gaps",
+            "",
+            "Deliberately unspecified at finalize — decide these while building, and "
+            "say so if a choice contradicts the design above.",
+            "",
+        ]
+        lines += [f"- {g}" for g in gaps]
+        lines.append("")
     return "\n".join(lines)
+
+
+def _concerns_section(state: ArchState) -> list[str]:
+    """The objections raised against this design and what happened to them.
+
+    Overruled ones matter most: they tell the builder "this was seen, and
+    chosen anyway, for this reason" — which is exactly what stops someone
+    re-litigating it, or quietly re-introducing the problem."""
+    if not state.concerns:
+        return []
+    lines = ["## Concerns raised", ""]
+    order = {"blocker": 0, "risk": 1, "smell": 2}
+    for c in sorted(state.concerns, key=lambda x: (order.get(x.severity, 9), x.id)):
+        status = c.status if c.status != "open" else "**still open**"
+        lines.append(f"- **[{c.severity}] {c.target}** — {c.claim} ({status})")
+        if c.alternative:
+            lines.append(f"  - alternative: {c.alternative}")
+        if c.resolution:
+            lines.append(f"  - resolution: {c.resolution}")
+    lines.append("")
+    return lines
+
+
+def _rivals_section(state: ArchState) -> list[str]:
+    """The shapes that were considered and dropped. Cheap to record, and the
+    single most common question a builder asks later: why not X?"""
+    rivals = [
+        v for v in state.sketchbook.variants.values()
+        if v.status != "chosen" and v.nodes
+    ]
+    if not rivals:
+        return []
+    lines = ["## Alternatives considered", ""]
+    for v in rivals:
+        head = f"- **{v.name}**"
+        if v.summary:
+            head += f" — {v.summary}"
+        lines.append(head)
+        if v.rejected_reason:
+            lines.append(f"  - not taken: {v.rejected_reason}")
+        lines.append(f"  - shape: {', '.join(n.label or n.id for n in v.nodes.values())}")
+    lines.append("")
+    return lines
 
 
 def _contract_sheet(comp: Component) -> list[str]:

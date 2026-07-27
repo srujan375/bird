@@ -22,6 +22,12 @@ from .tools import ToolContext
 from .skills import load_skills
 
 
+# How long `mha arch` keeps serving a finalized design so it can be read. It
+# gives up sooner the moment the page closes; this is only the backstop for a
+# tab left open and forgotten.
+ARCH_LINGER_SECONDS = 30 * 60
+
+
 def _add_common(p) -> None:
     p.add_argument("--repo", default=".", help="repository root (default: cwd)")
     p.add_argument("--model", default="default", help="model alias or provider:model spec")
@@ -358,6 +364,10 @@ def _arch_main(args) -> int:
         transport = HttpTransport(
             static_dir=arch_def.STATIC_DIR,
             stop_when=lambda e: e.get("type") == "arch_state" and e.get("phase") == "finalized",
+            # finalize ends the session, not the reading of it: keep serving the
+            # read-only design until the tab is closed (or half an hour passes).
+            # Nothing can change any more — every tool is locked at `finalized`.
+            linger=ARCH_LINGER_SECONDS,
         )
         server = Server(repl, transport=transport, broker=broker)
 
@@ -366,8 +376,7 @@ def _arch_main(args) -> int:
             arch = ArchSession.load(resumed_dir)
             arch.run_dir = run_dir
         else:
-            arch = ArchSession(run_dir=run_dir)
-            arch.state.phase = "brainstorm"  # fresh sessions open on the loose sketch layer
+            arch = ArchSession(run_dir=run_dir)  # opens on the sketch layer
         arch.broker = server.broker
         arch.judge = make_judge(registry, OpenAICompatClient())
 
@@ -396,6 +405,7 @@ def _arch_main(args) -> int:
             rc = 0
         time.sleep(0.3)  # let SSE clients drain the finalized/bye events
         if arch.state.phase == "finalized":
+            # (we are only here once the page closed or the linger ran out)
             from .harnesses.arch.bundle import bundle_paths
 
             print("architecture finalized. handoff bundle:")

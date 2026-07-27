@@ -128,12 +128,14 @@ class Page:
                 assert remaining > 0, f"timed out waiting for {what}; got {[x['type'] for x in self.events]}"
                 self.cv.wait(remaining)
 
-    def post(self, path, body):
+    def post(self, path, body, status=200):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=5)
         conn.request("POST", path, body=json.dumps(body))
-        status = conn.getresponse().status
+        resp = conn.getresponse()
+        payload = resp.read()
         conn.close()
-        assert status == 200
+        assert resp.status == status, f"POST {path} -> {resp.status}: {payload!r}"
+        return json.loads(payload or b"{}")
 
 
 def build_stack(tmp_path, script):
@@ -204,7 +206,8 @@ def test_full_arch_session_over_http(tmp_path):
                               "feedback": "record a rate limiting decision first"})
     end = page.wait_for(lambda e: e["type"] == "turn_end", "turn A end")
     assert end["status"] == "reply"
-    assert arch.state.phase == "resolved"
+    # a rejected finalize drops back into the working phase, not a dead end
+    assert arch.state.phase == "expand"
 
     # turn B: feedback addressed, finalize approved
     page.post("/input", {"text": "record it and finalize"})

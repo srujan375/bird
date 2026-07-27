@@ -5,6 +5,7 @@ from mha.harnesses.arch.state import (
     ArchState,
     Brief,
     Component,
+    Concern,
     Connection,
     DeployUnit,
     Entity,
@@ -121,7 +122,7 @@ def test_render_all_structure():
                     steps=[FlowStep(src="db", dst="db", action="noop")])],
     )
     out = render.render_all(st)
-    assert set(out) == {"toplevel", "flows", "facets"}
+    assert set(out) == {"toplevel", "flows", "facets", "sketches", "active_sketch"}
     assert "flowchart TD" in out["toplevel"]
     assert "f1" in out["flows"]
     assert out["facets"]["db"]["kind"] == "store"
@@ -135,12 +136,12 @@ def test_tracker_prefix_and_phases():
     st = ArchState()
     t = render.tracker(st)
     assert t.startswith(render.TRACKER_PREFIX)
-    assert "phase: intake" in t
-    assert "goal" in t  # missing brief fields named
+    assert "phase: brainstorm" in t      # a session opens on the sketch layer
+    assert "nothing promoted yet" in t
 
-    st = state_with()
+    st = state_with(components=[comp("db", "store")])
     st.phase = "propose"
-    assert "top level still owes" in render.tracker(st)
+    assert "still loose" in render.tracker(st)
 
     st.phase = "expand"
     st.obligations = [
@@ -153,15 +154,50 @@ def test_tracker_prefix_and_phases():
     assert 'expand("db")' in t
 
     st.obligations = []
-    assert "challenge pass" in render.tracker(st)
+    assert "done" in render.tracker(st)
 
-    st.phase = "challenge"
+
+def test_tracker_carries_gaps_and_concerns():
+    """The tracker reports; it never demands. Both layers show at once."""
+    st = state_with(components=[comp("db", "store")])
+    st.components["db"].trace = []
+    st.components["db"].data_owned = None
+    st.concerns.append(Concern(id="c1", severity="blocker", target="db",
+                               claim="unbounded growth", alternative="add retention"))
+    t = render.tracker(st)
+    assert "thin (" in t and "none required" in t
+    assert "c1 [blocker] db: unbounded growth" in t
+    # an open blocker is what the hint points at
+    assert "c1 is an open blocker" in t
+
+
+def test_sketch_layer_renders_before_anything_is_promoted():
+    from mha.harnesses.arch.sketch import SketchLink, SketchNode, Variant
+
+    st = ArchState()
+    v = Variant(id="v1", name="evented")
+    v.nodes["api"] = SketchNode(id="api", label="API", kind="api")
+    v.nodes["q"] = SketchNode(id="q", label="Queue", kind="queue")
+    v.links.append(SketchLink(src="api", dst="q", label="emits", kind="async"))
+    st.sketchbook.variants["v1"] = v
+    st.sketchbook.active = "v1"
+
+    out = render.render_all(st)
+    assert out["active_sketch"] == "v1"
+    assert "flowchart LR" in out["sketches"]["v1"]
+    assert "API" in out["sketches"]["v1"] and "-.->" in out["sketches"]["v1"]
+    assert "evented [2n/1e]" in render.tracker(st)
+
+
+def test_unanswered_questions_and_finalized_state_in_tracker():
+    st = state_with(components=[comp("db", "store")])
+    st.phase = "expand"
     st.questions = [OpenQuestion(id="q1", question="retention?", blocking=True, source="judge")]
     t = render.tracker(st)
-    assert "BLOCKING" in t and "q1" in t
+    assert "unanswered questions you asked" in t and "q1" in t
 
     st.questions[0].resolution = "answered"
-    assert "call `done` to request Finalize" in render.tracker(st)
+    assert "unanswered questions" not in render.tracker(st)
 
     st.phase = "finalized"
     assert "session complete" in render.tracker(st)

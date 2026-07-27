@@ -72,6 +72,7 @@ class Handlers(Protocol):
     def on_permission(self, req_id: int, approved: bool, feedback: str) -> None: ...
     def on_interrupt(self) -> None: ...
     def on_command(self, line: str) -> bool | None: ...
+    def on_mutate(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class Transport(Protocol):
@@ -213,6 +214,25 @@ class Server:
 
     def on_command(self, line: str) -> bool | None:
         return self._command(line)
+
+    def on_mutate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """A structured edit made in a UI rather than by the model.
+
+        The pump has no idea what a mutation means. It knows only that a
+        harness's state object may accept one, and asks; a session whose
+        harness has no such notion (code, a plain REPL) says so and nothing
+        breaks. The applying side is responsible for using the same validation
+        path the model's tools use — see arch's mutate.py for why that matters.
+        """
+        target = getattr(self.repl.runner.ctx, "arch", None)
+        apply = getattr(target, "apply_mutation", None)
+        if apply is None:
+            return {"ok": False, "error": "this session has no state a UI can edit"}
+        try:
+            result = apply(payload)
+        except Exception as e:  # a refusal is an answer, not a dead HTTP thread
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, **(result or {})}
 
     # ---- session logic ----
 

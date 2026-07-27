@@ -1,5 +1,9 @@
-"""The brainstorm phase: loose sketch tools, the depth slider, splice, phase
-guards, and promotion into the strict ArchState."""
+"""The sketch layer: loose tools, the depth slider, splice, and promotion.
+
+Since the overhaul the sketch layer is not a phase you get evicted from — it
+stays open for the whole session, and promoting is a non-destructive, repeatable
+move rather than a one-way door.
+"""
 
 from mha.harnesses.arch.session import ArchSession
 from mha.harnesses.arch.state import ArchState
@@ -22,8 +26,10 @@ from mha.tools import ToolContext
 class FakeBroker:
     def __init__(self, answers):
         self.answers = list(answers)
+        self.payloads = []
 
     def request(self, payload):
+        self.payloads.append(payload)
         return self.answers.pop(0)
 
 
@@ -90,48 +96,59 @@ def test_depth_is_a_two_way_slider(tmp_path):
     assert n.depth == "stub" and n.detail == ""  # collapsing clears the internal sketch
 
 
-def test_node_needs_an_active_variant(tmp_path):
-    ctx, _, _ = brainstorm_ctx(tmp_path)
-    out = err(NodeTool(), ctx, id="a")
-    assert "no active variant" in out
+def test_node_opens_a_variant_when_none_is_active(tmp_path):
+    """Sketching never asks for ceremony first — the surface is always there."""
+    ctx, session, _ = brainstorm_ctx(tmp_path)
+    ok(NodeTool(), ctx, id="a")
+    v = session.state.sketchbook.active_variant()
+    assert v is not None and "a" in v.nodes
 
 
-# ---------- phase guards ----------
+# ---------- no phase locks ----------
 
 
-def test_strict_tools_locked_in_brainstorm(tmp_path):
-    ctx, _, _ = brainstorm_ctx(tmp_path)
-    fill_brief(ctx)
-    out = err(ComponentTool(), ctx, id="api", kind="api", responsibility="r", trace=["g"])
-    assert "brainstorming" in out and "node" in out
+def test_strict_tools_work_during_brainstorm(tmp_path):
+    """The old harness refused this outright. Recording a component while still
+    sketching is now just allowed."""
+    ctx, session, _ = brainstorm_ctx(tmp_path)
+    ok(ComponentTool(), ctx, id="api", kind="api", responsibility="r", trace=["g"])
+    assert "api" in session.state.components
 
 
-def test_done_in_brainstorm_points_to_promote(tmp_path):
-    ctx, _, _ = brainstorm_ctx(tmp_path)
-    out = err(ArchDoneTool(), ctx, summary="s")
-    assert "promote" in out
+def test_component_needs_nothing_but_an_id(tmp_path):
+    ctx, session, _ = brainstorm_ctx(tmp_path)
+    res = ok(ComponentTool(), ctx, id="mystery")
+    assert session.state.components["mystery"].kind == "service"
+    assert "thin:" in res.output  # what's missing comes back as advice
 
 
-def test_loose_tools_locked_after_promote(tmp_path):
+def test_sketch_layer_stays_open_after_promote(tmp_path):
     ctx, session, _ = brainstorm_ctx(tmp_path)
     fill_brief(ctx)
     ok(VariantTool(), ctx, name="v")
     ok(NodeTool(), ctx, id="a", note="x")
     ok(PromoteTool(), ctx)
     assert session.state.phase == "propose"
-    out = err(NodeTool(), ctx, id="b")
-    assert "committed" in out and "propose" in out
+    ok(NodeTool(), ctx, id="b")  # back to the napkin: allowed
+    assert "b" in session.state.sketchbook.active_variant().nodes
+
+
+def test_done_with_nothing_promoted_points_at_promote_without_erroring(tmp_path):
+    ctx, _, _ = brainstorm_ctx(tmp_path)
+    res = ok(ArchDoneTool(), ctx, summary="s")
+    assert "promote" in res.output
 
 
 # ---------- promotion ----------
 
 
-def test_promote_requires_complete_brief(tmp_path):
-    ctx, _, _ = brainstorm_ctx(tmp_path)
+def test_promote_without_a_complete_brief_works_and_says_what_is_unknown(tmp_path):
+    ctx, session, _ = brainstorm_ctx(tmp_path)
     ok(VariantTool(), ctx, name="v")
     ok(NodeTool(), ctx, id="a", note="x")
-    out = err(PromoteTool(), ctx)
-    assert "brief still needs" in out and "goal" in out
+    res = ok(PromoteTool(), ctx)
+    assert "a" in session.state.components
+    assert "goal" in res.output and "not a blocker" in res.output
 
 
 def test_promote_requires_a_sketched_variant(tmp_path):
@@ -142,7 +159,7 @@ def test_promote_requires_a_sketched_variant(tmp_path):
     assert "no nodes" in err(PromoteTool(), ctx)
 
 
-def test_promote_seeds_strict_and_archives_rivals(tmp_path):
+def test_promote_seeds_strict_and_leaves_rivals_live(tmp_path):
     ctx, session, _ = brainstorm_ctx(tmp_path)
     fill_brief(ctx, scope="internal")
     ok(VariantTool(), ctx, id="v1", name="sync")
@@ -156,16 +173,47 @@ def test_promote_seeds_strict_and_archives_rivals(tmp_path):
     st = session.state
     assert st.phase == "propose"
     assert st.sketchbook.variants["v1"].status == "chosen"
-    assert st.sketchbook.variants["v2"].status == "archived"
+    # the rival is NOT archived — the user may still want to go back to it
+    assert st.sketchbook.variants["v2"].status == "draft"
     assert set(st.components) == {"api", "db"}
     assert st.components["db"].kind == "store"          # database -> store mapping
     assert st.components["api"].responsibility == "front door"
     assert [(c.src, c.dst) for c in st.connections] == [("api", "db")]
-    # promoted components are drafts — no trace yet
     assert any("trace + responsibility" in m for m in st.toplevel_missing())
 
 
-def test_promoted_drafts_block_approval_until_tightened(tmp_path):
+def test_repromoting_the_same_variant_is_idempotent(tmp_path):
+    ctx, session, _ = brainstorm_ctx(tmp_path)
+    ok(VariantTool(), ctx, id="v1", name="sync")
+    ok(NodeTool(), ctx, id="api")
+    ok(PromoteTool(), ctx)
+    ok(NodeTool(), ctx, id="db")           # sketch grew after promoting
+    res = ok(PromoteTool(), ctx)           # pick the growth up
+    assert set(session.state.components) == {"api", "db"}
+    assert "1 already seeded" in res.output
+
+
+def test_promoting_a_rival_with_replace_clears_the_old_shape(tmp_path):
+    ctx, session, _ = brainstorm_ctx(tmp_path)
+    ok(VariantTool(), ctx, id="v1", name="sync")
+    ok(NodeTool(), ctx, id="api")
+    ok(LinkTool(), ctx, src="api", dst="db", label="writes")
+    ok(PromoteTool(), ctx, variant_id="v1")
+    assert set(session.state.components) == {"api", "db"}
+
+    ok(VariantTool(), ctx, id="v2", name="evented")
+    ok(NodeTool(), ctx, id="queue-in")
+    ok(PromoteTool(), ctx, variant_id="v2", replace=True)
+    st = session.state
+    assert set(st.components) == {"queue-in"}   # the old seed is gone
+    assert st.connections == []                 # and nothing dangles
+    assert st.sketchbook.variants["v2"].status == "chosen"
+    assert st.sketchbook.variants["v1"].status == "draft"
+
+
+def test_promoted_drafts_reach_the_gate_with_what_is_thin(tmp_path):
+    """The old harness refused approval until every draft was tightened. Now the
+    thinness travels to the user, who decides whether it matters."""
     broker = FakeBroker([(True, "")])
     ctx, session, _ = brainstorm_ctx(tmp_path, broker=broker)
     fill_brief(ctx, scope="internal")
@@ -175,10 +223,22 @@ def test_promoted_drafts_block_approval_until_tightened(tmp_path):
     ok(LinkTool(), ctx, src="api", dst="db", label="writes")
     ok(PromoteTool(), ctx)
 
-    # drafts lack trace -> the top-level gate refuses
-    assert "trace + responsibility" in err(ArchDoneTool(), ctx, summary="s")
+    ok(ArchDoneTool(), ctx, summary="rough but real")
+    assert session.state.phase == "expand"  # approved
+    payload = broker.payloads[-1]
+    assert payload["kind"] == "toplevel_approval"
+    assert any("trace" in t for t in payload["thin"])
+    assert any("no trace" in g for g in payload["gaps"])
 
-    # tighten the promoted drafts, add the flow + decision the strict layer wants
+
+def test_tightening_the_design_clears_the_gaps(tmp_path):
+    ctx, session, _ = brainstorm_ctx(tmp_path)
+    fill_brief(ctx, scope="internal")
+    ok(VariantTool(), ctx, name="sync")
+    ok(NodeTool(), ctx, id="api", kind="api", note="serves requests")
+    ok(NodeTool(), ctx, id="db", kind="store", note="stores rows")
+    ok(LinkTool(), ctx, src="api", dst="db", label="writes")
+    ok(PromoteTool(), ctx)
     ok(ComponentTool(), ctx, id="api", trace=["goal"], responsibility="serves requests")
     ok(ComponentTool(), ctx, id="db", kind="store", data_owned="rows",
        trace=["goal"], responsibility="stores rows")
@@ -186,6 +246,5 @@ def test_promoted_drafts_block_approval_until_tightened(tmp_path):
        steps=[{"src": "api", "dst": "db", "action": "write"}])
     ok(DecideTool(), ctx, topic="store", category="storage",
        options=[{"name": "pg"}, {"name": "mongo"}], choice="pg", rationale="relational")
-
-    ok(ArchDoneTool(), ctx, summary="ready")
-    assert session.state.phase == "expand"  # user approved the top level
+    assert session.state.gaps() == []
+    assert session.state.toplevel_missing() == []

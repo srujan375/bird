@@ -7,6 +7,10 @@ Carries the same event vocabulary as StdioTransport, over HTTP on localhost:
   POST /input       → {"text": ...}
   POST /permission  → {"id": n, "approved": bool, "feedback": "optional"}
   POST /interrupt   → {}
+  POST /mutate      → {"op": ..., ...} — a UI edit; 200 {"ok": true} or 400
+                      {"ok": false, "error": ...}. The resulting state arrives
+                      on /events like every other change, so the reply carries
+                      only the verdict.
 
 Late joiners (including a mid-session browser refresh) are replayed: the
 latest `ready`, a bounded buffer of transcript events (harness_event /
@@ -19,6 +23,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +32,11 @@ from typing import Any, Callable
 REPLAY_LIMIT = 500  # transcript events kept for refresh replay
 SSE_PING_SECONDS = 15.0
 BUFFERED_TYPES = {"harness_event", "turn_end", "error"}
+LINGER_POLL_SECONDS = 0.5
+
+# Queued to a client to force a write without sending it anything: it comes out
+# as an SSE comment, which is how a gone-away tab gets noticed.
+_PING = object()
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -41,7 +51,15 @@ CONTENT_TYPES = {
 
 class HttpTransport:
     """Binds 127.0.0.1 on a random free port at construction (so the URL is
-    known before run() blocks); serves until shutdown() or stop_when fires."""
+    known before run() blocks); serves until shutdown() or stop_when fires.
+
+    `linger` is what stands between "the session is over" and "the page the
+    user is reading went dead under them". With it set, stop_when starts a
+    countdown instead of pulling the plug: the server keeps serving until the
+    last page closes (detected within one SSE ping) or `linger` seconds pass,
+    whichever comes first. Leave it at 0 when a caller is waiting on the return
+    — the lead's dispatch path, tests — and the old behaviour is unchanged.
+    """
 
     def __init__(
         self,
@@ -49,9 +67,12 @@ class HttpTransport:
         host: str = "127.0.0.1",
         port: int = 0,
         stop_when: Callable[[dict[str, Any]], bool] | None = None,
+        linger: float = 0.0,
     ) -> None:
         self.static_dir = static_dir.resolve()
         self._stop_when = stop_when
+        self._linger = max(0.0, linger)
+        self._stopping = False
         self._lock = threading.Lock()
         self._clients: list[queue.Queue] = []
         self._buffer: deque[dict[str, Any]] = deque(maxlen=REPLAY_LIMIT)
@@ -92,7 +113,33 @@ class HttpTransport:
             for q in self._clients:
                 q.put(event)
         if self._stop_when is not None and self._stop_when(event):
+            self._begin_stop()
+
+    def _begin_stop(self) -> None:
+        """stop_when fired. Either pull the plug or start the read window."""
+        with self._lock:
+            if self._stopping:
+                return
+            self._stopping = True
+        if self._linger <= 0:
             self.shutdown()
+            return
+        threading.Thread(target=self._linger_then_stop, daemon=True, name="http-linger").start()
+
+    def _linger_then_stop(self) -> None:
+        deadline = time.monotonic() + self._linger
+        while time.monotonic() < deadline:
+            time.sleep(LINGER_POLL_SECONDS)
+            with self._lock:
+                if not self._clients:
+                    break  # the last page closed; nothing left to stay open for
+                # No events flow after finalize, so a closed tab would otherwise
+                # go unnoticed until the 15s keepalive. Poke each client: the
+                # write fails, that thread unsubscribes, and the next poll sees
+                # an empty room.
+                for q in self._clients:
+                    q.put(_PING)
+        self.shutdown()
 
     def run(self, handlers: Any) -> None:
         self._handlers = handlers
@@ -180,6 +227,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 try:
                     event = q.get(timeout=SSE_PING_SECONDS)
                 except queue.Empty:
+                    event = _PING
+                if event is _PING:
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                     continue
@@ -220,6 +269,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
             )
         elif self.path == "/interrupt":
             handlers.on_interrupt()
+        elif self.path == "/mutate":
+            # getattr, not a hard call: a transport shouldn't require every
+            # embedder's Handlers to grow a method for a route it never serves
+            on_mutate = getattr(handlers, "on_mutate", None)
+            if on_mutate is None:
+                self._respond(404, {"error": "not found"})
+                return
+            result = on_mutate(payload)
+            self._respond(200 if result.get("ok") else 400, result)
+            return
         else:
             self._respond(404, {"error": "not found"})
             return

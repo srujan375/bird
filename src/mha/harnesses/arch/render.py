@@ -59,6 +59,22 @@ def toplevel_mermaid(state: ArchState) -> str:
     return "\n".join(lines)
 
 
+def sketch_mermaid(variant: Any) -> str:
+    """A loose variant as a diagram. The sketch layer is a first-class view now,
+    not a private scratchpad, so it renders wherever the strict graph does —
+    including while nothing has been promoted at all."""
+    lines = ["flowchart LR"]
+    for node in variant.nodes.values():
+        ident = _ident(node.id)
+        kind = f"<br/><i>{_label(node.kind)}</i>" if node.kind and node.kind != "component" else ""
+        lines.append(f'  {ident}["{_label(node.label or node.id)}{kind}"]')
+    for ln in variant.links:
+        arrow = _EDGE_ARROWS.get(ln.kind, "-->")
+        label = f'|"{_label(ln.label)}"|' if ln.label else ""
+        lines.append(f"  {_ident(ln.src)} {arrow}{label} {_ident(ln.dst)}")
+    return "\n".join(lines)
+
+
 def flow_mermaid(flow: Flow) -> str:
     lines = ["sequenceDiagram"]
     seen: list[str] = []
@@ -123,6 +139,12 @@ def render_all(state: ArchState) -> dict[str, Any]:
         "toplevel": toplevel_mermaid(state),
         "flows": {f.id: flow_mermaid(f) for f in state.flows},
         "facets": facets,
+        # every live variant, so the page has something to draw before (and
+        # after) anything is promoted
+        "sketches": {
+            v.id: sketch_mermaid(v) for v in state.sketchbook.variants.values() if v.nodes
+        },
+        "active_sketch": state.sketchbook.active,
     }
 
 
@@ -135,89 +157,105 @@ def risk_ordered_pending(state: ArchState) -> list:
 
 
 def _next_hint(state: ArchState) -> str:
-    if state.phase == "brainstorm":
-        v = state.sketchbook.active_variant()
+    """A suggestion, not an instruction. Nothing here is enforced anywhere —
+    the model is free to ignore it and talk to the user instead."""
+    if state.phase == "finalized":
+        return "session complete."
+    if state.phase == "toplevel_review":
+        return "awaiting the user's ruling on the top level."
+
+    blockers = state.open_blockers()
+    if blockers:
+        b = blockers[0]
+        return (
+            f"{b.id} is an open blocker against {b.target} — resolve it (design change, "
+            "or overruled with the reason) or put it to the user."
+        )
+    v = state.sketchbook.active_variant()
+    if not state.components:
         if v is None or not v.nodes:
             return (
-                "sketch a rough shape from the requirements — `variant` to name an idea, "
-                "then `node`/`link`. Offer the user a couple of rival shapes to react to."
+                "sketch a rough shape from what they asked for — a diagram they can "
+                "react to beats a form they have to fill. Rival takes are better than one."
             )
-        missing = state.brief.missing()
-        tail = f" (brief still needs: {', '.join(missing)})" if missing else ""
         return (
-            f"brainstorming '{v.name}' ({len(v.nodes)} node(s)): deepen/collapse/splice "
-            f"freely, spin up rival variants, talk it through. `promote` when you and the "
-            f"user land on one{tail}."
+            f"'{v.name}' has {len(v.nodes)} box(es): argue it through with the user, spin "
+            "up a rival, or `promote` it once you've landed on a shape."
         )
-    if state.phase == "intake":
-        missing = state.brief.missing()
-        if missing:
-            return (
-                f"brief still needs: {', '.join(missing)} — call `brief`; ask the user "
-                "for load-bearing facts you don't have (do not assume)."
-            )
-        return "brief complete — start proposing components."
-    if state.phase == "propose":
-        missing = state.toplevel_missing()
-        if missing:
-            return "top level still owes: " + "; ".join(missing) + "."
-        return "top level looks complete — call `done` to request the user's approval."
-    if state.phase == "toplevel_review":
-        return "awaiting user approval of the top level."
-    if state.phase == "expand":
+    if state.phase in ("expand", "resolved"):
         queue = risk_ordered_pending(state)
         if queue:
             head = queue[0]
-            return f'expand("{head.component_id}") next — {head.reason}.'
-        return "all obligations closed — call `done` to run the challenge pass."
-    if state.phase == "challenge":
-        open_qs = [q for q in state.questions if q.open]
-        if open_qs:
-            return "address the challenge findings (answer / ask the user / amend), then call `done`."
-        return "challenge clean — call `done` to request Finalize."
-    if state.phase == "resolved":
-        return "call `done` to request Finalize."
-    return "session complete."
+            return (
+                f'expand("{head.component_id}") is the one that would hurt most to get '
+                f"wrong — {head.reason}."
+            )
+        return "the design is covered — `done` when you want the user to finalize it."
+    thin = state.toplevel_missing()
+    if thin:
+        return (
+            "still loose: " + "; ".join(thin) + ". Tighten what matters, say why the rest "
+            "doesn't, then `done` for the user's sign-off."
+        )
+    return "the top level holds together — `done` when you want the user's sign-off."
+
+
+GAPS_SHOWN = 5
+CONCERNS_SHOWN = 5
 
 
 def tracker(state: ArchState) -> str:
-    """The pinned tracker — re-rendered into the conversation every turn."""
-    if state.phase == "brainstorm":
-        return _brainstorm_tracker(state)
-    happy = len(state.happy_flows())
-    lines = [
-        f"{TRACKER_PREFIX} — pinned; phase: {state.phase}]",
-        (
-            f"brief: scope={state.brief.scope or '?'} · "
-            f"components: {len(state.components)} · connections: {len(state.connections)} · "
-            f"flows: {len(state.flows)} ({happy} happy) · decisions: {len(state.decisions)}"
-        ),
-    ]
-    queue = risk_ordered_pending(state)
-    if queue:
-        items = ", ".join(f"{o.component_id}({o.facet})" for o in queue)
-        lines.append(f"obligations pending (risk order): {items}")
-    blocking = state.blocking_questions()
-    if blocking:
-        items = "; ".join(f"{q.id}: {q.question[:60]}" for q in blocking)
-        lines.append(f"BLOCKING questions open: {items}")
-    lines.append(f"next: {_next_hint(state)}")
-    return "\n".join(lines)
+    """The pinned tracker — re-rendered into the conversation every turn.
 
+    Both layers are always shown, because both are always live: the sketchbook
+    doesn't disappear when a shape is promoted. Gaps and concerns are reported,
+    never demanded — the model decides which are worth acting on."""
+    lines = [f"{TRACKER_PREFIX} — pinned; phase: {state.phase}]"]
 
-def _brainstorm_tracker(state: ArchState) -> str:
     book = state.sketchbook
-    lines = [f"{TRACKER_PREFIX} — pinned; phase: brainstorm]"]
     if book.variants:
         parts = []
         for v in book.variants.values():
-            tag = " ◀ active" if v.id == book.active else ""
-            if v.status == "archived":
+            tag = ""
+            if v.status == "chosen":
+                tag = " ✓chosen"
+            elif v.status == "archived":
                 tag = " (archived)"
+            elif v.id == book.active:
+                tag = " ◀ active"
             parts.append(f"{v.name} [{len(v.nodes)}n/{len(v.links)}e]{tag}")
-        lines.append("variants: " + " · ".join(parts))
+        lines.append("sketch: " + " · ".join(parts))
+
+    if state.components:
+        happy = len(state.happy_flows())
+        lines.append(
+            f"design: {len(state.components)} components · {len(state.connections)} connections · "
+            f"{len(state.flows)} flows ({happy} happy) · {len(state.decisions)} decisions"
+        )
     else:
-        lines.append("variants: none yet")
+        lines.append("design: nothing promoted yet")
     lines.append(f"brief: scope={state.brief.scope or '?'} · goal={'set' if state.brief.goal else '?'}")
+
+    concerns = state.open_concerns()
+    if concerns:
+        shown = concerns[:CONCERNS_SHOWN]
+        lines.append("open concerns:")
+        lines += [f"  - {c.id} [{c.severity}] {c.target}: {c.claim}" for c in shown]
+        if len(concerns) > len(shown):
+            lines.append(f"  … {len(concerns) - len(shown)} more")
+
+    gaps = state.gaps()
+    if gaps:
+        lines.append(f"thin ({len(gaps)}, none required): " + "; ".join(gaps[:GAPS_SHOWN]))
+
+    queue = risk_ordered_pending(state)
+    if queue:
+        lines.append("worth depth (risk order): " + ", ".join(
+            f"{o.component_id}({o.facet})" for o in queue))
+    blocking = state.blocking_questions()
+    if blocking:
+        lines.append("unanswered questions you asked: " + "; ".join(
+            f"{q.id}: {q.question[:60]}" for q in blocking))
+
     lines.append(f"next: {_next_hint(state)}")
     return "\n".join(lines)

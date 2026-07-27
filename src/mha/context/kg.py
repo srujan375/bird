@@ -130,7 +130,7 @@ class KGQueryResult:
 class KGStats:
     nodes: int
     edges: int
-    action: str  # "built" | "updated" | "fresh"
+    action: str  # "built" | "updated" | "fresh" | "seeded"
 
 
 class KG:
@@ -234,6 +234,37 @@ class KG:
         save_manifest(result["files"], manifest_path=str(self.manifest_path), root=self.repo_root)
         self._graph_cache = None
         return KGStats(nodes=G.number_of_nodes(), edges=G.number_of_edges(), action="updated")
+
+    def seed(self, nodes: list[dict], edges: list[dict]) -> KGStats:
+        """Merge hand-authored nodes into the graph, creating one if there is none.
+
+        Extraction can only describe code that exists. The arch harness calls
+        this at finalize so a greenfield `mha code` session can `kg_query` the
+        architecture on turn one — the components, their contracts and what
+        talks to what — instead of querying an empty repo and getting nothing.
+
+        Written through graphify's own exporter, so the result is shaped exactly
+        like a built graph and every reader stays oblivious. A later full
+        `build()` drops these nodes, which is correct: by then the code they
+        describe exists, and the graph should be earned rather than asserted.
+        """
+        from graphify.cluster import cluster
+        from graphify.export import to_json
+
+        G = self._load_graph().copy() if self.graph_path.exists() else nx.Graph()
+        for node in nodes:
+            attrs = {k: v for k, v in node.items() if k != "id"}
+            G.add_node(node["id"], **attrs)
+        for edge in edges:
+            src, dst = edge.get("source"), edge.get("target")
+            if src not in G or dst not in G:
+                continue  # never leave a dangling edge behind
+            G.add_edge(src, dst, **{k: v for k, v in edge.items() if k not in ("source", "target")})
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        communities = cluster(G) if G.number_of_nodes() else {}
+        to_json(G, communities, str(self.graph_path), force=True)
+        self._graph_cache = None
+        return KGStats(nodes=G.number_of_nodes(), edges=G.number_of_edges(), action="seeded")
 
     def ensure(self) -> KGStats:
         """Build if missing, update if stale, no-op if fresh. Blocking.

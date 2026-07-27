@@ -1,12 +1,23 @@
-"""The arch toolset — structured mutation of ArchState, gates as errors.
+"""The arch toolset — a design conversation with a memory.
 
-Follows plan.py's conventions: harness-owned state, the model mutates via
-validated calls, gates return instructive ToolErrors that say what to do
-instead. `done` is the universal phase gate (design ruling): in propose it
-fires the toplevel_approval broker request; in expand (obligations closed)
-it runs the challenge pass; in challenge/resolved it fires the finalize
-request. Gate rejections return as same-turn tool errors carrying the
-user's feedback.
+The tools exist so that thinking survives the session; they are not a form to
+be filled. Three rules follow from that, and they are what separate this from
+the original phase-gated toolset:
+
+1. A tool refuses only what is *broken* (an edge to a component that doesn't
+   exist, a session already finalized). Thinness comes back as advice on a
+   successful call, so the model can argue about whether it matters.
+2. No tool is locked by phase. Sketch after promoting, add a component before
+   the brief is complete, expand before approval — all allowed. Post-approval
+   structural edits still record an amendment; the audit trail was the part
+   worth keeping, not the lock.
+3. Disagreement is first-class: `concern` records an objection against the
+   design, a decision, or the user's own instruction, and open blockers are
+   shown to the user at the finalize gate rather than blocking the work.
+
+`done` is the two human gates and nothing else: top-level approval, then
+finalize. It never refuses for an incomplete design — it reports what is thin
+and lets the user decide.
 """
 
 from __future__ import annotations
@@ -20,9 +31,18 @@ from ...tools.files import ReadTool
 from ...tools.skill import SkillTool
 from ...tools.web import WebFetchTool, WebSearchTool
 from . import render
+from .reverse_seed import (
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_NODES,
+    SeedResult,
+    Subgraph,
+    reverse_seed,
+    scope_subgraph,
+)
 from .session import ArchSession
 from .sketch import DEPTHS, SketchLink, SketchNode, Variant
 from .state import (
+    CONCERN_SEVERITIES,
     KINDS,
     CONNECTION_KINDS,
     DECISION_CATEGORIES,
@@ -51,7 +71,7 @@ from .state import (
     StoreFacet,
 )
 
-POST_APPROVAL_PHASES = ("expand", "challenge", "resolved")
+POST_APPROVAL_PHASES = ("expand", "resolved")
 
 
 def _check(validate, *args) -> None:
@@ -69,53 +89,34 @@ def _session(ctx: ToolContext) -> ArchSession:
 
 
 def _guard_not_finalized(session: ArchSession) -> None:
+    """The one hard lock left in the harness. Everything the old phase gates
+    refused — sketching after promote, components before a complete brief,
+    expanding before approval — is now allowed and merely noted."""
     if session.state.phase == "finalized":
         raise ToolError("the session is finalized — no further changes are possible.")
 
 
-def _guard_toplevel_unlocked(session: ArchSession, what: str) -> None:
-    """component/connect are propose-phase tools."""
-    state = session.state
-    _guard_not_finalized(session)
-    if state.phase == "brainstorm":
-        raise ToolError(
-            f"you're brainstorming — {what} is a strict tool. Sketch loosely with "
-            "`node`/`link`/`splice`, then `promote` the shape you land on; promotion "
-            "seeds the strict components for you to tighten here."
-        )
-    if state.phase == "intake":
-        missing = state.brief.missing()
-        raise ToolError(
-            f"{what} is locked until the brief has {', '.join(missing) or 'its required fields'} "
-            "— call `brief` with what you know, and ask the user for load-bearing facts "
-            "you don't have."
-        )
-    if state.phase in POST_APPROVAL_PHASES:
-        raise ToolError(
-            f"the top level is user-approved; {what} is locked. Route the change through "
-            "`amend_toplevel` (it records an amendment and re-flags approval when structural)."
-        )
-
-
-def _guard_brainstorm(session: ArchSession, what: str) -> None:
-    """The loose sketch tools only run in the brainstorm phase — once a variant
-    is promoted the sketch is committed and the strict tools take over."""
-    _guard_not_finalized(session)
-    if session.state.phase != "brainstorm":
-        raise ToolError(
-            f"{what} is a brainstorming tool, but the sketch is committed (phase "
-            f"'{session.state.phase}'). Edit the strict design with `component`/`connect`"
-            + (" or `amend_toplevel`." if session.state.phase in POST_APPROVAL_PHASES else ".")
-        )
+def _toplevel_locked(session: ArchSession) -> bool:
+    """After the user approves the top level, structural edits still go
+    through — they just leave an amendment behind."""
+    return session.state.phase in POST_APPROVAL_PHASES
 
 
 def _active_variant(session: ArchSession) -> Variant:
-    v = session.state.sketchbook.active_variant()
-    if v is None:
-        raise ToolError(
-            "no active variant — start one with `variant` (give it a name), then add "
-            "nodes. Sketching a couple of rival variants first is encouraged."
-        )
+    """The sketch surface is always available: if nothing is open, open one.
+    Going back to the napkin mid-design is a legitimate move, not an error."""
+    book = session.state.sketchbook
+    v = book.active_variant()
+    if v is not None:
+        return v
+    live = next((x for x in book.variants.values() if x.status != "archived"), None)
+    if live is not None:
+        book.active = live.id
+        return live
+    vid = f"v{len(book.variants) + 1}"
+    v = Variant(id=vid, name="first take", summary="")
+    book.variants[vid] = v
+    book.active = vid
     return v
 
 
@@ -144,31 +145,59 @@ def _strict_kind(loose: str) -> str:
     return _KIND_MAP.get(k, "service")
 
 
-def _promote(session: ArchSession, variant: Variant) -> tuple[int, int]:
-    """Replay a chosen variant into the strict ArchState: nodes -> draft
-    Components (trace left empty for the model to fill in propose), links ->
-    Connections. Rivals are archived (their rejected_reason is the ADR gold).
-    Bypasses validation deliberately — these are drafts, tightened in propose."""
+def _drop_components(state: Any, ids: set[str]) -> None:
+    """Remove components and everything that would dangle without them."""
+    for cid in ids:
+        state.components.pop(cid, None)
+    state.connections = [c for c in state.connections if c.src not in ids and c.dst not in ids]
+    kept = []
+    for f in state.flows:
+        f.steps = [s for s in f.steps if s.src not in ids and s.dst not in ids]
+        if f.steps:
+            kept.append(f)
+    state.flows = kept
+    state.obligations = [o for o in state.obligations if o.component_id not in ids]
+
+
+def _promote(session: ArchSession, variant: Variant, replace: bool = False) -> tuple[int, int, int]:
+    """Seed the strict layer from a sketch: nodes -> draft Components, links ->
+    Connections. Deliberately skips the thinness checks — these are drafts.
+
+    Re-runnable and non-destructive. Rivals stay live (archiving is a separate,
+    deliberate move), a node already seeded from this variant is left alone
+    rather than duplicated, and `replace` clears what an *earlier* choice
+    seeded so switching horses doesn't leave two architectures on the canvas.
+    """
     state = session.state
     book = state.sketchbook
     for x in book.variants.values():
         if x.id == variant.id:
             x.status = "chosen"
-        elif x.status != "archived":
-            x.status = "archived"
+        elif x.status == "chosen":
+            x.status = "draft"  # the previous choice steps down but stays live
     book.active = variant.id
 
+    prefix = f"sketch:{variant.id}:"
+    if replace:
+        stale = {
+            c.id for c in state.components.values()
+            if c.origin.startswith("sketch:") and not c.origin.startswith(prefix)
+        }
+        _drop_components(state, stale)
+
+    seeded = {c.origin: c.id for c in state.components.values() if c.origin.startswith(prefix)}
     idmap: dict[str, str] = {}
-    used: set[str] = set()
-    for nid in variant.nodes:
+    added_c = kept = 0
+    for nid, node in variant.nodes.items():
+        origin = prefix + nid
+        if origin in seeded:
+            idmap[nid] = seeded[origin]
+            kept += 1
+            continue
         base = _slug(nid)
         cid, i = base, 2
-        while cid in used or cid in state.components:
+        while cid in state.components:
             cid, i = f"{base}-{i}", i + 1
-        used.add(cid)
-        idmap[nid] = cid
-    for nid, node in variant.nodes.items():
-        cid = idmap[nid]
         state.components[cid] = Component(
             id=cid,
             name=node.label or cid,
@@ -176,29 +205,70 @@ def _promote(session: ArchSession, variant: Variant) -> tuple[int, int]:
             responsibility=(node.note or node.detail or "").strip(),
             trace=[],
             existing=False,
+            origin=origin,
         )
-    seen: set[tuple[str, str, str]] = set()
-    added = 0
+        idmap[nid] = cid
+        added_c += 1
+
+    have = {(c.src, c.dst, c.label) for c in state.connections}
+    added_conn = 0
     for ln in variant.links:
         s, d = idmap.get(ln.src), idmap.get(ln.dst)
         if not s or not d:
             continue
-        key = (s, d, ln.label)
-        if key in seen:
+        label = ln.label or "calls"
+        if (s, d, label) in have:
             continue
-        seen.add(key)
+        have.add((s, d, label))
         state.connections.append(Connection(
             src=s, dst=d,
-            label=ln.label or "calls",
+            label=label,
             kind=ln.kind if ln.kind in CONNECTION_KINDS else "sync",
         ))
-        added += 1
-    state.phase = "propose"
-    return len(variant.nodes), added
+        added_conn += 1
+    if state.phase == "brainstorm":
+        state.phase = "propose"  # never yanks a later phase backwards
+    return added_c, added_conn, kept
 
 
-def _confirm(action: str, session: ArchSession) -> ToolResult:
-    return ToolResult(output=f"{action}\nnext: {render._next_hint(session.state)}")
+def _post_approval_amendment(session: ArchSession, description: str, *, structural: bool) -> str:
+    """After the user approves the top level, an edit is not refused — it is
+    recorded. The audit trail was the thing worth protecting; the lock wasn't."""
+    if not _toplevel_locked(session):
+        return ""
+    state = session.state
+    state.amendments.append(Amendment(
+        turn=len(state.amendments) + 1, description=description, structural=structural,
+    ))
+    if structural:
+        state.compute_obligations()
+        return (
+            "this changes the top level the user already approved — recorded as a "
+            "structural amendment and obligations recomputed. Tell them what moved and why."
+        )
+    return "recorded as an amendment against the approved top level."
+
+
+def _confirm(
+    action: str,
+    session: ArchSession,
+    *,
+    gaps: list[str] | None = None,
+    note: str = "",
+) -> ToolResult:
+    """Tool receipt: what happened, what is thin about it, what's worth doing
+    next. `gaps` is advice — the call already succeeded."""
+    parts = [action]
+    if note:
+        parts.append(note)
+    if gaps:
+        parts.append(
+            "thin: " + "; ".join(gaps)
+            + "\n(fill these in when you know them, or say why they don't matter here — "
+            "they are not required)"
+        )
+    parts.append(f"next: {render._next_hint(session.state)}")
+    return ToolResult(output="\n".join(parts))
 
 
 # ============================ the loose sketch layer ============================
@@ -230,7 +300,7 @@ class VariantTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_brainstorm(session, "`variant`")
+        _guard_not_finalized(session)
         book = session.state.sketchbook
         if args.get("archive"):
             vid = (args.get("id") or "").strip()
@@ -288,7 +358,7 @@ class NodeTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_brainstorm(session, "`node`")
+        _guard_not_finalized(session)
         v = _active_variant(session)
         nid = args["id"].strip()
         if args.get("remove"):
@@ -338,7 +408,7 @@ class LinkTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_brainstorm(session, "`link`")
+        _guard_not_finalized(session)
         v = _active_variant(session)
         src, dst = args["src"].strip(), args["dst"].strip()
         label = args.get("label")
@@ -395,7 +465,7 @@ class SpliceTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_brainstorm(session, "`splice`")
+        _guard_not_finalized(session)
         v = _active_variant(session)
         src, dst, nid = args["src"].strip(), args["dst"].strip(), args["id"].strip()
         for ref in (src, dst):
@@ -437,7 +507,7 @@ class DepthTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_brainstorm(session, "`depth`")
+        _guard_not_finalized(session)
         v = _active_variant(session)
         nid = args["node_id"].strip()
         node = v.nodes.get(nid)
@@ -458,15 +528,18 @@ class DepthTool(Tool):
 class PromoteTool(Tool):
     name = "promote"
     description = (
-        "Commit a variant: mark it chosen, archive the rivals, and seed the strict "
-        "design (components + connections) from its sketch — then you tighten each in "
-        "propose. Requires the brief to be complete first: the requirements only have "
-        "to be settled here, at promotion, not up front."
+        "Take a sketch variant forward: mark it chosen and seed the design "
+        "(components + connections) from it. Rivals stay live — you can keep "
+        "sketching, and promoting a different variant later is allowed (pass "
+        "replace:true to clear what the earlier choice seeded). Re-running it on the "
+        "same variant picks up nodes you have added since."
     )
     parameters = {
         "type": "object",
         "properties": {
             "variant_id": {"type": "string", "description": "which variant (default: the active one)"},
+            "replace": {"type": "boolean",
+                        "description": "drop what a previous variant seeded instead of merging"},
         },
         "additionalProperties": False,
     }
@@ -475,35 +548,34 @@ class PromoteTool(Tool):
         session = _session(ctx)
         state = session.state
         _guard_not_finalized(session)
-        if state.phase != "brainstorm":
-            raise ToolError(
-                f"promote only runs from brainstorm (phase is '{state.phase}'). The "
-                "shape is already committed."
-            )
         book = state.sketchbook
         vid = (args.get("variant_id") or book.active or "").strip()
         v = book.variants.get(vid) if vid else None
         if v is None:
-            raise ToolError("no variant to promote — name one with `variant` and sketch it first.")
+            known = ", ".join(book.variants) or "none"
+            raise ToolError(
+                f"no variant {vid!r} to promote (known: {known}) — name one with "
+                "`variant` and sketch it first."
+            )
         if not v.nodes:
             raise ToolError(f"variant {v.id} ({v.name}) has no nodes yet — sketch it before promoting.")
+        added_c, added_conn, kept = _promote(session, v, replace=bool(args.get("replace")))
+        session.touched()
+        bits = [f"seeded {added_c} component(s) and {added_conn} connection(s)"]
+        if kept:
+            bits.append(f"{kept} already seeded, left alone")
+        note = ""
         missing = state.brief.missing()
         if missing:
-            raise ToolError(
-                f"before promoting, the brief still needs: {', '.join(missing)}. These are "
-                "the load-bearing facts the build depends on — ask the user, record them "
-                "with `brief`, then promote."
+            note = (
+                f"the brief has no {', '.join(missing)} yet — not a blocker, but these are "
+                "load-bearing for the build. Ask the user rather than assuming."
             )
-        n_comp, n_conn = _promote(session, v)
-        session.touched()
-        return ToolResult(
-            output=(
-                f"Promoted '{v.name}': seeded {n_comp} component(s) and {n_conn} "
-                "connection(s) into the strict design; phase -> propose. Now give each "
-                "component a `trace` (which brief goal it serves) and a one-line "
-                "responsibility, add the key `flow`(s) and the major `decide` decision(s), "
-                "then call `done` for the user's top-level approval."
-            )
+        return _confirm(
+            f"Chose '{v.name}': " + "; ".join(bits) + ".",
+            session,
+            note=note,
+            gaps=state.gaps()[:6],
         )
 
 
@@ -541,12 +613,8 @@ class BriefTool(Tool):
         session = _session(ctx)
         state = session.state
         _guard_not_finalized(session)
-        if state.phase in POST_APPROVAL_PHASES:
-            raise ToolError(
-                "the brief is settled (top level approved). Record a scope change as an "
-                "amendment (`amend_toplevel`) or an open question (`ask`)."
-            )
         b = state.brief
+        before_scope = b.scope
         for key in ("goal", "scope", "latency", "consistency", "availability", "deploy_target"):
             if key in args:
                 setattr(b, key, args[key])
@@ -557,12 +625,21 @@ class BriefTool(Tool):
             if key in args:
                 setattr(b.scale, key, args[key])
         missing = b.missing()
-        if state.phase == "intake" and not missing:
-            state.phase = "propose"
+        note = ""
+        if _toplevel_locked(session) and b.scope != before_scope:
+            state.amendments.append(Amendment(
+                turn=len(state.amendments) + 1,
+                description=f"brief scope {before_scope or '?'} -> {b.scope}", structural=True,
+            ))
+            note = "scope changed after approval — recorded as an amendment; obligations recomputed."
+            state.compute_obligations()
         session.touched()
         if missing:
-            return _confirm(f"Brief updated; still missing: {', '.join(missing)}.", session)
-        return _confirm("Brief complete — components unlocked.", session)
+            return _confirm(
+                f"Brief updated. Still unknown: {', '.join(missing)} — ask the user for "
+                "these rather than assuming them.", session, note=note,
+            )
+        return _confirm("Brief updated.", session, note=note)
 
 
 class ComponentTool(Tool):
@@ -570,8 +647,9 @@ class ComponentTool(Tool):
     description = (
         "Add, update, or remove a top-level component. Upserts by id (ids are "
         "immutable and kebab-case; rename via `name`). `remove: true` deletes it — "
-        "connections and flows referencing it must be removed first. Locked after "
-        "top-level approval (use amend_toplevel)."
+        "connections and flows referencing it must be removed first. Only `id` is "
+        "required: record what you know now, fill the rest in as it settles. After "
+        "top-level approval this still works and records an amendment."
     )
     parameters = {
         "type": "object",
@@ -594,11 +672,19 @@ class ComponentTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_toplevel_unlocked(session, "`component`")
+        state = session.state
+        _guard_not_finalized(session)
         cid = args["id"].strip()
         result = _apply_component(session, args, cid)
+        note = _post_approval_amendment(session, result, structural=(
+            bool(args.get("remove")) or "kind" in args
+        ))
+        comp = state.components.get(cid)
         session.touched("component", cid)
-        return _confirm(result, session)
+        return _confirm(
+            result, session, note=note,
+            gaps=state.component_gaps(comp) if comp is not None else None,
+        )
 
 
 def _apply_component(session: ArchSession, args: dict[str, Any], cid: str) -> str:
@@ -617,13 +703,10 @@ def _apply_component(session: ArchSession, args: dict[str, Any], cid: str) -> st
         return f"Removed component {cid}."
     current = state.components.get(cid)
     if current is None:
-        for req in ("kind", "responsibility"):
-            if not args.get(req):
-                raise ToolError(f"a new component needs {req!r}.")
         comp = Component(
             id=cid,
             name=args.get("name", cid),
-            kind=args["kind"],
+            kind=args.get("kind") or "service",
             responsibility=args.get("responsibility", ""),
             trace=list(args.get("trace", [])),
             existing=bool(args.get("existing", False)),
@@ -633,6 +716,10 @@ def _apply_component(session: ArchSession, args: dict[str, Any], cid: str) -> st
         )
         _check(state.validate_component, comp, False)
         state.components[cid] = comp
+        # the design layer has something in it now, so the session is no longer
+        # only sketching. `promote` does the same thing for the other route in.
+        if state.phase == "brainstorm":
+            state.phase = "propose"
         return f"Added component {cid} ({comp.kind})."
     for key in ("name", "kind", "responsibility", "tech", "data_owned", "failure_notes"):
         if key in args:
@@ -672,10 +759,17 @@ class ConnectTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_toplevel_unlocked(session, "`connect`")
+        state = session.state
+        _guard_not_finalized(session)
         result = _apply_connection(session, args)
-        session.touched("connection", f"{args['src']}->{args['dst']}")
-        return _confirm(result, session)
+        note = _post_approval_amendment(session, result, structural=bool(args.get("remove")))
+        src, dst = args["src"].strip(), args["dst"].strip()
+        conn = next((c for c in state.connections if c.src == src and c.dst == dst), None)
+        session.touched("connection", f"{src}->{dst}")
+        return _confirm(
+            result, session, note=note,
+            gaps=state.connection_gaps(conn) if conn is not None else None,
+        )
 
 
 def _apply_connection(session: ArchSession, args: dict[str, Any]) -> str:
@@ -754,13 +848,6 @@ class FlowTool(Tool):
         session = _session(ctx)
         state = session.state
         _guard_not_finalized(session)
-        if state.phase == "brainstorm":
-            raise ToolError(
-                "flows come after you `promote` a shape — while brainstorming, sketch "
-                "paths loosely with `node`/`link`/`splice`."
-            )
-        if state.phase == "intake":
-            raise ToolError("flows are locked until the brief is complete — call `brief` first.")
         fid = args["id"].strip()
         existing = next((f for f in state.flows if f.id == fid), None)
         if args.get("remove"):
@@ -785,14 +872,9 @@ class FlowTool(Tool):
             else:
                 state.flows.append(flow)
                 action = f"Recorded flow {fid} ({flow.kind}, {len(flow.steps)} steps)."
-        # post-approval flow changes are additive behavior documentation —
-        # allowed directly, but they leave an audit trail
-        if state.phase in POST_APPROVAL_PHASES:
-            state.amendments.append(
-                Amendment(turn=len(state.amendments) + 1, description=action, structural=False)
-            )
+        note = _post_approval_amendment(session, action, structural=False)
         session.touched("flow", fid)
-        return _confirm(action, session)
+        return _confirm(action, session, note=note)
 
 
 def _as_str(owner: str, key: str, val: Any) -> str:
@@ -950,9 +1032,9 @@ _UNIT_ITEM = {
 class ExpandTool(Tool):
     name = "expand"
     description = (
-        "Fill one component's facet (its internal contract) — locked until the top "
-        "level is user-approved, then done ONE component at a time in the tracker's "
-        "risk order. Pass the field group matching the component's kind: endpoints "
+        "Fill one component's facet (its internal contract). Available at any point — "
+        "expand something early if that is what the conversation is about; the tracker "
+        "still suggests a risk order. Pass the field group matching the component's kind: endpoints "
         "(api/gateway) · entities/access_patterns/retention (store/cache) · messages "
         "(queue) · interface/modules (service/job/ui) · tasks (llm) · units/"
         "state_locality (infra)."
@@ -989,11 +1071,6 @@ class ExpandTool(Tool):
         session = _session(ctx)
         state = session.state
         _guard_not_finalized(session)
-        if state.phase in ("brainstorm", "intake", "propose", "toplevel_review"):
-            raise ToolError(
-                "expand is locked until the top level is approved — finish the top "
-                "level and call `done` to request the user's approval."
-            )
         cid = args["component_id"].strip()
         comp = state.components.get(cid)
         if comp is None:
@@ -1001,14 +1078,6 @@ class ExpandTool(Tool):
         facet_kind = FACET_FOR_KIND.get(comp.kind)
         if facet_kind is None:
             raise ToolError(f"{cid} is kind {comp.kind!r} — not ours to design; no facet applies.")
-        queue = render.risk_ordered_pending(state)
-        owed = next((o for o in queue if o.component_id == cid), None)
-        if queue and owed is not queue[0] and owed is not None:
-            head = queue[0]
-            raise ToolError(
-                f"one component at a time, in risk order: expand {head.component_id!r} "
-                f"first ({head.reason})."
-            )
         hint, builder = _FACET_BUILDERS[facet_kind]
         facet = builder(args)
         primary = getattr(facet, ("endpoints", "entities", "messages", "interface",
@@ -1017,17 +1086,29 @@ class ExpandTool(Tool):
         if not primary:
             raise ToolError(f"a {facet_kind} facet needs {hint}.")
         comp.facet = facet
+        queue = render.risk_ordered_pending(state)
+        owed = next((o for o in queue if o.component_id == cid), None)
         if owed is not None:
             owed.status = "done"
+        note = ""
+        if queue and owed is not queue[0]:
+            head = queue[0]
+            note = (
+                f"note: {head.component_id} is the riskier one still open ({head.reason}) "
+                "— worth doing next unless you have a reason to leave it."
+            )
         session.touched("component", cid)
-        return _confirm(f"Expanded {cid} ({facet_kind} facet).", session)
+        return _confirm(f"Expanded {cid} ({facet_kind} facet).", session, note=note)
 
 
 class DecideTool(Tool):
     name = "decide"
     description = (
-        "Record an architectural decision: at least 2 real options with pros/cons, "
-        "the choice (must match an option name), and the rationale. Upserts by id."
+        "Record an architectural decision: the options you weighed with pros/cons, the "
+        "choice (must match one of the option names), and the rationale. Upserts by id. "
+        "Recording a one-option decision is allowed and noted — but if there was never "
+        "an alternative, that is usually worth saying out loud rather than dressing up "
+        "as a decision."
     )
     parameters = {
         "type": "object",
@@ -1037,7 +1118,6 @@ class DecideTool(Tool):
             "category": {"type": "string", "enum": list(DECISION_CATEGORIES)},
             "options": {
                 "type": "array",
-                "minItems": 2,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -1054,7 +1134,7 @@ class DecideTool(Tool):
             "status": {"type": "string", "enum": ["decided", "deferred"],
                        "description": "deferred still records the default taken"},
         },
-        "required": ["topic", "category", "options", "choice", "rationale"],
+        "required": ["topic", "category", "choice", "rationale"],
         "additionalProperties": False,
     }
 
@@ -1068,7 +1148,7 @@ class DecideTool(Tool):
             topic=args["topic"],
             category=args["category"],
             options=[Option(name=o["name"], pros=list(o.get("pros", [])),
-                            cons=list(o.get("cons", []))) for o in args["options"]],
+                            cons=list(o.get("cons", []))) for o in args.get("options", [])],
             choice=args["choice"],
             rationale=args["rationale"],
             status=args.get("status", "decided"),
@@ -1082,7 +1162,7 @@ class DecideTool(Tool):
             state.decisions.append(dec)
             action = f"Recorded decision {did}: {dec.topic} -> {dec.choice}."
         session.touched("decision", did)
-        return _confirm(action, session)
+        return _confirm(action, session, gaps=state.decision_gaps(dec))
 
 
 class AskTool(Tool):
@@ -1145,12 +1225,82 @@ class AnswerTool(Tool):
         return _confirm(f"Question {qid} {q.resolution}.", session)
 
 
+class ConcernTool(Tool):
+    name = "concern"
+    description = (
+        "Put an objection on the record — the design is wrong, a decision will hurt, "
+        "or something is more than it needs to be. Use it against the design, against "
+        "a decision, against your OWN earlier proposal, or against what the user just "
+        "asked for. Say what breaks concretely and name the cheaper option.\n"
+        "severity: blocker (it will not work) · risk (it works but will hurt) · smell "
+        "(more than it needs to be). Open blockers are shown to the user at the "
+        "finalize gate — they never stop you working.\n"
+        "Resolve one with resolve:<id> and a status: `accepted` (the design changed), "
+        "`overruled` (the user or you decided to live with it — the reason is the "
+        "record), or `withdrawn` (you were wrong). Overruled concerns are kept: the "
+        "code harness inherits them.\n"
+        "State it in your reply too — this tool only records it."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "severity": {"type": "string", "enum": list(CONCERN_SEVERITIES)},
+            "target": {"type": "string",
+                       "description": "component/decision id, 'brief', 'user', or what it is about"},
+            "claim": {"type": "string", "description": "what breaks, concretely"},
+            "alternative": {"type": "string", "description": "the cheaper or safer option"},
+            "resolve": {"type": "string", "description": "id of an existing concern to close"},
+            "status": {"type": "string", "enum": ["accepted", "overruled", "withdrawn"]},
+            "resolution": {"type": "string", "description": "why — kept in the handoff"},
+        },
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        state = session.state
+        _guard_not_finalized(session)
+        rid = (args.get("resolve") or "").strip()
+        if rid:
+            c = next((x for x in state.concerns if x.id == rid), None)
+            if c is None:
+                known = ", ".join(x.id for x in state.concerns) or "none"
+                raise ToolError(f"no concern {rid!r} (known: {known}).")
+            c.status = args.get("status", "accepted")
+            c.resolution = args.get("resolution", "")
+            session.touched("concern", rid)
+            tail = f" — {c.resolution}" if c.resolution else ""
+            return _confirm(f"Concern {rid} {c.status}{tail}.", session)
+        claim = (args.get("claim") or "").strip()
+        if not claim:
+            raise ToolError("a concern needs a `claim`: what breaks, concretely.")
+        severity = args.get("severity", "risk")
+        if severity not in CONCERN_SEVERITIES:
+            raise ToolError(f"severity must be one of {', '.join(CONCERN_SEVERITIES)}.")
+        filed = session.file_concerns([{
+            "severity": severity,
+            "target": args.get("target", "design"),
+            "claim": claim,
+            "alternative": args.get("alternative", ""),
+        }], source="model")
+        if not filed:
+            return _confirm("Already on the record — not filed twice.", session)
+        c = filed[0]
+        session.touched("concern", c.id)
+        return _confirm(
+            f"Recorded {c.id} [{c.severity}] against {c.target}. Say it in your reply — "
+            "and if the user disagrees, resolve it as overruled with their reason.",
+            session,
+        )
+
+
 class AmendTool(Tool):
     name = "amend_toplevel"
     description = (
-        "The ONLY route to top-level edits after user approval: apply a component or "
-        "connection change (same fields as those tools, incl. remove) with a "
-        "description. Structural changes (add/remove/kind) re-flag the approval."
+        "Apply a component or connection change (same fields as those tools, incl. "
+        "remove) together with a written reason. `component`/`connect` also work after "
+        "approval and record an amendment automatically — reach for this one when the "
+        "*why* matters and should be in the audit trail in your words."
     )
     parameters = {
         "type": "object",
@@ -1167,11 +1317,6 @@ class AmendTool(Tool):
         session = _session(ctx)
         state = session.state
         _guard_not_finalized(session)
-        if state.phase not in POST_APPROVAL_PHASES:
-            raise ToolError(
-                "the top level is not approved yet — edit it directly with "
-                "`component`/`connect`; amend_toplevel is for post-approval changes."
-            )
         comp_args = args.get("component")
         conn_args = args.get("connection")
         if bool(comp_args) == bool(conn_args):
@@ -1203,13 +1348,24 @@ class AmendTool(Tool):
         return _confirm(f"Amendment recorded: {action}{note}", session)
 
 
+def _concern_payload(concerns: list[Any]) -> list[dict[str, str]]:
+    return [
+        {"id": c.id, "severity": c.severity, "target": c.target,
+         "claim": c.claim, "alternative": c.alternative, "source": c.source}
+        for c in concerns
+    ]
+
+
 class ArchDoneTool(Tool):
     name = "done"
     description = (
-        "Signal the current phase is complete. In propose this requests the user's "
-        "top-level approval; after expand it runs the challenge pass; when all "
-        "blocking questions are resolved it requests Finalize (which writes the "
-        "handoff bundle and ends the session). Gates tell you what is still owed."
+        "Take the design to the user. Before their sign-off this requests top-level "
+        "approval; after it, Finalize (writes the handoff bundle and ends the "
+        "session).\n"
+        "It never refuses because the design is unfinished. Whatever is still thin, "
+        "still unanswered, or still objected to travels to the user with the request, "
+        "and they decide. Don't call it to end a turn — a plain reply does that; call "
+        "it when you genuinely want the user's ruling."
     )
     parameters = {
         "type": "object",
@@ -1226,48 +1382,35 @@ class ArchDoneTool(Tool):
         summary = args["summary"]
         if state.phase == "finalized":
             raise ToolError("the session is already finalized.")
-        if state.phase == "brainstorm":
-            raise ToolError(
-                "you're still brainstorming — there's no phase to close here. When you "
-                "and the user agree on a shape, call `promote` to commit it (not `done`)."
+        if not state.components:
+            return _confirm(
+                "Nothing is committed to the design yet, so there is nothing to approve. "
+                "`promote` the sketch you and the user have landed on first — or just keep "
+                "talking; a plain reply ends your turn.",
+                session,
             )
-        if state.phase == "intake":
-            raise ToolError(
-                f"the brief still needs: {', '.join(state.brief.missing())}. Call `brief` "
-                "(and ask the user) before anything else."
-            )
-        if state.phase == "propose":
-            return self._toplevel_gate(session, summary)
-        if state.phase == "expand":
-            return self._challenge_or_finalize(session, summary)
-        # challenge / resolved
-        return self._finalize_gate(session, summary)
+        if _toplevel_locked(session):
+            return self._finalize_gate(session, summary, ctx.kg)
+        return self._toplevel_gate(session, summary)
 
     def _toplevel_gate(self, session: ArchSession, summary: str) -> ToolResult:
         state = session.state
-        missing = state.toplevel_missing()
-        if missing:
-            raise ToolError("the top level still owes: " + "; ".join(missing) + ".")
-        blocking = state.blocking_questions()
-        if blocking:
-            items = "; ".join(f"{q.id}: {q.question}" for q in blocking)
-            raise ToolError(
-                f"{len(blocking)} blocking question(s) still open: {items}. Top-level "
-                "approval cannot be requested until they are resolved — ask the user in "
-                "your reply, record their answers with `answer`, and end your turn. Call "
-                "`done` again only once every blocking question is answered."
-            )
         state.phase = "toplevel_review"
         session.touched()
-        approved, feedback = session.request_gate(
-            {"kind": "toplevel_approval", "summary": summary}
-        )
+        approved, feedback = session.request_gate({
+            "kind": "toplevel_approval",
+            "summary": summary,
+            "thin": state.toplevel_missing(),
+            "gaps": state.gaps(),
+            "concerns": _concern_payload(state.open_concerns()),
+            "questions": [q.question for q in state.blocking_questions()],
+        })
         if not approved:
             state.phase = "propose"
             session.touched()
-            raise ToolError(
-                f"The user requested changes to the top level: {feedback or '(no details)'} "
-                "— address the feedback, then call done again."
+            return _confirm(
+                f"The user wants changes before approving: {feedback or '(no details given)'}",
+                session,
             )
         state.phase = "expand"
         state.compute_obligations()
@@ -1275,62 +1418,200 @@ class ArchDoneTool(Tool):
         queue = render.risk_ordered_pending(state)
         if queue:
             items = "; ".join(f"{o.component_id} ({o.reason})" for o in queue)
-            return ToolResult(
-                output=f"Top level approved. Obligation queue (risk order): {items}. "
-                       f"Start with expand(\"{queue[0].component_id}\")."
+            return _confirm(
+                f"Top level approved. Worth depth, riskiest first: {items}.", session,
             )
-        return self._challenge_or_finalize(session, summary)
+        return _confirm("Top level approved.", session)
 
-    def _challenge_or_finalize(self, session: ArchSession, summary: str) -> ToolResult:
-        state = session.state
-        pending = render.risk_ordered_pending(state)
-        if pending:
-            items = "; ".join(f"{o.component_id} ({o.facet})" for o in pending)
-            raise ToolError(
-                f"obligations still pending: {items}. Expand them (or have the user "
-                "waive them) before finishing."
-            )
-        findings = session.run_challenge()
-        state.phase = "challenge"
-        session.touched()
-        if findings:
-            items = "; ".join(f"{q.id}: {q.question}" for q in findings)
-            raise ToolError(
-                f"challenge pass found {len(findings)} finding(s): {items}. Address "
-                "them (answer / ask the user / amend), then call done again."
-            )
-        return self._finalize_gate(session, summary)
-
-    def _finalize_gate(self, session: ArchSession, summary: str) -> ToolResult:
+    def _finalize_gate(self, session: ArchSession, summary: str, kg: Any = None) -> ToolResult:
         from .bundle import bundle_paths, write_bundle
+        from .kg_seed import seed_kg
 
         state = session.state
-        blocking = state.blocking_questions()
-        if blocking:
-            items = "; ".join(f"{q.id}: {q.question}" for q in blocking)
-            raise ToolError(
-                f"blocking questions unresolved: {items}. Resolve them with `answer` "
-                "(ask the user in your reply if you need them)."
-            )
+        session.run_audit()  # deterministic pass; the model critic runs on its own
+        blockers = state.open_blockers()
         state.phase = "resolved"
         session.touched()
         artifacts = [str(p) for p in bundle_paths(session.run_dir)] if session.run_dir else []
-        approved, feedback = session.request_gate(
-            {"kind": "finalize", "summary": summary, "artifacts": artifacts}
-        )
+        approved, feedback = session.request_gate({
+            "kind": "finalize",
+            "summary": summary,
+            "artifacts": artifacts,
+            # everything the user should weigh before signing it off
+            "blockers": _concern_payload(blockers),
+            "concerns": _concern_payload([c for c in state.open_concerns() if c not in blockers]),
+            "gaps": state.gaps(),
+            "questions": [q.question for q in state.blocking_questions()],
+            "obligations": [f"{o.component_id} ({o.facet})" for o in render.risk_ordered_pending(state)],
+        })
         if not approved:
-            raise ToolError(
-                f"The user requested changes instead of finalizing: {feedback or '(no details)'} "
-                "— address the feedback, then call done again."
+            state.phase = "expand"
+            session.touched()
+            return _confirm(
+                f"The user wants changes instead of finalizing: {feedback or '(no details given)'}",
+                session,
             )
+        # approving with objections open is a decision, and it is recorded as one.
+        # Re-check `open`: the gate is a snapshot, and the user can settle an
+        # objection from the rail while it is up — that ruling is the real one.
+        overruled = [c for c in blockers if c.open]
+        for c in overruled:
+            c.status = "overruled"
+            c.resolution = feedback.strip() or "overruled by the user at the finalize gate"
         written = write_bundle(state, session.run_dir) if session.run_dir else []
+        # the other half of the handoff: the markdown is what the builder reads,
+        # the graph is what it can ask questions of eleven turns later
+        seeded = seed_kg(kg, state, str(written[1]) if len(written) > 1 else "architecture.md")
         state.phase = "finalized"
         session.touched()
         paths = ", ".join(str(p) for p in written) or "(no run dir — nothing written)"
+        tail = f" {len(overruled)} open blocker(s) overruled and recorded." if overruled else ""
+        if seeded:
+            tail += f" {seeded}."
         return ToolResult(
-            output=f"Architecture finalized. Handoff bundle: {paths}. Next step: mha code.",
+            output=f"Architecture finalized. Handoff bundle: {paths}.{tail} Next step: mha code.",
             details={"done": True, "artifacts": [str(p) for p in written]},
         )
+
+
+class ImportStateTool(Tool):
+    name = "import_state"
+    description = (
+        "Read the existing code knowledge graph and populate the design with the "
+        "as-is architecture (components, connections, facets) for a feature or "
+        "subsystem, so the render layer can display it and you can propose "
+        "modifications against the loaded state. One-shot at session start: it "
+        "refuses if the design already has components. Returns a transparency "
+        "report of what was inferred and what is uncertain — review the low-"
+        "confidence inferences and correct them with `component`/`connect`."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "scope": {
+                "type": "string",
+                "description": "A feature name, file path, or symbol to scope the "
+                               "import to (not always the whole codebase).",
+            },
+            "max_nodes": {
+                "type": "integer",
+                "description": f"Cap on subgraph size (default {DEFAULT_MAX_NODES}). "
+                               "A truncation is reported, not an error.",
+            },
+            "max_depth": {
+                "type": "integer",
+                "description": f"BFS depth cap (default {DEFAULT_MAX_DEPTH}).",
+            },
+        },
+        "required": ["scope"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_not_finalized(session)
+        state = session.state
+        scope = (args.get("scope") or "").strip()
+        if not scope:
+            raise ToolError("scope is required — a feature name, file path, or symbol.")
+
+        # one-shot: refuse to clobber a design the model already started
+        if state.components:
+            raise ToolError(
+                f"state already has {len(state.components)} component(s); import_state "
+                "is a one-shot at session start. Start a new session to re-scope."
+            )
+
+        kg = ctx.kg
+        if kg is None or not kg.is_ready():
+            raise ToolError(
+                "the knowledge graph is not ready; run `mha kg build` first, or "
+                "describe the architecture from scratch."
+            )
+
+        max_nodes = int(args.get("max_nodes", DEFAULT_MAX_NODES))
+        max_depth = int(args.get("max_depth", DEFAULT_MAX_DEPTH))
+        subgraph = scope_subgraph(kg, scope, max_nodes=max_nodes, max_depth=max_depth)
+        if not subgraph.nodes:
+            raise ToolError(
+                "scope query matched no KG nodes; try a file path, symbol name, "
+                "or broader term."
+            )
+
+        result = reverse_seed(subgraph, scope)
+        if not result.components:
+            raise ToolError(
+                "scope query matched no KG nodes; try a file path, symbol name, "
+                "or broader term."
+            )
+
+        # import_state is the sole writer to arch-state for this step (the
+        # reverse-seed→arch-state connection was collapsed: reverse_seed is pure).
+        for comp in result.components:
+            _check(state.validate_component, comp, False)
+            state.components[comp.id] = comp
+        for conn in result.connections:
+            _check(state.validate_connection, conn)
+            state.connections.append(conn)
+        # a loaded design is no longer a blank sketch — move to propose so the
+        # model can refine and the user can approve the top level.
+        if state.phase == "brainstorm":
+            state.phase = "propose"
+        session.touched("import_state", scope)
+
+        return _import_report(session, result, scope)
+
+
+def _import_report(session: ArchSession, result: SeedResult, scope: str) -> ToolResult:
+    """The transparency report: what loaded, what was inferred, what's thin."""
+    state = session.state
+    inferences = [
+        {
+            "component_id": i.component_id,
+            "field": i.field,
+            "value": i.value,
+            "confidence": i.confidence,
+            "evidence": i.evidence,
+        }
+        for i in result.inference_log
+    ]
+    gaps = state.gaps()
+    low = [i for i in result.inference_log if i.confidence == "low"]
+    parts = [
+        f"Imported {len(result.components)} component(s) and {len(result.connections)} "
+        f"connection(s) from the knowledge graph (scope: {scope!r}).",
+        f"components: {', '.join(c.id for c in result.components)}",
+    ]
+    if low:
+        parts.append(
+            f"{len(low)} low-confidence inference(s) — review and correct with "
+            "`component`/`connect`:"
+        )
+        for i in low[:12]:
+            parts.append(f"  - {i.component_id}.{i.field} = {i.value} ({i.evidence})")
+        if len(low) > 12:
+            parts.append(f"  ... and {len(low) - 12} more (see details).")
+    if gaps:
+        parts.append(
+            "thin: " + "; ".join(gaps[:12])
+            + (f" ... and {len(gaps) - 12} more" if len(gaps) > 12 else "")
+        )
+    parts.append(
+        "The loaded state is editable: set responsibilities, fix kinds, tighten "
+        "connections, then `done` for top-level approval."
+    )
+    parts.append(f"next: {render._next_hint(state)}")
+    return ToolResult(
+        output="\n".join(parts),
+        details={
+            "loaded": len(result.components),
+            "components": [c.id for c in result.components],
+            "connections": len(result.connections),
+            "inferences": inferences,
+            "gaps": gaps,
+            "concerns": [],
+        },
+    )
 
 
 def arch_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool]:
@@ -1342,9 +1623,10 @@ def arch_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool
     if with_web:
         tools.extend([WebSearchTool(), WebFetchTool()])
     tools.extend([
+        ImportStateTool(),
         VariantTool(), NodeTool(), LinkTool(), SpliceTool(), DepthTool(), PromoteTool(),
         BriefTool(), ComponentTool(), ConnectTool(), FlowTool(), ExpandTool(),
-        DecideTool(), AskTool(), AnswerTool(), AmendTool(), SkillTool(),
+        DecideTool(), ConcernTool(), AskTool(), AnswerTool(), AmendTool(), SkillTool(),
         ArchDoneTool(),
     ])
     return tools

@@ -19,18 +19,24 @@ STATIC_DIR = Path(__file__).with_name("static")
 MUTATING_TOOLS = frozenset({
     "variant", "node", "link", "splice", "depth", "promote",
     "brief", "component", "connect", "flow", "expand", "decide",
-    "ask", "answer", "amend_toplevel",
+    "concern", "ask", "answer", "amend_toplevel",
 })
 
 EXPLORE_NUDGE = (
-    "[system notice] {n} turns without recording anything. Sketch or record structure "
-    "NOW (variant / node / link while brainstorming; brief / component / flow / decide "
-    "once promoted), or give the user your question as a reply."
+    "[system notice] {n} turns without recording anything. If you have a shape in mind, "
+    "put it on the canvas (variant / node / link, or component / flow / decide); if you "
+    "have an objection, record it with `concern`; if you need the user, reply and ask. "
+    "Thinking that never lands anywhere doesn't survive the session."
 )
 
 
 def arch_tracker(ctx: ToolContext) -> str | None:
-    """The engine's tracker provider: pin the arch tracker every turn."""
+    """The engine's tracker provider: pin the arch tracker every turn.
+
+    Also where the critic is kicked — this runs once per turn, and
+    `start_critic` returns immediately (the review happens on its own thread),
+    so the turn is never delayed by it."""
     if ctx.arch is None:
         return None
+    ctx.arch.start_critic()
     return render.tracker(ctx.arch.state)

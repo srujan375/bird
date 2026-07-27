@@ -71,25 +71,40 @@ def test_component_id_must_be_kebab():
         st.validate_component(comp("Worker_Pool"), updating=False)
 
 
-def test_component_requires_trace():
+def test_thin_component_is_accepted_and_reported_as_a_gap():
+    """The inversion: a component with no trace is recorded, not refused."""
     st = small_state()
-    with pytest.raises(ValueError, match="YAGNI"):
-        st.validate_component(comp("api", trace=[]), updating=False)
+    c = comp("api", trace=[])
+    st.validate_component(c, updating=False)  # does not raise
+    assert any("YAGNI" in g for g in st.component_gaps(c))
 
 
-def test_store_requires_data_owned():
+def test_store_without_data_owned_is_a_gap_not_an_error():
     st = small_state()
     c = comp("db", kind="store")
     c.data_owned = None
-    with pytest.raises(ValueError, match="data_owned"):
-        st.validate_component(c, updating=False)
+    st.validate_component(c, updating=False)
+    assert any("data_owned" in g for g in st.component_gaps(c))
+    c.data_owned = "orders"
+    assert not any("data_owned" in g for g in st.component_gaps(c))
 
 
-def test_production_requires_failure_notes():
+def test_failure_notes_gap_only_at_production_scope():
+    assert not small_state().component_gaps(comp("svc"))
     st = small_state("production")
-    with pytest.raises(ValueError, match="failure_notes"):
-        st.validate_component(comp("svc"), updating=False)
-    st.validate_component(comp("svc", failure_notes="retries, then 503"), updating=False)
+    assert any("failure_notes" in g for g in st.component_gaps(comp("svc")))
+    assert not st.component_gaps(comp("svc", failure_notes="retries, then 503"))
+
+
+def test_malformed_id_and_unknown_kind_still_raise():
+    """Structural breakage stays a hard error — it would corrupt the graph."""
+    st = small_state()
+    with pytest.raises(ValueError, match="kebab-case"):
+        st.validate_component(comp("Not An Id"), updating=False)
+    bad = comp("svc")
+    bad.kind = "wormhole"
+    with pytest.raises(ValueError, match="unknown kind"):
+        st.validate_component(bad, updating=False)
 
 
 # ---------- connection / flow / decision validation ----------
@@ -102,23 +117,24 @@ def test_connection_refs_must_exist():
         st.validate_connection(Connection(src="a", dst="b", label="x", kind="sync"))
 
 
-def test_async_connection_requires_mechanism():
+def test_async_without_mechanism_is_a_gap():
     st = small_state()
     st.components["a"] = comp("a")
     st.components["b"] = comp("b")
-    with pytest.raises(ValueError, match="mechanism"):
-        st.validate_connection(Connection(src="a", dst="b", label="x", kind="async"))
-    st.validate_connection(
-        Connection(src="a", dst="b", label="x", kind="async", mechanism="rabbitmq")
-    )
+    loose = Connection(src="a", dst="b", label="x", kind="async")
+    st.validate_connection(loose)  # does not raise
+    assert any("mechanism" in g for g in st.connection_gaps(loose))
+    named = Connection(src="a", dst="b", label="x", kind="async", mechanism="rabbitmq")
+    assert not st.connection_gaps(named)
 
 
-def test_production_connection_requires_failure_mode():
+def test_connection_failure_mode_gap_at_production_scope():
     st = small_state("production")
     st.components["a"] = comp("a")
     st.components["b"] = comp("b")
-    with pytest.raises(ValueError, match="failure_mode"):
-        st.validate_connection(Connection(src="a", dst="b", label="x", kind="sync"))
+    conn = Connection(src="a", dst="b", label="x", kind="sync")
+    st.validate_connection(conn)
+    assert any("failure_mode" in g for g in st.connection_gaps(conn))
 
 
 def test_flow_steps_must_reference_components():
@@ -129,11 +145,12 @@ def test_flow_steps_must_reference_components():
                               steps=[FlowStep(src="a", dst="ghost", action="GET /x")]))
 
 
-def test_decision_needs_two_options_and_valid_choice():
+def test_single_option_decision_is_a_gap_but_bad_choice_still_raises():
     st = small_state()
-    with pytest.raises(ValueError, match="2 options"):
-        st.validate_decision(Decision(id="d", topic="t", category="storage",
-                                      options=[Option(name="pg")], choice="pg", rationale="r"))
+    lonely = Decision(id="d", topic="t", category="storage",
+                      options=[Option(name="pg")], choice="pg", rationale="r")
+    st.validate_decision(lonely)  # recorded — you can decide without a bake-off
+    assert any("without alternatives" in g for g in st.decision_gaps(lonely))
     with pytest.raises(ValueError, match="must match"):
         st.validate_decision(Decision(id="d", topic="t", category="storage",
                                       options=[Option(name="pg"), Option(name="mysql")],
@@ -277,3 +294,44 @@ def test_json_round_trip_with_facets():
     assert back.amendments[0].description == "renamed"
     # round-trip is loss-free
     assert back.to_dict() == st.to_dict()
+
+
+def test_a_pre_overhaul_state_file_still_loads():
+    """`intake` and `challenge` were removed once nothing advanced into them.
+    A session saved before that must still open — mapped to where it would be
+    now, not left holding a phase no code understands."""
+    old = {
+        "mode": "system",
+        "phase": "intake",
+        "brief": {"goal": "ship it", "actors": ["user"], "scope": "internal"},
+        "components": {},
+        "connections": [], "flows": [], "decisions": [],
+        "questions": [], "concerns": [], "obligations": [], "amendments": [],
+    }
+    assert ArchState.from_dict(old).phase == "brainstorm"
+
+    old["phase"] = "challenge"
+    old["components"] = {"db": {"id": "db", "name": "db", "kind": "store",
+                                "responsibility": "rows"}}
+    migrated = ArchState.from_dict(old)
+    assert migrated.phase == "expand"
+    assert migrated.components["db"].kind == "store"
+    # and the migrated value is what gets written back — the old name is gone
+    assert migrated.to_dict()["phase"] == "expand"
+
+
+def test_gaps_by_subject_groups_thinness_for_the_page():
+    """The page marks the thin node itself, so the rules stay server-side."""
+    st = small_state("production")
+    st.components["api"] = comp("api", trace=[])
+    st.components["db"] = comp("db", kind="store")
+    st.components["db"].data_owned = None
+    st.connections.append(Connection(src="api", dst="db", label="w", kind="async"))
+    by = st.gaps_by_subject()
+    assert any("trace" in g for g in by["api"])
+    assert any("data_owned" in g for g in by["db"])
+    assert any("mechanism" in g for g in by["api->db"])
+    # the flat form the tracker and bundle use is derived from the same source
+    assert sorted(st.gaps()) == sorted(
+        f"{subj}: {g}" for subj, gaps in by.items() for g in gaps
+    )

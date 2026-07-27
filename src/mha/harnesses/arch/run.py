@@ -65,11 +65,13 @@ def run_arch_interactive(
         transport = HttpTransport(
             static_dir=arch_def.STATIC_DIR,
             stop_when=lambda e: e.get("type") == "arch_state" and e.get("phase") == "finalized",
+            # no linger here, unlike `mha arch`: the lead is blocked on this
+            # call and has a build to start. The page keeps its finalized
+            # read-only view (finalized takes precedence over disconnected).
         )
         server = Server(repl, transport=transport)  # wires ctx.record -> transport + gates
 
-        arch = ArchSession(run_dir=run_dir)
-        arch.state.phase = "brainstorm"  # fresh sessions open on the loose sketch layer
+        arch = ArchSession(run_dir=run_dir)  # opens on the sketch layer
         arch.broker = server.broker
         arch.judge = make_judge(registry, client)
 

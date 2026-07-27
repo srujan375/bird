@@ -1,4 +1,4 @@
-"""Tests for the arch toolset — gates, upserts, done-as-universal-gate."""
+"""Tests for the arch toolset — advisory gaps, upserts, the two human gates."""
 
 import pytest
 
@@ -72,39 +72,66 @@ def add_component(ctx, cid, kind="service", **kw):
 # ---------- gates ----------
 
 
-def test_component_locked_until_brief(tmp_path):
-    ctx, _, _ = make_ctx(tmp_path)
-    out = err(ComponentTool(), ctx, id="api", kind="api", responsibility="r", trace=["g"])
-    assert "locked until the brief" in out and "goal" in out
+def test_component_works_before_the_brief_is_complete(tmp_path):
+    """The brief is load-bearing, not a turnstile — record structure whenever
+    the conversation produces it."""
+    ctx, session, _ = make_ctx(tmp_path)
+    ok(ComponentTool(), ctx, id="api", kind="api", responsibility="r", trace=["g"])
+    assert "api" in session.state.components
 
 
-def test_brief_unlocks_and_flips_phase(tmp_path):
+def test_brief_reports_what_is_still_unknown(tmp_path):
     ctx, session, events = make_ctx(tmp_path)
-    res = fill_brief(ctx)
+    res = ok(BriefTool(), ctx, goal="ship it")
+    assert "actors" in res.output and "scope" in res.output
+    assert "assuming" in res.output          # ask, don't invent
+    fill_brief(ctx)
+    # a complete brief no longer moves the session anywhere: it gates nothing,
+    # it accretes. The phase follows the *design*, not the paperwork.
+    assert session.state.phase == "brainstorm"
+    assert events and events[-1]["phase"] == "brainstorm"
+
+
+def test_the_first_component_leaves_the_sketch_layer(tmp_path):
+    """Whichever way a component arrives — promoted or hand-written — the
+    session stops being 'brainstorm' once the design layer holds something."""
+    ctx, session, _ = make_ctx(tmp_path)
+    assert session.state.phase == "brainstorm"
+    add_component(ctx, "api")
     assert session.state.phase == "propose"
-    assert "components unlocked" in res.output.lower()
-    assert events and events[-1]["phase"] == "propose"
+    # and it never yanks a later phase backwards
+    session.state.phase = "expand"
+    add_component(ctx, "db", kind="store")
+    assert session.state.phase == "expand"
 
 
-def test_expand_locked_until_approval(tmp_path):
-    ctx, _, _ = make_ctx(tmp_path)
+def test_expand_works_before_approval(tmp_path):
+    ctx, session, _ = make_ctx(tmp_path)
     fill_brief(ctx)
     add_component(ctx, "db", kind="store")
-    out = err(ExpandTool(), ctx, component_id="db", entities=[{"name": "x", "keys": "id"}])
-    assert "locked until the top level is approved" in out
+    ok(ExpandTool(), ctx, component_id="db", entities=[{"name": "x", "keys": "id"}])
+    assert session.state.components["db"].facet.facet_kind == "store"
 
 
-def test_done_in_intake_lists_missing(tmp_path):
+def test_done_with_an_empty_design_does_not_error(tmp_path):
     ctx, _, _ = make_ctx(tmp_path)
-    out = err(ArchDoneTool(), ctx, summary="s")
-    assert "goal" in out and "actors" in out
+    res = ok(ArchDoneTool(), ctx, summary="s")
+    assert "nothing to approve" in res.output.lower()
 
 
-def test_done_in_propose_requires_toplevel(tmp_path):
-    ctx, _, _ = make_ctx(tmp_path)
+def test_done_takes_a_thin_design_to_the_user_anyway(tmp_path):
+    """The old gate refused until the top level was complete. Now it goes to the
+    user with the thinness attached and they rule on it."""
+    broker = FakeBroker([(True, "")])
+    ctx, session, _ = make_ctx(tmp_path, broker=broker)
     fill_brief(ctx)
-    out = err(ArchDoneTool(), ctx, summary="s")
-    assert "happy flow" in out and "decision" in out
+    add_component(ctx, "api", kind="api")
+    ok(ArchDoneTool(), ctx, summary="early but worth a look")
+    assert session.state.phase == "expand"
+    payload = broker.requests[0]
+    assert payload["kind"] == "toplevel_approval"
+    assert any("happy flow" in t for t in payload["thin"])
+    assert any("decision" in t for t in payload["thin"])
 
 
 # ---------- upsert / remove ----------
@@ -142,13 +169,14 @@ def test_connect_upsert_by_label(tmp_path):
     assert "multiple connections" in out
 
 
-def test_async_requires_mechanism(tmp_path):
-    ctx, _, _ = make_ctx(tmp_path)
+def test_async_without_mechanism_is_recorded_with_advice(tmp_path):
+    ctx, session, _ = make_ctx(tmp_path)
     fill_brief(ctx)
     add_component(ctx, "a")
     add_component(ctx, "b")
-    out = err(ConnectTool(), ctx, src="a", dst="b", label="events", kind="async")
-    assert "mechanism" in out
+    res = ok(ConnectTool(), ctx, src="a", dst="b", label="events", kind="async")
+    assert len(session.state.connections) == 1
+    assert "thin:" in res.output and "mechanism" in res.output
 
 
 # ---------- the full session walk ----------
@@ -182,13 +210,14 @@ def test_full_session_to_finalize(tmp_path):
     res = ok(ArchDoneTool(), ctx, summary="top level ready")
     assert session.state.phase == "expand"
     assert broker.requests[0]["kind"] == "toplevel_approval"
-    # risk order: store before api
-    assert 'expand("db")' in res.output
+    # risk order is a suggestion: store before api
+    assert "db" in res.output
 
-    out = err(ExpandTool(), ctx, component_id="gw",
-              endpoints=[{"route": "/in", "method": "POST", "request": "{}",
-                          "response": "{}", "auth": "hmac"}])
-    assert "risk order" in out and "'db'" in out
+    # expanding out of order is allowed, and says which one mattered more
+    res = ok(ExpandTool(), ctx, component_id="gw",
+             endpoints=[{"route": "/in", "method": "POST", "request": "{}",
+                         "response": "{}", "auth": "hmac"}])
+    assert "db" in res.output and "riskier" in res.output
 
     ok(ExpandTool(), ctx, component_id="db",
        entities=[{"name": "events", "keys": "id", "fields": ["id", "payload"]}],
@@ -198,7 +227,7 @@ def test_full_session_to_finalize(tmp_path):
                    "response": "{}", "auth": "hmac"}])
     assert session.state.pending_obligations() == []
 
-    res = ok(ArchDoneTool(), ctx, summary="expanded")  # challenge clean -> finalize
+    res = ok(ArchDoneTool(), ctx, summary="expanded")  # straight to the finalize gate
     assert session.state.phase == "finalized"
     assert broker.requests[1]["kind"] == "finalize"
     assert broker.requests[1]["artifacts"]
@@ -246,8 +275,8 @@ def test_toplevel_rejection_returns_feedback_same_turn(tmp_path):
     broker = FakeBroker([(False, "drop the worker pool")])
     ctx, session, _ = make_ctx(tmp_path, broker=broker)
     build_toplevel(ctx, scope="internal")
-    out = err(ArchDoneTool(), ctx, summary="ready?")
-    assert "The user requested changes" in out and "drop the worker pool" in out
+    res = ok(ArchDoneTool(), ctx, summary="ready?")  # a refusal is the user talking, not an error
+    assert "wants changes" in res.output and "drop the worker pool" in res.output
     assert session.state.phase == "propose"  # back to editing
 
 
@@ -267,14 +296,14 @@ def test_finalize_rejection_keeps_session_alive(tmp_path):
     build_toplevel(ctx, scope="internal")
     ok(ArchDoneTool(), ctx, summary="ready")
     expand_owed(ctx)
-    out = err(ArchDoneTool(), ctx, summary="finalize?")
-    assert "add retention policy" in out
-    assert session.state.phase == "resolved"
+    res = ok(ArchDoneTool(), ctx, summary="finalize?")
+    assert "add retention policy" in res.output
+    assert session.state.phase == "expand"  # back to work on the design
 
 
-def test_challenge_findings_block_then_resolve(tmp_path):
+def test_audit_findings_reach_the_finalize_gate_without_blocking_it(tmp_path):
     """A production design with an unconnected component and no failure twin
-    gets challenge findings; resolving them lets finalize through."""
+    files concerns — and still finalizes if the user says so."""
     broker = FakeBroker([(True, ""), (True, "")])
     ctx, session, _ = make_ctx(tmp_path, broker=broker)
     fill_brief(ctx, "production")
@@ -292,77 +321,101 @@ def test_challenge_findings_block_then_resolve(tmp_path):
     ok(ExpandTool(), ctx, component_id="gw",
        endpoints=[{"route": "/x", "method": "POST", "request": "{}",
                    "response": "{}", "auth": "key"}])
-    out = err(ArchDoneTool(), ctx, summary="done?")
-    assert "challenge pass found" in out
-    assert session.state.phase == "challenge"
-    assert any(q.source == "harness_audit" for q in session.state.questions)
-    # findings are non-blocking here; done again goes to finalize
-    res = ok(ArchDoneTool(), ctx, summary="findings noted")
+    ok(ArchDoneTool(), ctx, summary="done?")
     assert session.state.phase == "finalized"
+    assert any(c.source == "harness_audit" for c in session.state.concerns)
+    claims = " ".join(c.claim for c in session.state.concerns)
+    assert "orphan" in claims and "failure twin" in claims
+    # they travelled to the user with the finalize request
+    assert broker.requests[-1]["kind"] == "finalize"
+    assert broker.requests[-1]["concerns"]
 
 
-def test_judge_findings_appended_and_failure_tolerated(tmp_path):
+def test_critic_files_concerns_off_the_turn(tmp_path):
     calls = []
 
     def judge(state):
         calls.append(state.phase)
-        return ["would the queue survive a region outage?"]
+        return [{"severity": "blocker", "target": "db",
+                 "claim": "would the queue survive a region outage?",
+                 "alternative": "replicate the queue"}]
 
-    ctx, session, _ = make_ctx(tmp_path, broker=FakeBroker([(True, "")]))
+    ctx, session, _ = make_ctx(tmp_path)
     session.judge = judge
     build_toplevel(ctx, scope="internal")
-    ok(ArchDoneTool(), ctx, summary="ready")
-    expand_owed(ctx)
-    out = err(ArchDoneTool(), ctx, summary="expanded")
-    assert "region outage" in out
-    assert any(q.source == "judge" for q in session.state.questions)
-    assert calls == ["expand"]
 
-    # a judge that blows up degrades to the audit alone
-    session2 = ArchSession(state=ArchState(), judge=lambda s: 1 / 0)
-    assert session2.run_challenge() == []
+    session.start_critic()
+    session._critic_thread.join(timeout=5)
+    assert [c.claim for c in session.state.concerns] == ["would the queue survive a region outage?"]
+    assert session.state.open_blockers()
+    assert calls == ["propose"]
+
+    # an unchanged design is not reviewed twice
+    session.start_critic()
+    if session._critic_thread is not None:
+        session._critic_thread.join(timeout=5)
+    assert len(calls) == 1
+    assert len(session.state.concerns) == 1
+
+    # the design moves on -> reviewed again, but the same finding isn't duplicated
+    add_component(ctx, "extra")
+    session.start_critic()
+    session._critic_thread.join(timeout=5)
+    assert len(calls) == 2 and len(session.state.concerns) == 1
 
 
-def test_blocking_question_gates_finalize(tmp_path):
-    broker = FakeBroker([(True, "")])
+def test_critic_failure_is_silent(tmp_path):
+    """An offline or broken judge must never surface as a session failure."""
+    session = ArchSession(state=ArchState(), judge=lambda s: 1 / 0)
+    session.state.components["x"] = session.state.components.get("x") or _stub_component()
+    session.start_critic()
+    session._critic_thread.join(timeout=5)
+    assert session.state.concerns == []
+
+
+def _stub_component():
+    from mha.harnesses.arch.state import Component
+    return Component(id="x", name="x", kind="service", responsibility="r")
+
+
+def test_unanswered_question_travels_to_both_gates(tmp_path):
+    """An open question is information for the user's ruling, not a turnstile."""
+    broker = FakeBroker([(True, ""), (True, "")])
     ctx, session, _ = make_ctx(tmp_path, broker=broker)
     build_toplevel(ctx, scope="internal")
-    ok(ArchDoneTool(), ctx, summary="ready")          # top level approved (no blocking qs yet)
+    ok(AskTool(), ctx, question="which region?", blocking=True)
+
+    ok(ArchDoneTool(), ctx, summary="ready")
+    assert session.state.phase == "expand"
+    assert broker.requests[0]["questions"] == ["which region?"]
+
     expand_owed(ctx)
-    ok(AskTool(), ctx, question="which region?", blocking=True)   # surfaces during expand
-    out = err(ArchDoneTool(), ctx, summary="finalize?")
-    assert "blocking questions unresolved" in out and "which region?" in out
+    ok(ArchDoneTool(), ctx, summary="finalize?")
+    assert broker.requests[-1]["questions"] == ["which region?"]
+    assert session.state.phase == "finalized"
+
+
+def test_answering_a_question_closes_it(tmp_path):
+    ctx, session, _ = make_ctx(tmp_path)
+    fill_brief(ctx)
+    ok(AskTool(), ctx, question="which region?", blocking=True)
+    assert session.state.blocking_questions()
     ok(AnswerTool(), ctx, id="q1", answer="us-east-1")
     assert session.state.blocking_questions() == []
 
 
-def test_blocking_question_gates_toplevel_approval(tmp_path):
-    # Approval must not be requested while a blocking question is open.
+def test_post_approval_edits_record_amendments_instead_of_being_refused(tmp_path):
     broker = FakeBroker([(True, "")])
     ctx, session, _ = make_ctx(tmp_path, broker=broker)
     build_toplevel(ctx, scope="internal")
-    ok(AskTool(), ctx, question="which region?", blocking=True)
-    out = err(ArchDoneTool(), ctx, summary="ready")
-    assert "blocking question" in out and "which region?" in out
-    assert session.state.phase == "propose"           # gate did not advance
-    assert broker.requests == []                        # approval was never requested
-    ok(AnswerTool(), ctx, id="q1", answer="us-east-1")
-    ok(ArchDoneTool(), ctx, summary="ready")            # now it proceeds to approval
-    assert session.state.phase == "expand"
-    assert broker.requests and broker.requests[0]["kind"] == "toplevel_approval"
-
-
-def test_amend_toplevel_gates_and_structural_flag(tmp_path):
-    broker = FakeBroker([(True, "")])
-    ctx, session, _ = make_ctx(tmp_path, broker=broker)
-    build_toplevel(ctx, scope="internal")
-    out = err(AmendTool(), ctx, description="x",
-              component={"id": "cache", "kind": "cache", "responsibility": "r", "trace": ["g"]})
-    assert "not approved yet" in out
     ok(ArchDoneTool(), ctx, summary="ready")
-    # post-approval: component tool locked, amend works
-    out = err(ComponentTool(), ctx, id="cache", kind="cache", responsibility="r", trace=["g"])
-    assert "amend_toplevel" in out
+
+    # the plain component tool still works after approval — and leaves a trail
+    res = ok(ComponentTool(), ctx, id="cache", kind="cache", responsibility="r", trace=["g"])
+    assert "structural amendment" in res.output
+    assert session.state.amendments[-1].structural is True
+    ok(ComponentTool(), ctx, id="cache", remove=True)
+
     res = ok(AmendTool(), ctx, description="add cache for hot reads",
              component={"id": "cache", "kind": "cache", "responsibility": "r", "trace": ["g"]})
     assert "structural" in res.output
@@ -387,9 +440,10 @@ def test_persistence_and_resume(tmp_path):
 def test_toolset_composition(tmp_path):
     names = [t.name for t in arch_harness_tools()]
     assert names == ["read", "kg_query", "WebSearch", "WebFetch",
+                     "import_state",
                      "variant", "node", "link", "splice", "depth", "promote",
                      "brief", "component", "connect", "flow", "expand", "decide",
-                     "ask", "answer", "amend_toplevel", "skill", "done"]
+                     "concern", "ask", "answer", "amend_toplevel", "skill", "done"]
     for absent in ("edit", "write", "bash", "plan"):
         assert absent not in names
     names = [t.name for t in arch_harness_tools(with_kg=False, with_web=False)]

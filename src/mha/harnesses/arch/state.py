@@ -1,9 +1,18 @@
 """ArchState — the single source of truth for an architecture session.
 
-Tools mutate it, the UI renders it, phase gates read it, and the handoff
-bundle is serialized from it at finalize. Implements docs/arch-state-schema.md
-exactly; do not diverge. Validation raises ValueError with instructive text —
-the tool layer converts those to ToolErrors verbatim.
+Tools mutate it, the UI renders it, the two human gates read it, and the
+handoff bundle is serialized from it at finalize.
+
+Two kinds of check live here, and the difference is the whole posture of the
+harness:
+
+- `validate_*` raises ValueError for things that are *broken* — a malformed id,
+  an edge to a component that does not exist. The tool layer turns those into
+  ToolErrors verbatim, because accepting them would corrupt the graph.
+- `*_gaps` returns advice for things that are merely *thin* — no trace, a store
+  that never says what it owns, an async edge with no named mechanism. These
+  never refuse a tool call. They surface in the tracker, on the page and in the
+  bundle, so the design can be argued about instead of form-filled.
 """
 
 from __future__ import annotations
@@ -16,13 +25,19 @@ from .sketch import Sketchbook
 
 Mode = Literal["system", "feature"]
 Phase = Literal[
-    "brainstorm",
-    "intake", "propose", "toplevel_review", "expand", "challenge", "resolved", "finalized"
+    "brainstorm", "propose", "toplevel_review", "expand", "resolved", "finalized"
 ]
 PHASES: tuple[str, ...] = (
-    "brainstorm",
-    "intake", "propose", "toplevel_review", "expand", "challenge", "resolved", "finalized"
+    "brainstorm", "propose", "toplevel_review", "expand", "resolved", "finalized"
 )
+
+# Phases the overhaul retired, and where a state file written before it lands.
+# `intake` gated components behind a complete brief; the brief now accretes
+# through the whole session, so a session that never got past it had nothing
+# promoted — that is brainstorm. `challenge` was a one-shot critique pass
+# between expand and resolved; the critic runs continuously now, so a session
+# sitting in it was mid-design — that is expand.
+RETIRED_PHASES: dict[str, str] = {"intake": "brainstorm", "challenge": "expand"}
 
 KINDS: tuple[str, ...] = (
     "service", "api", "gateway", "store", "queue", "cache",
@@ -35,6 +50,9 @@ DECISION_CATEGORIES: tuple[str, ...] = (
     "storage", "communication", "consistency", "deployment", "integration", "llm", "other"
 )
 QUESTION_SOURCES: tuple[str, ...] = ("model", "harness_audit", "judge", "user")
+CONCERN_SEVERITIES: tuple[str, ...] = ("blocker", "risk", "smell")
+CONCERN_SOURCES: tuple[str, ...] = ("model", "judge", "harness_audit")
+CONCERN_STATUSES: tuple[str, ...] = ("open", "accepted", "overruled", "withdrawn")
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 
@@ -116,6 +134,7 @@ class Component:
     data_owned: str | None = None
     failure_notes: str | None = None
     facet: Any | None = None  # one of the *Facet classes; None = black box
+    origin: str = ""  # "sketch:<variant_id>" when seeded by promote; "" = hand-written
 
 
 @dataclass
@@ -297,6 +316,32 @@ class OpenQuestion:
 
 
 @dataclass
+class Concern:
+    """A recorded objection — the harness's memory of disagreement.
+
+    An OpenQuestion says "I need to know something". A Concern says "I think
+    this is wrong, here is what breaks, here is the cheaper option". It can
+    target the design, a decision, or the user's own instruction, and the agent
+    can raise one against its own earlier proposal.
+
+    Overruled concerns are *kept*, with the reason: "we knew, we chose anyway,
+    here's why" is the most valuable thing the code harness can inherit.
+    """
+    id: str
+    severity: str          # blocker | risk | smell
+    target: str            # component/decision id, "brief", "user", or free text
+    claim: str             # what breaks, concretely
+    alternative: str = ""  # the cheaper or safer option, when there is one
+    status: str = "open"   # open | accepted | overruled | withdrawn
+    resolution: str = ""   # why it was accepted / overruled
+    source: str = "model"  # model | judge | harness_audit
+
+    @property
+    def open(self) -> bool:
+        return self.status == "open"
+
+
+@dataclass
 class Obligation:
     component_id: str
     facet: str
@@ -317,7 +362,7 @@ class Amendment:
 @dataclass
 class ArchState:
     mode: str = "system"
-    phase: str = "intake"
+    phase: str = "brainstorm"  # a session opens on the loose sketch layer
     brief: Brief = field(default_factory=Brief)
     sketchbook: Sketchbook = field(default_factory=Sketchbook)
     components: dict[str, Component] = field(default_factory=dict)
@@ -325,6 +370,7 @@ class ArchState:
     flows: list[Flow] = field(default_factory=list)
     decisions: list[Decision] = field(default_factory=list)
     questions: list[OpenQuestion] = field(default_factory=list)
+    concerns: list[Concern] = field(default_factory=list)
     obligations: list[Obligation] = field(default_factory=list)
     amendments: list[Amendment] = field(default_factory=list)
 
@@ -336,6 +382,14 @@ class ArchState:
     def blocking_questions(self) -> list[OpenQuestion]:
         return [q for q in self.questions if q.blocking and q.open]
 
+    def open_concerns(self) -> list[Concern]:
+        return [c for c in self.concerns if c.open]
+
+    def open_blockers(self) -> list[Concern]:
+        """Surfaced at the finalize gate so the user overrules deliberately —
+        they never stop the session from continuing."""
+        return [c for c in self.concerns if c.open and c.severity == "blocker"]
+
     def pending_obligations(self) -> list[Obligation]:
         return [o for o in self.obligations if o.status == "pending"]
 
@@ -343,7 +397,9 @@ class ArchState:
         return [f for f in self.flows if f.kind == "happy"]
 
     def toplevel_missing(self) -> list[str]:
-        """What the propose phase still owes before toplevel_review."""
+        """What a top level would normally have before the user approves it.
+        Advisory since the overhaul: reported to the model and shown at the
+        approval gate so the user can judge, never used to refuse `done`."""
         missing = []
         if not self.components:
             missing.append("at least one component")
@@ -361,7 +417,10 @@ class ArchState:
             missing.append("trace + responsibility for: " + ", ".join(untightened))
         return missing
 
-    # ---- validation (ValueError text goes to the model verbatim) ----
+    # ---- validation: only what is BROKEN (ValueError text reaches the model) ----
+    #
+    # The bar is "would accepting this corrupt the graph or the render?", not
+    # "is this design finished?". Thinness is advice — see the *_gaps methods.
 
     def validate_component(self, comp: Component, updating: bool) -> None:
         if not _ID_RE.match(comp.id):
@@ -371,20 +430,6 @@ class ArchState:
             )
         if comp.kind not in KINDS:
             raise ValueError(f"unknown kind {comp.kind!r}; one of: {', '.join(KINDS)}.")
-        if not comp.responsibility.strip():
-            raise ValueError("responsibility is required: one sentence on what this component does.")
-        if not comp.trace:
-            raise ValueError(
-                "trace is required: which brief goals/constraints does this component "
-                "serve? A component that serves none is YAGNI — drop it or justify it."
-            )
-        if comp.kind == "store" and not (comp.data_owned or "").strip():
-            raise ValueError("a store must declare data_owned: what data does it own?")
-        if self.scope_is_production() and not (comp.failure_notes or "").strip():
-            raise ValueError(
-                f"scope is {self.brief.scope}: failure_notes is required — what happens "
-                "when this component fails, and how is that contained?"
-            )
 
     def validate_connection(self, conn: Connection) -> None:
         for ref in (conn.src, conn.dst):
@@ -395,16 +440,6 @@ class ArchState:
                 )
         if conn.kind not in CONNECTION_KINDS:
             raise ValueError(f"connection kind must be one of {', '.join(CONNECTION_KINDS)}.")
-        if conn.kind == "async" and not (conn.mechanism or "").strip():
-            raise ValueError(
-                "an async connection must name its mechanism: which queue/bus/stream "
-                "carries it?"
-            )
-        if self.scope_is_production() and not (conn.failure_mode or "").strip():
-            raise ValueError(
-                f"scope is {self.brief.scope}: failure_mode is required — what does "
-                f"{conn.src} do when {conn.dst} is down?"
-            )
 
     def validate_flow(self, flow: Flow) -> None:
         if flow.kind not in FLOW_KINDS:
@@ -422,14 +457,63 @@ class ArchState:
     def validate_decision(self, dec: Decision) -> None:
         if dec.category not in DECISION_CATEGORIES:
             raise ValueError(f"decision category must be one of {', '.join(DECISION_CATEGORIES)}.")
-        if len(dec.options) < 2:
-            raise ValueError(
-                "a decision needs at least 2 options — a choice without alternatives "
-                "is not a decision."
-            )
         names = [o.name for o in dec.options]
-        if dec.choice not in names:
+        if names and dec.choice not in names:
             raise ValueError(f"choice {dec.choice!r} must match one option name: {names}.")
+
+    # ---- gaps: what is THIN (advice; never refuses a tool call) ----
+
+    def component_gaps(self, comp: Component) -> list[str]:
+        gaps = []
+        if not comp.responsibility.strip():
+            gaps.append("no responsibility — one sentence on what it does")
+        if not comp.trace and not comp.existing:
+            gaps.append("no trace — which brief goal does it serve? (a component that serves none is YAGNI)")
+        if comp.kind == "store" and not (comp.data_owned or "").strip():
+            gaps.append("store with no data_owned — what data does it own?")
+        if self.scope_is_production() and not (comp.failure_notes or "").strip():
+            gaps.append(f"no failure_notes at {self.brief.scope} scope — what happens when it fails?")
+        return gaps
+
+    def connection_gaps(self, conn: Connection) -> list[str]:
+        gaps = []
+        if conn.kind == "async" and not (conn.mechanism or "").strip():
+            gaps.append("async with no mechanism — which queue/bus/stream carries it?")
+        if self.scope_is_production() and not (conn.failure_mode or "").strip():
+            gaps.append(f"no failure_mode at {self.brief.scope} scope — what does {conn.src} do when {conn.dst} is down?")
+        return gaps
+
+    @staticmethod
+    def decision_gaps(dec: Decision) -> list[str]:
+        if len(dec.options) < 2:
+            return ["only one option — a choice without alternatives isn't a decision"]
+        return []
+
+    def gaps_by_subject(self) -> dict[str, list[str]]:
+        """Thinness keyed by what it is about ('api', 'api->db', 'd1').
+
+        The page renders this per node, so the rules for what counts as thin
+        live here only — the UI never re-implements them."""
+        out: dict[str, list[str]] = {}
+        for comp in self.components.values():
+            if gaps := self.component_gaps(comp):
+                out[comp.id] = gaps
+        for conn in self.connections:
+            if gaps := self.connection_gaps(conn):
+                out.setdefault(f"{conn.src}->{conn.dst}", []).extend(gaps)
+        for dec in self.decisions:
+            if gaps := self.decision_gaps(dec):
+                out[dec.id] = gaps
+        return out
+
+    def gaps(self) -> list[str]:
+        """Everything thin in the design, as '<subject>: <what's missing>' lines.
+        Read by the tracker, the page and the bundle — never by a gate."""
+        return [
+            f"{subject}: {gap}"
+            for subject, gaps in self.gaps_by_subject().items()
+            for gap in gaps
+        ]
 
     def references_to(self, component_id: str) -> list[str]:
         """Human-readable list of things that would dangle if the id vanished."""
@@ -510,7 +594,8 @@ class ArchState:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArchState":
-        state = cls(mode=d.get("mode", "system"), phase=d.get("phase", "intake"))
+        phase = d.get("phase", "brainstorm")
+        state = cls(mode=d.get("mode", "system"), phase=RETIRED_PHASES.get(phase, phase))
         state.sketchbook = Sketchbook.from_dict(d.get("sketchbook"))
         b = d.get("brief", {})
         state.brief = Brief(
@@ -534,6 +619,7 @@ class ArchState:
                 tech=c.get("tech"), data_owned=c.get("data_owned"),
                 failure_notes=c.get("failure_notes"),
                 facet=facet_from_dict(c.get("facet")),
+                origin=c.get("origin", ""),
             )
         state.connections = [Connection(**c) for c in d.get("connections", [])]
         state.flows = [
@@ -553,6 +639,7 @@ class ArchState:
             for x in d.get("decisions", [])
         ]
         state.questions = [OpenQuestion(**q) for q in d.get("questions", [])]
+        state.concerns = [Concern(**c) for c in d.get("concerns", [])]
         state.obligations = [Obligation(**o) for o in d.get("obligations", [])]
         state.amendments = [Amendment(**a) for a in d.get("amendments", [])]
         return state

@@ -1,79 +1,14 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>mha arch</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1.5' y='2.5' width='6' height='4.5' rx='1' fill='none' stroke='%23222' stroke-width='1'/><rect x='8.5' y='9' width='6' height='4.5' rx='1' fill='none' stroke='%234a3fb0' stroke-width='1'/><path d='M5 7v2h6.5' stroke='%23c05a2e' fill='none' stroke-width='1'/></svg>" />
-  <link rel="stylesheet" href="style.css" />
-</head>
-<body>
-  <div class="app" id="app" data-conn="connecting" data-run="idle">
-
-    <!-- ===================== header ===================== -->
-    <header class="topbar">
-      <div class="brand" id="brand">Architecture session</div>
-      <div class="meta">
-        <span class="m-item" id="m-model">architect · —</span>
-        <span class="m-item" id="m-repo">—</span>
-        <span class="m-item faint" id="m-session">—</span>
-        <span class="ro-badge" id="ro-badge" hidden>read-only</span>
-        <span class="conn" id="conn"><i class="cdot"></i><span id="conn-label">Connecting…</span></span>
-      </div>
-    </header>
-
-    <!-- ===================== stage ===================== -->
-    <main class="stage">
-      <section class="canvas" id="canvas">
-        <div class="empty" id="empty">
-          <div class="empty-inner">
-            <div class="empty-title">No components yet</div>
-            <div class="empty-sub">The agent is laying out the architecture — nodes appear here as they're proposed.</div>
-          </div>
-        </div>
-
-        <svg id="dsvg"></svg>
-
-        <div class="canvas-tools">
-          <button class="crumb" id="crumb" hidden><span class="crumb-back">←&nbsp;system</span><span class="crumb-sep">/</span><b id="crumb-name"></b></button>
-          <span class="tools-spacer"></span>
-          <div class="zoom">
-            <button id="z-fit" title="Fit to view">Fit</button><button id="z-out" title="Zoom out">−</button><button id="z-in" title="Zoom in">+</button>
-          </div>
-        </div>
-
-        <button class="drawer-tab" id="drawer-tab">
-          <span class="tab-label" id="drawer-tab-label">Decisions</span>
-          <span class="tab-count" id="drawer-tab-count">0</span>
-          <span class="tab-flag" id="drawer-tab-flag" hidden></span>
-          <span class="tab-caret">⌄</span>
-        </button>
-
-        <div class="render-error" id="render-error" hidden>
-          <b>Diagram failed to render</b>
-          <div class="mono" id="render-error-msg"></div>
-          <span class="faint">showing the last good render</span>
-        </div>
-
-        <div class="conn-lost" id="conn-lost" hidden>
-          <div class="cl-title">Connection lost</div>
-          <div class="cl-sub">Attempting to reconnect to the session…</div>
-        </div>
-      </section>
-
-      <!-- right insights drawer -->
-      <aside class="drawer" id="drawer" aria-hidden="true"></aside>
-    </main>
-
-    <!-- ===================== bottom chat (resizable panel) ===================== -->
-    <footer class="chat" id="chat">
-      <div class="chat-resize" id="chat-resize" title="Drag to resize"><span class="grip"></span></div>
-      <div class="log" id="log"></div>
-      <div class="composer" id="composer"></div>
-    </footer>
-  </div>
-
-  <script src="diagram.js"></script>
-  <script src="app.js"></script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mha arch</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1.5' y='2.5' width='6' height='4.5' rx='1' fill='none' stroke='%23222' stroke-width='1'/><rect x='8.5' y='9' width='6' height='4.5' rx='1' fill='none' stroke='%234a3fb0' stroke-width='1'/><path d='M5 7v2h6.5' stroke='%23c05a2e' fill='none' stroke-width='1'/></svg>" />
+    <script type="module" crossorigin src="./assets/index-CIontPXt.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-Eec70Y-t.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>
