@@ -12,17 +12,17 @@ import time
 
 import pytest
 
-from mha.engine.runner import Runner
-from mha.engine.session import SessionRecorder
-from mha.harnesses.arch import harness as arch_def
-from mha.harnesses.arch.render import TRACKER_PREFIX
-from mha.harnesses.arch.session import ArchSession
-from mha.harnesses.arch.tools import arch_harness_tools
-from mha.http_transport import HttpTransport
-from mha.llm.registry import ModelSpec, ProviderConfig, Registry
-from mha.llm.types import LLMResponse, Message, ToolCall, Usage
-from mha.repl import Repl
-from mha.serve import Server
+from ox.engine.runner import Runner
+from ox.engine.session import SessionRecorder
+from ox.harnesses.arch import harness as arch_def
+from ox.harnesses.arch.render import TRACKER_PREFIX
+from ox.harnesses.arch.session import ArchSession
+from ox.harnesses.arch.tools import arch_harness_tools
+from ox.http_transport import HttpTransport
+from ox.llm.registry import ModelSpec, ProviderConfig, Registry
+from ox.llm.types import LLMResponse, Message, ToolCall, Usage
+from ox.repl import Repl
+from ox.serve import Server
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -139,10 +139,10 @@ class Page:
 
 
 def build_stack(tmp_path, script):
-    run_dir = tmp_path / ".mha" / "sessions" / "arch-t"
+    run_dir = tmp_path / ".ox" / "sessions" / "arch-t"
     recorder = SessionRecorder(run_dir)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
-    from mha.tools import ToolContext
+    from ox.tools import ToolContext
 
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event)
     runner = Runner(
@@ -175,7 +175,7 @@ def test_full_arch_session_over_http(tmp_path):
     # the static page is served
     conn = http.client.HTTPConnection(host, port, timeout=5)
     conn.request("GET", "/")
-    assert b"mha arch" in conn.getresponse().read()
+    assert b"ox arch" in conn.getresponse().read()
     conn.close()
 
     page.post("/input", {"text": "design a url shortener"})

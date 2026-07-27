@@ -19,9 +19,9 @@ from urllib.parse import quote
 import httpx
 import pytest
 
-from mha.harnesses.code import code_harness_tools
-from mha.tools import WebFetchTool, WebSearchTool
-from mha.tools.base import ToolContext, ToolError
+from ox.harnesses.code import code_harness_tools
+from ox.tools import WebFetchTool, WebSearchTool
+from ox.tools.base import ToolContext, ToolError
 
 
 # ---------- fixtures ----------
@@ -206,7 +206,7 @@ def test_webfetch_happy_path_html_to_md(ctx, repo):
     assert "[prompt: summarize this]" in r.output
     assert r.details["from_cache"] is False
     # cache file is written on first call
-    cache_file = repo / ".mha" / "cache" / "webfetch"
+    cache_file = repo / ".ox" / "cache" / "webfetch"
     assert cache_file.is_dir()
     assert any(cache_file.iterdir())
 
@@ -315,8 +315,9 @@ def test_both_tools_have_required_schema_fields():
 
 def test_schemas_under_token_budget_after_adding_web_tools():
     """Regression guard: even with the two web tools, the full toolset stays
-    under the 1450-token wire budget (mirrors test_tools.py — single source
-    of truth for the threshold)."""
+    under the wire budget (mirrors test_tools.py — single source of truth for
+    the threshold). read_image added ~130 tokens, so the budget tracks the
+    test_tools.py 1600-token guard rather than the pre-read_image 1450."""
     wire = json.dumps([t.spec().to_openai() for t in code_harness_tools(with_kg=True)])
     approx_tokens = len(wire) / 4
-    assert approx_tokens < 1450, f"schemas ≈ {approx_tokens:.0f} tokens, budget is 1450"
+    assert approx_tokens < 1600, f"schemas ≈ {approx_tokens:.0f} tokens, budget is 1600"

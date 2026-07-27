@@ -1,7 +1,7 @@
 """Tests for the arch renderers — mermaid sources + the pinned tracker."""
 
-from mha.harnesses.arch import render
-from mha.harnesses.arch.state import (
+from ox.harnesses.arch import render
+from ox.harnesses.arch.state import (
     ArchState,
     Brief,
     Component,
@@ -172,7 +172,7 @@ def test_tracker_carries_gaps_and_concerns():
 
 
 def test_sketch_layer_renders_before_anything_is_promoted():
-    from mha.harnesses.arch.sketch import SketchLink, SketchNode, Variant
+    from ox.harnesses.arch.sketch import SketchLink, SketchNode, Variant
 
     st = ArchState()
     v = Variant(id="v1", name="evented")

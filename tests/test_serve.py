@@ -1,18 +1,18 @@
-"""Tests for the JSON-lines serve bridge (mha serve)."""
+"""Tests for the JSON-lines serve bridge (ox serve)."""
 
 import json
 import queue
 import threading
 import time
 
-from mha.engine.runner import Runner
-from mha.engine.session import SessionRecorder
-from mha.llm.registry import ModelSpec, ProviderConfig, Registry
-from mha.llm.types import LLMResponse, Message, ToolCall, Usage
-from mha.repl import Repl
-from mha.serve import GatedTool, Server, _diff_lines
-from mha.harnesses.code import code_harness_tools
-from mha.tools import Tool, ToolContext, ToolResult
+from ox.engine.runner import Runner
+from ox.engine.session import SessionRecorder
+from ox.llm.registry import ModelSpec, ProviderConfig, Registry
+from ox.llm.types import LLMResponse, Message, ToolCall, Usage
+from ox.repl import Repl
+from ox.serve import GatedTool, Server, _diff_lines
+from ox.harnesses.code import code_harness_tools
+from ox.tools import Tool, ToolContext, ToolResult
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -36,7 +36,7 @@ class FakeClient:
 
 def make_repl(tmp_path, script):
     (tmp_path / "f.py").write_text("x = 1\n")
-    recorder = SessionRecorder(tmp_path / ".mha" / "sessions" / "t")
+    recorder = SessionRecorder(tmp_path / ".ox" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     runner = Runner(
@@ -222,10 +222,10 @@ def test_serve_permission_denied(monkeypatch, tmp_path):
 
 
 def test_serve_model_list(monkeypatch, tmp_path):
-    from mha.llm.discovery import DiscoveredModel
+    from ox.llm.discovery import DiscoveredModel
 
     monkeypatch.setattr(
-        "mha.serve.discover_models",
+        "ox.serve.discover_models",
         lambda registry: ([DiscoveredModel("fake:model", "configured", 32768)], ["a note"]),
     )
     feeder, out, thread = run_server(monkeypatch, tmp_path, [])
@@ -256,7 +256,7 @@ def test_serve_command(monkeypatch, tmp_path):
 def test_serve_persists_transcript_after_turn(monkeypatch, tmp_path):
     """serve must persist messages.jsonl after a turn so a /reload respawn
     can resume the conversation (it never used to)."""
-    from mha.engine.session import load_messages
+    from ox.engine.session import load_messages
 
     feeder, out, thread = run_server(
         monkeypatch, tmp_path, [Message(role="assistant", content="hello there")]
@@ -291,7 +291,7 @@ def test_serve_reload_emits_run_id(monkeypatch, tmp_path):
 
 def test_permission_response_feedback_reaches_broker(monkeypatch, tmp_path):
     """A rejection's feedback string travels wire -> broker -> request()."""
-    from mha.serve import PermissionBroker
+    from ox.serve import PermissionBroker
 
     events = []
     broker = PermissionBroker(lambda t, **d: events.append({"type": t, **d}))

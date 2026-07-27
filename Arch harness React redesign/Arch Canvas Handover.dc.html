@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet"><script src="./doc-page.js"></script><style>doc-page:not(:defined){visibility:hidden}a{color:oklch(45% 0.16 275)}a:hover{color:oklch(35% 0.16 275)}h1,h2,h3{text-wrap:balance}.kb,.cd{font-family:'IBM Plex Mono',ui-monospace,monospace}.callout{break-inside:avoid;orphans:3;widows:3}td,th{orphans:3;widows:3}</style></helmet>
+<doc-page margin="0.8in">
+  <div slot="footer" style="display:flex;align-items:baseline;gap:10px;padding-top:8px;border-top:1px solid oklch(90% 0.006 260);font:10.5px 'IBM Plex Mono',monospace;color:oklch(58% 0.015 260)">
+    <span>mha arch · component-canvas direction (3)</span>
+    <span style="flex:1"></span>
+    <span>internal handover · 2026-07-25</span>
+  </div>
+
+  <div style="font:14.5px/1.65 'IBM Plex Sans',system-ui,sans-serif;color:oklch(25% 0.015 260)">
+
+    <div style="font:600 10.5px 'IBM Plex Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:oklch(52% 0.19 275);margin-bottom:8px">Handover · direction 3</div>
+    <h1 style="font:700 30px/1.2 'IBM Plex Sans';margin:0 0 10px;color:oklch(20% 0.02 260)">Architecture harness: React infinite canvas with component-canvas dialogs</h1>
+    <p style="margin:0 0 20px;font-size:15.5px;color:oklch(42% 0.015 260)">What to build to replace <span class="cd" style="font-size:13.5px">src/mha/harnesses/arch/static/</span> (vanilla <span class="cd" style="font-size:13.5px">app.js</span> + hand-rolled SVG <span class="cd" style="font-size:13.5px">diagram.js</span>) with a React project whose canvas is editable, pans and zooms infinitely, updates live mid-turn, and opens a component's internals in its own dialog canvas rather than expanding it on the system graph.</p>
+
+    <div class="callout" style="background:oklch(98.6% 0.002 260);border:1px solid oklch(91% 0.006 260);border-left:3px solid oklch(52% 0.19 275);border-radius:6px;padding:14px 16px;margin:0 0 26px">
+      <div style="font:600 10px 'IBM Plex Mono';letter-spacing:.1em;text-transform:uppercase;color:oklch(52% 0.19 275);margin-bottom:7px">The one principle</div>
+      <div style="font-size:14px;line-height:1.6">The harness's <span class="cd" style="font-size:13px">ArchState</span> stays the single source of truth. The canvas is a <em>projection</em> of it plus one client-owned overlay (node positions, annotations, sticky notes). Anything the user changes that belongs to the architecture is sent back as the tool-equivalent mutation; anything that is only about looking at the architecture never leaves the browser.</div>
+    </div>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">1. Scope</h2>
+    <p style="margin:0 0 10px">In scope: the whole page served by <span class="cd" style="font-size:13.5px">mha arch</span> — one user, localhost, one session per page.</p>
+    <ul style="margin:0 0 12px;padding-left:20px">
+      <li style="margin-bottom:5px">Infinite canvas of components and connections, with pan, zoom, fit, minimap and a select/rect/arrow/text/note/freehand tool palette.</li>
+      <li style="margin-bottom:5px">Direct editing: move nodes (persisted), rename, edit responsibility inline; annotations and sticky notes as a canvas-only layer.</li>
+      <li style="margin-bottom:5px">Component internals in a <b>component canvas dialog</b> — its own pan/zoom surface, one shell per facet kind, one level deeper for a single module.</li>
+      <li style="margin-bottom:5px">Chat rail with streaming agent text, tool-activity lines, obligations, decisions, questions, flows; finalize gate; all connection and turn states.</li>
+    </ul>
+    <p style="margin:0 0 22px">Out of scope for v1: creating components or connections by drawing (read the note in §7), multiple sessions, resume UI, auth, remote access, mobile.</p>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">2. Stack</h2>
+    <table style="width:100%;border-collapse:collapse;margin:0 0 12px;font-size:13px">
+      <thead><tr style="background:oklch(97% 0.004 260)"><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Concern</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Choice</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Why</th></tr></thead>
+      <tbody>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Build</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Vite + React 18 + TypeScript</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Static build output served by the existing harness route.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Canvas</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><b>React Flow</b></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Nodes are typed React components, so a node <em>is</em> the contract sheet; gives pan/zoom/minimap/drag/handles for free and keeps positions in our store.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Not Excalidraw</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">—</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">It owns its own document model; keeping that in sync with <span class="cd" style="font-size:12.5px">ArchState</span> costs more than it returns. Borrow the interaction feel, not the package.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Annotation layer</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">React Flow custom nodes (sticky, text) + one freehand SVG layer</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Rides the same transform as the graph, so annotations stay pinned when you zoom.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">State</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Zustand: <span class="cd" style="font-size:12.5px">sessionStore</span> (server truth) + <span class="cd" style="font-size:12.5px">canvasStore</span> (overlay)</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">The split <em>is</em> the architecture: one store is replaced wholesale by every <span class="cd" style="font-size:12.5px">arch_state</span> event, the other is never touched by the server.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Layout</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">ELK (layered) behind a <b>Tidy up</b> button</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Never automatic: pinned nodes keep their place.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Transport</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Existing SSE + POST contract, unchanged</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">No server work needed for v1 except the mutation endpoint in §5.</td></tr>
+      </tbody>
+    </table>
+    <p style="margin:0 0 22px;font-size:13.5px;color:oklch(48% 0.015 260)">Mermaid is not used anywhere. The server already pushes structured state; rendering from it directly is what makes nodes clickable and editable.</p>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">3. Shell anatomy</h2>
+    <p style="margin:0 0 10px">Three fixed regions, no page scroll. Left <b>tool rail</b> 52px; centre <b>canvas</b>; right <b>rail</b> 380px with tabs Chat / Decisions / Questions / Flows. Top bar 44px: session goal, phase, model, repo, connection dot, <b>Tidy up</b>, and a depth switcher (L0 system · L1 internals · L2 modules) that reflects what is open rather than acting as a mode.</p>
+    <ul style="margin:0 0 12px;padding-left:20px">
+      <li style="margin-bottom:5px">Canvas overlays: a count chip and an in-progress notice top-left; minimap and a zoom pill bottom-right; a keyboard-hint strip bottom-left (<span class="kb">⌘K</span> commands, <span class="kb">E</span> open facet, <span class="kb">⇧E</span> deeper, <span class="kb">L</span> tidy, <span class="kb">⎋</span> interrupt/close).</li>
+      <li style="margin-bottom:5px">Node card: kind (mono, uppercase, 9px), name 14.5px semibold, responsibility 11.5px, optional tech pills, a dot when the component owes a facet, a badge with the facet summary when it has one. <span class="cd" style="font-size:13px">existing: true</span> renders dashed and dimmed.</li>
+      <li style="margin-bottom:5px">Connections: curved bezier, 1.4px; <span class="cd" style="font-size:13px">async</span> dashed, <span class="cd" style="font-size:13px">batch</span> heavier; label chips carry a canvas-coloured backing so they stay legible over the grid.</li>
+      <li style="margin-bottom:5px">Chat rail scopes to the open component: while a component canvas is open, messages are prefixed with that component and the rail says so.</li>
+    </ul>
+    <div class="callout" style="background:oklch(96% 0.06 95);border:1px solid oklch(72% 0.15 65/.4);border-radius:6px;padding:12px 14px;margin:0 0 22px;font-size:13.5px;line-height:1.6">
+      <b>Tokens</b> — palette: canvas <span class="cd" style="font-size:12.5px">oklch(97.5% .003 250)</span>, surface white, ink <span class="cd" style="font-size:12.5px">oklch(22% .02 260)</span>, muted <span class="cd" style="font-size:12.5px">oklch(54% .015 260)</span>, hairline <span class="cd" style="font-size:12.5px">oklch(90% .006 260)</span>, accent <span class="cd" style="font-size:12.5px">oklch(52% .19 275)</span>, changed/amber <span class="cd" style="font-size:12.5px">oklch(72% .15 65)</span>, ok <span class="cd" style="font-size:12.5px">oklch(58% .12 155)</span>, danger <span class="cd" style="font-size:12.5px">oklch(58% .17 25)</span>. Type: IBM Plex Sans for UI, IBM Plex Mono for ids, values and keys. One border weight (1px, 1.5px when selected), radius 8–14px, shadows only on floating surfaces.
+    </div>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">4. The component canvas dialog</h2>
+    <p style="margin:0 0 10px">Clicking a component selects it; opening it (badge, <span class="kb">E</span>, or the chat rail's action) mounts a floating dialog over a dimmed canvas. <b>The system graph never reflows.</b> That is the whole point: node positions are user-owned, so growing a node in place would shove hand-placed neighbours, and internals need more room than a node's footprint anyway.</p>
+    <table style="width:100%;border-collapse:collapse;margin:0 0 12px;font-size:13px">
+      <thead><tr style="background:oklch(97% 0.004 260)"><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Part</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Contents</th></tr></thead>
+      <tbody>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260);width:26%">Header</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Kind chip · name · breadcrumb once you go deeper (<span class="cd" style="font-size:12.5px">order-service / pricing</span>) · summary (“4 modules”) · <b>Open full canvas</b> · close.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Tabs</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Facet-dependent: Data flow / Contract / Decisions / Failure modes for a service; Entities / Access patterns / Retention / Migration risk for a store.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Body</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Its own React Flow instance — dotted field, drag, pan, zoom, fit — plus dashed <b>port chips</b> at the left and right edges naming the real inbound/outbound neighbours, so the internals stay anchored to the system graph.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Footer</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Interface line (<span class="cd" style="font-size:12.5px">exposes …</span>), invariants, and the hint strip (<span class="kb">⎋</span> close, drag to rearrange).</td></tr>
+      </tbody>
+    </table>
+    <p style="margin:0 0 10px"><b>Sizes.</b> Docked dialog 640×470 minimum, resizable, remembers its size; <b>Open full canvas</b> promotes the same component to a full-window view with the ghost neighbours pinned at the frame edges. Same React tree, two containers.</p>
+    <p style="margin:0 0 10px"><b>One shell, every facet kind.</b> The dialog is a frame; what goes inside is chosen by <span class="cd" style="font-size:13.5px">facet.facet_kind</span>:</p>
+    <table style="width:100%;border-collapse:collapse;margin:0 0 12px;font-size:13px">
+      <thead><tr style="background:oklch(97% 0.004 260)"><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Facet</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Sub-diagram</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Reads from</th></tr></thead>
+      <tbody>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">service</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Module data-flow graph in lanes (edge → domain → persistence), typed internal edges</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">modules[]</span>, <span class="cd" style="font-size:12.5px">interface[]</span></td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">store</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">ER canvas: entity cards with fields, keys, indexes; relation edges with cardinality</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">entities[]</span>, <span class="cd" style="font-size:12.5px">access_patterns[]</span></td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">queue</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Message flow: producers → per-message contract cards → consumers, plus DLQ</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">messages[]</span> + connections</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">api</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Endpoint table grouped by route, with auth, errors, idempotency, pagination</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">endpoints[]</span></td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">infra</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Deployment frames: a unit as a container holding the component ids it hosts</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">units[]</span>, <span class="cd" style="font-size:12.5px">state_locality</span></td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">llm</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Task chain: prompt contract → context strategy → guardrails → fallback</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">tasks[]</span></td></tr>
+      </tbody>
+    </table>
+    <p style="margin:0 0 10px">A component with no facet yet opens the same dialog in an empty state: responsibility, contract, why it owes a facet, and an <b>Expand this component</b> action that posts the instruction to the agent.</p>
+    <div class="callout" style="background:oklch(98.6% 0.002 260);border:1px solid oklch(91% 0.006 260);border-radius:6px;padding:13px 15px;margin:0 0 22px;font-size:13.5px;line-height:1.6">
+      <b>L2 — one module deeper.</b> Selecting a module opens its internal chain <em>in the same dialog</em> with a breadcrumb back to L1, so the user never loses their place. This needs a schema addition — see §8. Until it lands, render the module card with its purpose and no L2 affordance; do not fake the chain.
+    </div>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">5. Events in, mutations out</h2>
+    <p style="margin:0 0 10px">One SSE connection to <span class="cd" style="font-size:13.5px">/events</span>; POSTs to <span class="cd" style="font-size:13.5px">/input</span>, <span class="cd" style="font-size:13.5px">/permission</span>, <span class="cd" style="font-size:13.5px">/interrupt</span>. The server replays late joiners, so a refresh rebuilds everything — the canvas overlay must therefore survive reload independently (see §6).</p>
+    <table style="width:100%;border-collapse:collapse;margin:0 0 12px;font-size:13px">
+      <thead><tr style="background:oklch(97% 0.004 260)"><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Event</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Canvas + rail behaviour</th></tr></thead>
+      <tbody>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260);width:30%"><span class="cd">ready</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Fill model, repo, run id; enable input; restore the saved overlay for this run id.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">assistant_delta</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Append to the in-flight message; render progressively (deltas are frequent — buffer to one paint per frame).</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">harness_event</span> tool calls</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">One compact activity line per call, keeping today's glyph vocabulary (<span class="cd" style="font-size:12.5px">+ component</span>, <span class="cd" style="font-size:12.5px">→ connect</span>, <span class="cd" style="font-size:12.5px">◆ decide</span>, <span class="cd" style="font-size:12.5px">▸ expand</span>, <span class="cd" style="font-size:12.5px">⌕ kg_query</span>).</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">arch_state</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Replace server truth wholesale. Diff by id against the previous snapshot: new nodes fade+slide in at an auto-placed spot, changed nodes and edges get the amber ring for ~2s, removed nodes fade out. Never re-fit and never move a node the user has placed. Refresh the drawer lists, obligations and any open dialog in place.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">permission_request</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">toplevel_approval</span> → Approve banner; <span class="cd" style="font-size:12.5px">finalize</span> → Finalize / Request changes. Non-blocking: replying in the composer routes as feedback.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">turn_end</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Close the message, show status (completed / interrupted / error), re-enable input.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd">error</span> · <span class="cd">bye</span> / drop</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Non-fatal notice with Retry; disconnected veil over the canvas with input disabled (canvas stays pannable so the user can still read it).</td></tr>
+      </tbody>
+    </table>
+    <p style="margin:0 0 10px"><b>Edits go out as mutations.</b> Apply optimistically, then POST. On failure, roll the node back and drop an inline notice in the rail — never leave the canvas showing something the harness does not believe.</p>
+    <table style="width:100%;border-collapse:collapse;margin:0 0 12px;font-size:13px">
+      <thead><tr style="background:oklch(97% 0.004 260)"><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">User action</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Sent as</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Notes</th></tr></thead>
+      <tbody>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Move a node</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">nothing</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Client overlay only; marks the node pinned so Tidy up leaves it alone.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Rename · edit responsibility</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">component</span> mutation (post-approval: <span class="cd" style="font-size:12.5px">amend_toplevel</span>)</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Ids are immutable — a rename changes <span class="cd" style="font-size:12.5px">name</span> only. Show the pending mutation in the inspector footer with an Apply affordance.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Sticky note · annotation · freehand</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">nothing</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Canvas-only, never in the handoff bundle. Offer “send as a question” to promote one into <span class="cd" style="font-size:12.5px">ask</span>.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Expand a component</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">/input</span> instruction</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Same phrasing today's page uses; the agent runs <span class="cd" style="font-size:12.5px">expand</span> and the dialog fills in live.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Interrupt · approve · finalize</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)"><span class="cd" style="font-size:12.5px">/interrupt</span>, <span class="cd" style="font-size:12.5px">/permission</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Unchanged from today.</td></tr>
+      </tbody>
+    </table>
+    <p style="margin:0 0 22px;font-size:13.5px;color:oklch(48% 0.015 260)">Server work needed: one endpoint that accepts a structured mutation and applies it through the same validation path the model's tools use (so <span class="cd" style="font-size:13px">trace</span>, kind-conditional fields and the amendment audit trail all still hold), returning the new state or a validation error. Reject silently-invalid edits rather than accepting them into state.</p>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">6. The canvas overlay</h2>
+    <p style="margin:0 0 10px">Persist per run id (<span class="cd" style="font-size:13.5px">localStorage</span> key <span class="cd" style="font-size:13.5px">mha_arch_canvas:&lt;run_id&gt;</span>): node positions and pinned flags, viewport transform, sticky notes and annotations, dialog size, rail tab, chat height. Restore on <span class="cd" style="font-size:13.5px">ready</span>.</p>
+    <ul style="margin:0 0 22px;padding-left:20px">
+      <li style="margin-bottom:5px">Placement for an unpinned new node: run ELK on the unpinned subset only, with pinned nodes as fixed obstacles — so the graph stays readable without ever moving hand-placed cards.</li>
+      <li style="margin-bottom:5px">Ids are stable and immutable, so overlay entries key cleanly off <span class="cd" style="font-size:13.5px">component.id</span>; drop entries whose id disappears.</li>
+      <li style="margin-bottom:5px">Never write to storage keys the page didn't create; keep today's <span class="cd" style="font-size:13.5px">mha_arch_chat_h</span> behaviour working.</li>
+    </ul>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">7. States to build</h2>
+    <p style="margin:0 0 10px">Each of these is a real state with its own screen, not an afterthought: connecting / first load with the initial turn already streaming · agent turn in progress (text streaming while nodes land) · idle · empty architecture · user editing with a pending mutation · component dialog open (filled, empty-facet, and filling live mid-turn) · L2 open · finalize pending · interrupted turn · turn error · disconnected · finalized read-only.</p>
+    <p style="margin:0 0 22px">Read-only after finalize means: canvas still pans, zooms and opens dialogs; every edit affordance and the composer are gone; the rail shows the bundle paths and <span class="cd" style="font-size:13.5px">mha code</span> as the next step.</p>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">8. Schema delta for L2 (decision needed)</h2>
+    <p style="margin:0 0 10px">L1 needs no schema change — every facet kind already carries the fields its sub-diagram draws. L2 does: <span class="cd" style="font-size:13.5px">Module</span> is currently name + purpose, which is not enough to draw a chain. Two options, pick one before building L2:</p>
+    <ul style="margin:0 0 12px;padding-left:20px">
+      <li style="margin-bottom:6px"><b>Author it.</b> Add optional <span class="cd" style="font-size:13.5px">steps: list[ModuleStep]</span> and <span class="cd" style="font-size:13.5px">reads: list[str]</span> to <span class="cd" style="font-size:13.5px">Module</span>, where a step is name + purpose + optional note, filled by a scoped <span class="cd" style="font-size:13.5px">expand_module</span> tool. Deterministic and immediate; costs the model a few more tokens per risky module.</li>
+      <li style="margin-bottom:6px"><b>Derive it.</b> Leave the schema alone and build L2 from the knowledge graph once code exists. Free at design time, but empty on greenfield — which is exactly when the user wants it.</li>
+    </ul>
+    <p style="margin:0 0 22px">Recommendation: author it, gated on risk the same way facet obligations are — only modules on a critical flow, or holding rules that are expensive to get wrong, owe an L2. Otherwise the model writes detail nobody reads.</p>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">9. Build order</h2>
+    <table style="width:100%;border-collapse:collapse;margin:0 0 12px;font-size:13px">
+      <thead><tr style="background:oklch(97% 0.004 260)"><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Phase</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Ships</th><th style="text-align:left;padding:7px 9px;border:1px solid oklch(91% 0.006 260);font:600 11px 'IBM Plex Mono';letter-spacing:.06em;text-transform:uppercase;color:oklch(45% 0.015 260)">Done when</th></tr></thead>
+      <tbody>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">1 · Parity</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Vite shell, SSE client, both stores, React Flow canvas, rail, composer, all connection/turn states</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">A full session runs end to end with no regression against today's page.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">2 · Canvas</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Overlay persistence, drag + pin, Tidy up, minimap, tool palette, sticky notes, annotations, <span class="kb">⌘K</span></td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">A mid-turn state push never moves a node the user placed.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">3 · Editing</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Inline rename + responsibility, pending-mutation UI, mutation endpoint, rollback path</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">A rejected edit rolls back visibly and the state stays consistent.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">4 · Dialog L1</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Dialog shell, port chips, service + store + queue sub-diagrams, empty-facet state, full-canvas promotion</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Opening a component during a live <span class="cd" style="font-size:12.5px">expand</span> fills in without closing.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">5 · Dialog L2</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Schema delta, <span class="cd" style="font-size:12.5px">expand_module</span>, module chain view, breadcrumb</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">A builder can read one module's rules without opening the repo.</td></tr>
+        <tr><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">6 · Polish</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">api + infra + llm sub-diagrams, flow playback, canvas PNG export</td><td style="padding:7px 9px;border:1px solid oklch(91% 0.006 260)">Every facet kind has a sub-diagram; nothing falls back to a bare list.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">10. Acceptance checks</h2>
+    <ul style="margin:0 0 12px;padding-left:20px">
+      <li style="margin-bottom:5px">Move three nodes, then let the agent add two more: the three stay exactly where they were put.</li>
+      <li style="margin-bottom:5px">Open a component dialog mid-turn: it fills as tools land, and the system graph behind it does not shift by a pixel.</li>
+      <li style="margin-bottom:5px">Rename a component: the id in every connection, flow and the bundle is unchanged.</li>
+      <li style="margin-bottom:5px">Refresh the page mid-session: transcript, state, positions, notes and viewport all come back.</li>
+      <li style="margin-bottom:5px">Kill the server: disconnected veil, input disabled, canvas still readable and pannable.</li>
+      <li style="margin-bottom:5px">Finalize: canvas read-only, bundle paths shown, no edit affordance anywhere.</li>
+      <li style="margin-bottom:5px">Zoom to 30% and to 300%: labels stay legible or hide cleanly; no label ever sits under a card.</li>
+    </ul>
+
+    <h2 style="font:600 19px/1.3 'IBM Plex Sans';margin:0 0 8px;color:oklch(22% 0.02 260)">11. Open questions</h2>
+    <ul style="margin:0 0 6px;padding-left:20px">
+      <li style="margin-bottom:5px">Should drawing a new component or connection on the canvas be allowed in v1, or stay agent-only? (Today's answer: agent-only; the user edits what exists.)</li>
+      <li style="margin-bottom:5px">Should the dialog be dockable into the right rail for side-by-side reading, or stay floating?</li>
+      <li style="margin-bottom:5px">Do annotations belong in the session log at all — useful history, or noise the harness shouldn't carry?</li>
+      <li style="margin-bottom:5px">L2: author or derive (§8) — needs a decision before phase 5.</li>
+    </ul>
+    <p style="margin:14px 0 0;font-size:13px;color:oklch(52% 0.015 260)">Reference mocks: <span class="cd" style="font-size:12.5px">Arch Canvas Redesign.dc.html</span> — <b>3a</b> system canvas with the dialog open, <b>3b</b> dialog at L2, <b>3c</b> the store variant of the same shell; <b>2b</b> shows the full-canvas promotion. Baseline being replaced: <b>0a</b>.</p>
+  </div>
+</doc-page>
+
+</x-dc>
+</body>
+</html>

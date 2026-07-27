@@ -4,16 +4,16 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from mha.skills import Skill, is_valid_skill_name, load_skills, render_index
-from mha.harnesses.code import code_harness_tools
-from mha.tools.base import ToolContext
-from mha.tools.skill import SkillTool
+from ox.skills import Skill, is_valid_skill_name, load_skills, render_index
+from ox.harnesses.code import code_harness_tools
+from ox.tools.base import ToolContext
+from ox.tools.skill import SkillTool
 
 
 # --- helpers ---
 
 def _write_skill(d: Path, name: str, description: str, body: str) -> Path:
-    """Write a skill file. `d` should be the skills directory (e.g. repo/.mha/skills)."""
+    """Write a skill file. `d` should be the skills directory (e.g. repo/.ox/skills)."""
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{name}.md"
     p.write_text(f"name: {name}\ndescription: {description}\n\n{body}", encoding="utf-8")
@@ -23,7 +23,7 @@ def _write_skill(d: Path, name: str, description: str, body: str) -> Path:
 # --- loader: parsing ---
 
 def test_parse_skill_front_matter(tmp_path):
-    _write_skill(tmp_path / ".mha" / "skills", "commit-style", "Use when writing commits", "Be concise.")
+    _write_skill(tmp_path / ".ox" / "skills", "commit-style", "Use when writing commits", "Be concise.")
     skills = [s for s in load_skills(tmp_path) if s.source == "project"]
     assert len(skills) == 1
     sk = skills[0]
@@ -35,7 +35,7 @@ def test_parse_skill_front_matter(tmp_path):
 
 def test_parse_skill_no_description(tmp_path):
     """A skill without a description still loads (empty description)."""
-    d = tmp_path / ".mha" / "skills"
+    d = tmp_path / ".ox" / "skills"
     d.mkdir(parents=True)
     (d / "bare.md").write_text("name: bare\n\nDo the thing.", encoding="utf-8")
     skills = [s for s in load_skills(tmp_path) if s.source == "project"]
@@ -47,7 +47,7 @@ def test_parse_skill_no_description(tmp_path):
 
 def test_empty_body_skipped(tmp_path):
     """A file with no body is silently skipped, not an error."""
-    d = tmp_path / ".mha" / "skills"
+    d = tmp_path / ".ox" / "skills"
     d.mkdir(parents=True)
     (d / "empty.md").write_text("name: empty\ndescription: nothing here\n\n", encoding="utf-8")
     skills = [s for s in load_skills(tmp_path) if s.source == "project"]
@@ -56,7 +56,7 @@ def test_empty_body_skipped(tmp_path):
 
 def test_name_derived_from_filename(tmp_path):
     """No front-matter at all → name comes from the filename stem."""
-    d = tmp_path / ".mha" / "skills"
+    d = tmp_path / ".ox" / "skills"
     d.mkdir(parents=True)
     (d / "auto-named.md").write_text("Just a body, no front-matter.", encoding="utf-8")
     skills = [s for s in load_skills(tmp_path) if s.source == "project"]
@@ -68,8 +68,8 @@ def test_name_derived_from_filename(tmp_path):
 
 def test_project_overrides_user(tmp_path, monkeypatch):
     """Project skills override user skills by name."""
-    _write_skill(tmp_path / ".mha" / "skills", "shared", "project version", "project body")
-    user_dir = tmp_path / "home" / ".mha" / "skills"
+    _write_skill(tmp_path / ".ox" / "skills", "shared", "project version", "project body")
+    user_dir = tmp_path / "home" / ".ox" / "skills"
     _write_skill(user_dir, "shared", "user version", "user body")
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     skills = load_skills(tmp_path)
@@ -80,8 +80,8 @@ def test_project_overrides_user(tmp_path, monkeypatch):
 
 def test_user_and_project_coexist(tmp_path, monkeypatch):
     """Different names from both sources all appear."""
-    _write_skill(tmp_path / ".mha" / "skills", "proj-only", "p", "proj body")
-    user_dir = tmp_path / "home" / ".mha" / "skills"
+    _write_skill(tmp_path / ".ox" / "skills", "proj-only", "p", "proj body")
+    user_dir = tmp_path / "home" / ".ox" / "skills"
     _write_skill(user_dir, "user-only", "u", "user body")
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     skills = load_skills(tmp_path)
@@ -93,7 +93,7 @@ def test_user_and_project_coexist(tmp_path, monkeypatch):
 # --- loader: built-in ---
 
 def test_builtin_skill_creator_loaded(tmp_path):
-    """The skill-creator built-in skill ships with mha and is always available."""
+    """The skill-creator built-in skill ships with ox and is always available."""
     skills = load_skills(tmp_path)
     names = {s.name for s in skills}
     assert "skill-creator" in names
@@ -104,7 +104,7 @@ def test_builtin_skill_creator_loaded(tmp_path):
 
 def test_project_overrides_builtin(tmp_path):
     """A project skill named 'skill-creator' overrides the built-in."""
-    _write_skill(tmp_path / ".mha" / "skills", "skill-creator", "custom", "my version")
+    _write_skill(tmp_path / ".ox" / "skills", "skill-creator", "custom", "my version")
     skills = load_skills(tmp_path)
     sk = next(s for s in skills if s.name == "skill-creator")
     assert sk.source == "project"
@@ -197,7 +197,7 @@ def test_skill_tool_in_control_arm():
 
 def test_all_schemas_under_token_budget():
     tools = code_harness_tools(with_kg=True)
-    assert len(tools) == 11
+    assert len(tools) == 12
     wire = json.dumps([t.spec().to_openai() for t in tools])
     approx_tokens = len(wire) / 4
     assert approx_tokens < 1600, f"schemas ≈ {approx_tokens:.0f} tokens, budget is 1600"
@@ -207,18 +207,18 @@ def test_all_schemas_under_token_budget():
 
 def test_repl_completer_builtin_commands(tmp_path):
     """The readline completer returns built-in /commands."""
-    from mha.repl import Repl
-    from mha.engine.runner import Runner
-    from mha.engine.session import SessionRecorder
-    from mha.llm.registry import ModelSpec, ProviderConfig, Registry
-    from mha.llm.types import Message, Usage, LLMResponse
-    from mha.llm.wire.openai_compat import OpenAICompatClient
+    from ox.repl import Repl
+    from ox.engine.runner import Runner
+    from ox.engine.session import SessionRecorder
+    from ox.llm.registry import ModelSpec, ProviderConfig, Registry
+    from ox.llm.types import Message, Usage, LLMResponse
+    from ox.llm.wire.openai_compat import OpenAICompatClient
 
     class FakeClient:
         def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
-    recorder = SessionRecorder(tmp_path / ".mha" / "sessions" / "t")
+    recorder = SessionRecorder(tmp_path / ".ox" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event, skills=[])
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     spec = ModelSpec(spec="fake:model", provider=ProviderConfig(name="fake", base_url="http://x"), model="model", context_window=32768)
@@ -260,11 +260,11 @@ def test_repl_completer_builtin_commands(tmp_path):
 
 def test_repl_completer_includes_skills(tmp_path):
     """The readline completer includes /<skill-name> alongside built-ins."""
-    from mha.repl import Repl
-    from mha.engine.runner import Runner
-    from mha.engine.session import SessionRecorder
-    from mha.llm.registry import ModelSpec, ProviderConfig, Registry
-    from mha.llm.types import Message, Usage, LLMResponse
+    from ox.repl import Repl
+    from ox.engine.runner import Runner
+    from ox.engine.session import SessionRecorder
+    from ox.llm.registry import ModelSpec, ProviderConfig, Registry
+    from ox.llm.types import Message, Usage, LLMResponse
 
     class FakeClient:
         def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
@@ -274,7 +274,7 @@ def test_repl_completer_includes_skills(tmp_path):
         Skill(name="commit-style", description="d", body="b", path=Path("x"), source="project"),
         Skill(name="flaky-test", description="d", body="b", path=Path("y"), source="user"),
     ]
-    recorder = SessionRecorder(tmp_path / ".mha" / "sessions" / "t")
+    recorder = SessionRecorder(tmp_path / ".ox" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event, skills=skills)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     spec = ModelSpec(spec="fake:model", provider=ProviderConfig(name="fake", base_url="http://x"), model="model", context_window=32768)
@@ -327,17 +327,17 @@ def test_repl_completer_includes_skills(tmp_path):
 
 def test_repl_completer_non_slash_returns_none(tmp_path):
     """Non-slash input gets no completion."""
-    from mha.repl import Repl
-    from mha.engine.runner import Runner
-    from mha.engine.session import SessionRecorder
-    from mha.llm.registry import ModelSpec, ProviderConfig, Registry
-    from mha.llm.types import Message, Usage, LLMResponse
+    from ox.repl import Repl
+    from ox.engine.runner import Runner
+    from ox.engine.session import SessionRecorder
+    from ox.llm.registry import ModelSpec, ProviderConfig, Registry
+    from ox.llm.types import Message, Usage, LLMResponse
 
     class FakeClient:
         def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
-    recorder = SessionRecorder(tmp_path / ".mha" / "sessions" / "t")
+    recorder = SessionRecorder(tmp_path / ".ox" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event, skills=[])
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     spec = ModelSpec(spec="fake:model", provider=ProviderConfig(name="fake", base_url="http://x"), model="model", context_window=32768)
@@ -359,18 +359,18 @@ def test_repl_completer_non_slash_returns_none(tmp_path):
 # --- serve ready event includes skills ---
 
 def test_serve_ready_includes_skills(monkeypatch, tmp_path):
-    """The 'ready' event from mha serve includes the skills list."""
+    """The 'ready' event from ox serve includes the skills list."""
     import json
     import queue
     import threading
     import time
 
-    from mha.engine.runner import Runner
-    from mha.engine.session import SessionRecorder
-    from mha.llm.registry import ModelSpec, ProviderConfig, Registry
-    from mha.llm.types import LLMResponse, Message, Usage
-    from mha.repl import Repl
-    from mha.serve import Server
+    from ox.engine.runner import Runner
+    from ox.engine.session import SessionRecorder
+    from ox.llm.registry import ModelSpec, ProviderConfig, Registry
+    from ox.llm.types import LLMResponse, Message, Usage
+    from ox.repl import Repl
+    from ox.serve import Server
 
     class FakeClient:
         def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
@@ -379,7 +379,7 @@ def test_serve_ready_includes_skills(monkeypatch, tmp_path):
     skills = [
         Skill(name="commit-style", description="Use when writing commits", body="be concise", path=Path("x"), source="project"),
     ]
-    recorder = SessionRecorder(tmp_path / ".mha" / "sessions" / "t")
+    recorder = SessionRecorder(tmp_path / ".ox" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event, skills=skills)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     spec = ModelSpec(spec="fake:model", provider=ProviderConfig(name="fake", base_url="http://x"), model="model", context_window=32768)

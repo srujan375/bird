@@ -47,7 +47,7 @@ def test_every_declared_glob_matches_something():
 ])
 def test_runtime_asset_is_declared(relpath: str):
     """Each non-.py file the tool reads at runtime must be covered by a glob."""
-    path = SRC / "mha" / relpath
+    path = SRC / "ox" / relpath
     assert path.is_file(), f"{relpath} is missing from the source tree"
     covered = False
     for package, patterns in package_data().items():
@@ -63,9 +63,9 @@ def test_runtime_asset_is_declared(relpath: str):
 
 def test_workbench_bundle_is_built_and_referenced():
     """The page is a build artifact (source in arch-ui/). If the built assets
-    are missing or index.html points at stale filenames, `mha arch` serves a
+    are missing or index.html points at stale filenames, `ox arch` serves a
     blank page — so the built output has to be committed, not just built."""
-    static = SRC / "mha" / "harnesses" / "arch" / "static"
+    static = SRC / "ox" / "harnesses" / "arch" / "static"
     index = static / "index.html"
     assert index.is_file(), "static/index.html missing — run `npm run build` in arch-ui/"
     assets = list((static / "assets").glob("*"))

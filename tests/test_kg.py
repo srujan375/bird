@@ -1,6 +1,6 @@
 import pytest
 
-from mha.context.kg import KG, branch_slug, singularize, tokenize
+from ox.context.kg import KG, branch_slug, singularize, tokenize
 
 
 def test_tokenize_camel_and_snake():
@@ -57,7 +57,7 @@ def kg(repo):
 
 def test_build_creates_branch_aware_store(kg, repo):
     assert kg.graph_path.exists()
-    assert str(kg.graph_path).startswith(str(repo / ".mha" / "kg" / "no-git"))
+    assert str(kg.graph_path).startswith(str(repo / ".ox" / "kg" / "no-git"))
     assert kg.manifest_path.exists()
     assert kg.is_ready()
 

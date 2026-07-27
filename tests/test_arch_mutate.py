@@ -11,11 +11,11 @@ import threading
 
 import pytest
 
-from mha.harnesses.arch.mutate import MutationError, apply_mutation
-from mha.harnesses.arch.session import ArchSession
-from mha.harnesses.arch.state import ArchState, Component, Concern, Connection, Flow, FlowStep
-from mha.harnesses.arch.tools import ComponentTool
-from mha.tools import ToolContext
+from ox.harnesses.arch.mutate import MutationError, apply_mutation
+from ox.harnesses.arch.session import ArchSession
+from ox.harnesses.arch.state import ArchState, Component, Concern, Connection, Flow, FlowStep
+from ox.harnesses.arch.tools import ComponentTool
+from ox.tools import ToolContext
 
 from .test_arch_e2e import Page, build_stack
 
@@ -174,7 +174,7 @@ def test_concern_refusals(payload, expected):
 
 
 def test_promoting_a_variant_from_the_canvas_seeds_the_design():
-    from mha.harnesses.arch.sketch import SketchLink, SketchNode, Variant
+    from ox.harnesses.arch.sketch import SketchLink, SketchNode, Variant
 
     session, _ = make_session()
     session.state.components.clear()
@@ -197,7 +197,7 @@ def test_promoting_a_variant_from_the_canvas_seeds_the_design():
 
 
 def test_promoting_an_empty_variant_is_refused():
-    from mha.harnesses.arch.sketch import Variant
+    from ox.harnesses.arch.sketch import Variant
 
     session, _ = make_session()
     session.state.sketchbook.variants["v3"] = Variant(id="v3", name="empty", summary="")
@@ -258,7 +258,7 @@ def test_mutate_over_http(tmp_path):
 
 
 def test_mutate_is_refused_when_the_session_has_no_arch_state(tmp_path):
-    """`mha code` and the plain REPL share this pump; the route must decline
+    """`ox code` and the plain REPL share this pump; the route must decline
     politely rather than explode."""
     server, transport, arch, _ = build_stack(tmp_path, [])
     server.repl.runner.ctx.arch = None

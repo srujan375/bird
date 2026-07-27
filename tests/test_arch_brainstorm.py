@@ -5,9 +5,9 @@ stays open for the whole session, and promoting is a non-destructive, repeatable
 move rather than a one-way door.
 """
 
-from mha.harnesses.arch.session import ArchSession
-from mha.harnesses.arch.state import ArchState
-from mha.harnesses.arch.tools import (
+from ox.harnesses.arch.session import ArchSession
+from ox.harnesses.arch.state import ArchState
+from ox.harnesses.arch.tools import (
     ArchDoneTool,
     BriefTool,
     ComponentTool,
@@ -20,7 +20,7 @@ from mha.harnesses.arch.tools import (
     SpliceTool,
     VariantTool,
 )
-from mha.tools import ToolContext
+from ox.tools import ToolContext
 
 
 class FakeBroker:

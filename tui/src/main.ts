@@ -51,7 +51,7 @@ function tildify(p: string): string {
 	return p.startsWith(home) ? "~" + p.slice(home.length) : p;
 }
 
-// Mirrors mha's REPL commands (src/mha/repl.py). Skill names from the server
+// Mirrors ox's REPL commands (src/ox/repl.py). Skill names from the server
 // are merged in at runtime when the "ready" message arrives (below).
 const SLASH_COMMANDS = [
 	{ name: "help", description: "list commands" },
@@ -61,11 +61,11 @@ const SLASH_COMMANDS = [
 	{ name: "skills", description: "list available skills" },
 	{ name: "compact", description: "compact conversation history" },
 	{ name: "clear", description: "start a fresh conversation" },
-	{ name: "reload", description: "respawn mha with latest code/skills (resume this session)" },
+	{ name: "reload", description: "respawn ox with latest code/skills (resume this session)" },
 	{ name: "session", description: "show session info" },
 	{ name: "sessions", description: "list all past sessions with names" },
 	{ name: "continue", description: "resume a previous session" },
-	{ name: "quit", description: "exit mha" },
+	{ name: "quit", description: "exit ox" },
 ];
 
 /* ---------- UI scaffold ---------- */
@@ -339,7 +339,7 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 			// session's transcript so code/skill/tool changes take effect
 			// without a new terminal session.
 			const rid = msg.run_id;
-			addToChat(new Notice("↻ reloading mha — respawning serve with latest code/skills…", "accent"));
+			addToChat(new Notice("↻ reloading ox — respawning serve with latest code/skills…", "accent"));
 			busy = false;
 			hideThinking();
 			bridge?.restart(rid);
@@ -372,7 +372,7 @@ if (!DEMO) {
 		onExit: (code) => {
 			if (code !== 0) {
 				hideThinking();
-				addToChat(new Notice(`mha serve exited (code ${code}) — is the venv installed and ollama running?`, "danger"));
+				addToChat(new Notice(`ox serve exited (code ${code}) — is the venv installed and ollama running?`, "danger"));
 				busy = false;
 				tui.requestRender();
 			} else {

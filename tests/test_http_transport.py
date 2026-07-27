@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from mha.http_transport import HttpTransport
+from ox.http_transport import HttpTransport
 
 
 class Handlers:

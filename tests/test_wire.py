@@ -2,9 +2,9 @@ import httpx
 import pytest
 from pytest_httpx import IteratorStream
 
-from mha.llm.registry import ModelSpec, ProviderConfig
-from mha.llm.types import Message, ToolSpec
-from mha.llm.wire.openai_compat import MAX_TRANSPORT_ATTEMPTS, OpenAICompatClient, WireError
+from ox.llm.registry import ModelSpec, ProviderConfig
+from ox.llm.types import Message, ToolSpec
+from ox.llm.wire.openai_compat import MAX_TRANSPORT_ATTEMPTS, OpenAICompatClient, WireError
 
 
 @pytest.fixture
@@ -18,7 +18,7 @@ def spec():
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.setattr("mha.llm.wire.openai_compat.time.sleep", lambda s: None)
+    monkeypatch.setattr("ox.llm.wire.openai_compat.time.sleep", lambda s: None)
     c = OpenAICompatClient()
     yield c
     c.close()

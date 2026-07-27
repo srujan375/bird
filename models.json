@@ -81,6 +81,7 @@
     "default": "ollama:glm-5.2",
     "architect": "ollama:glm-5.2",
     "judge": "ollama:glm-5.2",
-    "compactor": "ollama:glm-5.2"
+    "compactor": "ollama:glm-5.2",
+    "vision": "ollama:glm-5.2"
   }
 }

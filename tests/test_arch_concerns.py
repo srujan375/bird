@@ -3,12 +3,12 @@ findings, what the finalize gate does with an open blocker, and what survives
 into the handoff bundle.
 """
 
-from mha.harnesses.arch import judge
-from mha.harnesses.arch.bundle import write_bundle
-from mha.harnesses.arch.session import ArchSession
-from mha.harnesses.arch.sketch import SketchNode, Variant
-from mha.harnesses.arch.state import ArchState
-from mha.harnesses.arch.tools import (
+from ox.harnesses.arch import judge
+from ox.harnesses.arch.bundle import write_bundle
+from ox.harnesses.arch.session import ArchSession
+from ox.harnesses.arch.sketch import SketchNode, Variant
+from ox.harnesses.arch.state import ArchState
+from ox.harnesses.arch.tools import (
     ArchDoneTool,
     ComponentTool,
     ConcernTool,
@@ -17,7 +17,7 @@ from mha.harnesses.arch.tools import (
     FlowTool,
     BriefTool,
 )
-from mha.tools import ToolContext
+from ox.tools import ToolContext
 
 
 class FakeBroker:

@@ -1,6 +1,6 @@
 import json
 
-from mha.llm.types import LLMResponse, Message, ToolCall, ToolSpec, Usage
+from ox.llm.types import ContentPart, LLMResponse, Message, ToolCall, ToolSpec, Usage
 
 
 def test_toolspec_to_openai():
@@ -62,3 +62,64 @@ def test_usage_add():
     assert total.input_tokens == 11
     assert total.output_tokens == 7
     assert total.total_tokens == 18
+
+
+# --- ContentPart / multimodal Message ---
+
+def test_contentpart_text_constructor():
+    p = ContentPart.text_part("hello")
+    assert p.type == "text"
+    assert p.text == "hello"
+    assert p.image_url is None
+    assert p.to_openai() == {"type": "text", "text": "hello"}
+
+
+def test_contentpart_image_constructor():
+    p = ContentPart.image("data:image/png;base64,AAAA")
+    assert p.type == "image_url"
+    assert p.image_url == {"url": "data:image/png;base64,AAAA"}
+    assert p.to_openai() == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA"},
+    }
+
+
+def test_contentpart_roundtrip_dict():
+    p = ContentPart.image("data:image/png;base64,AAAA")
+    restored = ContentPart.from_dict(p.to_dict())
+    assert restored == p
+
+
+def test_message_list_content_to_openai():
+    msg = Message(
+        role="user",
+        content=[
+            ContentPart.text_part("describe this"),
+            ContentPart.image("data:image/png;base64,AAAA"),
+        ],
+    )
+    wire = msg.to_openai()
+    assert wire["role"] == "user"
+    assert isinstance(wire["content"], list)
+    assert wire["content"][0] == {"type": "text", "text": "describe this"}
+    assert wire["content"][1]["type"] == "image_url"
+    assert wire["content"][1]["image_url"]["url"] == "data:image/png;base64,AAAA"
+
+
+def test_message_string_content_still_passes_through():
+    # backward compatibility: str content is unchanged on the wire
+    msg = Message(role="user", content="plain text")
+    wire = msg.to_openai()
+    assert wire["content"] == "plain text"
+
+
+def test_message_list_content_roundtrip_dict():
+    msg = Message(
+        role="user",
+        content=[ContentPart.text_part("q"), ContentPart.image("data:image/png;base64,AAAA")],
+    )
+    restored = Message.from_dict(msg.to_dict())
+    assert restored.role == "user"
+    assert isinstance(restored.content, list)
+    assert restored.content[0].text == "q"
+    assert restored.content[1].image_url == {"url": "data:image/png;base64,AAAA"}

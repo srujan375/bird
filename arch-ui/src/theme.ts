@@ -10,7 +10,7 @@ import { create } from "zustand";
 
 export type ThemeName = "light" | "dark";
 
-const KEY = "mha_arch_theme";
+const KEY = "ox_arch_theme";
 
 function initial(): ThemeName {
   try {

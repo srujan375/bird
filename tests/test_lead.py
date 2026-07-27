@@ -7,14 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from mha.engine.runner import Runner
-from mha.engine.session import SessionRecorder
-from mha.harnesses import handoff, registry
-from mha.harnesses.lead import lead_harness_tools
-from mha.harnesses.lead.tools import ArchitectTool, CodeTool
-from mha.llm.registry import ModelSpec, ProviderConfig, Registry
-from mha.llm.types import LLMResponse, Message, ToolCall, Usage
-from mha.tools import ToolContext
+from ox.engine.runner import Runner
+from ox.engine.session import SessionRecorder
+from ox.harnesses import handoff, registry
+from ox.harnesses.lead import lead_harness_tools
+from ox.harnesses.lead.tools import ArchitectTool, CodeTool
+from ox.llm.registry import ModelSpec, ProviderConfig, Registry
+from ox.llm.types import LLMResponse, Message, ToolCall, Usage
+from ox.tools import ToolContext
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -101,7 +101,7 @@ def test_seed_context_lands_in_system_prompt(tmp_path):
 # --------------------------------------------------------------- handoff
 
 def _write_bundle(root, run_name, text="# Architecture\n\ncontent"):
-    d = root / ".mha" / "sessions" / run_name / "bundle"
+    d = root / ".ox" / "sessions" / run_name / "bundle"
     d.mkdir(parents=True)
     (d / "architecture.md").write_text(text)
     return d.parent
@@ -118,7 +118,7 @@ def test_find_bundle_by_id_and_latest(tmp_path):
     # 'latest' picks the most recently written bundle
     assert handoff.find_bundle_dir(tmp_path, "latest") == b
     # a session dir without a bundle is not matched
-    (tmp_path / ".mha" / "sessions" / "arch-empty").mkdir()
+    (tmp_path / ".ox" / "sessions" / "arch-empty").mkdir()
     assert handoff.find_bundle_dir(tmp_path, "arch-empty") is None
 
 
@@ -143,7 +143,7 @@ def test_code_tool_seeds_and_forks_ctx(tmp_path, monkeypatch):
         return SimpleNamespace(run=lambda task: SimpleNamespace(
             status="done", summary="built", turns=1))
 
-    monkeypatch.setattr("mha.harnesses.registry.build_runner", fake_build_runner)
+    monkeypatch.setattr("ox.harnesses.registry.build_runner", fake_build_runner)
     ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path,
                       plan="PARENT_PLAN", last_bundle="THE-DESIGN")
     res = CodeTool().run({"task": "build it"}, ctx)
@@ -175,7 +175,7 @@ def test_architect_tool_stashes_bundle_on_finalize(tmp_path, monkeypatch):
         (run_dir / "bundle" / "architecture.md").write_text("# Shortener\n\ndesign")
         return _fake_arch_session("finalized", run_dir)
 
-    monkeypatch.setattr("mha.harnesses.arch.run.run_arch_interactive", fake_interactive)
+    monkeypatch.setattr("ox.harnesses.arch.run.run_arch_interactive", fake_interactive)
     ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path)
     res = ArchitectTool().run({"task": "shorten urls"}, ctx)
 
@@ -197,8 +197,8 @@ def test_architect_always_uses_interactive_workbench(tmp_path, monkeypatch):
             return _fake_arch_session("finalized", run_dir)
         return fake
 
-    monkeypatch.setattr("mha.harnesses.arch.run.run_arch_interactive", make_fake("interactive"))
-    monkeypatch.setattr("mha.harnesses.arch.run.run_arch_headless", make_fake("headless"))
+    monkeypatch.setattr("ox.harnesses.arch.run.run_arch_interactive", make_fake("interactive"))
+    monkeypatch.setattr("ox.harnesses.arch.run.run_arch_headless", make_fake("headless"))
 
     # There is no auto path: architecture must ALWAYS open the interactive
     # Workbench (browser + human gates), never the headless auto-approve walk.
@@ -207,10 +207,10 @@ def test_architect_always_uses_interactive_workbench(tmp_path, monkeypatch):
 
 
 def test_architect_tool_errors_if_not_finalized(tmp_path, monkeypatch):
-    from mha.tools import ToolError
+    from ox.tools import ToolError
 
     monkeypatch.setattr(
-        "mha.harnesses.arch.run.run_arch_interactive",
+        "ox.harnesses.arch.run.run_arch_interactive",
         lambda **kw: _fake_arch_session("expand"),
     )
     ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path)
@@ -259,9 +259,9 @@ class ScriptClient:
 
 
 def test_arch_headless_reaches_finalized(tmp_path):
-    from mha.harnesses.arch.run import run_arch_headless
+    from ox.harnesses.arch.run import run_arch_headless
 
-    run_dir = tmp_path / ".mha" / "sessions" / "arch-h"
+    run_dir = tmp_path / ".ox" / "sessions" / "arch-h"
     arch = run_arch_headless(
         repo_root=tmp_path, task="design a url shortener", registry=REG,
         client=ScriptClient(ARCH_WALK), run_dir=run_dir,
@@ -295,13 +295,13 @@ def test_lead_end_to_end(tmp_path, monkeypatch):
     # architect ALWAYS opens the interactive Workbench in the product; for a
     # browserless test, delegate that to the headless walk so the scripted
     # client can drive the arch session to finalized.
-    from mha.harnesses.arch.run import run_arch_headless
+    from ox.harnesses.arch.run import run_arch_headless
 
-    monkeypatch.setattr("mha.harnesses.arch.run.run_arch_interactive",
+    monkeypatch.setattr("ox.harnesses.arch.run.run_arch_interactive",
                         lambda *, on_status=None, **kw: run_arch_headless(**kw))
 
     events = []
-    run_dir = tmp_path / ".mha" / "sessions" / "lead-e2e"
+    run_dir = tmp_path / ".ox" / "sessions" / "lead-e2e"
     recorder = SessionRecorder(run_dir)
 
     lead_script = [

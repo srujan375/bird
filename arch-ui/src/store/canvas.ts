@@ -14,8 +14,8 @@ import type { Layer } from "../types";
 
 export interface XY { x: number; y: number }
 
-const STORAGE_PREFIX = "mha_arch_canvas:";
-const CHAT_KEY = "mha_arch_chat_h"; // shared with the old page on purpose
+const STORAGE_PREFIX = "ox_arch_canvas:";
+const CHAT_KEY = "ox_arch_chat_h"; // shared with the old page on purpose
 const DEFAULT_RAIL = 380;
 
 export interface Overlay {

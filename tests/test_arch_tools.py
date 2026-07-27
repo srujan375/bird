@@ -2,9 +2,9 @@
 
 import pytest
 
-from mha.harnesses.arch.session import ArchSession
-from mha.harnesses.arch.state import ArchState
-from mha.harnesses.arch.tools import (
+from ox.harnesses.arch.session import ArchSession
+from ox.harnesses.arch.state import ArchState
+from ox.harnesses.arch.tools import (
     AmendTool,
     AnswerTool,
     ArchDoneTool,
@@ -17,7 +17,7 @@ from mha.harnesses.arch.tools import (
     FlowTool,
     arch_harness_tools,
 )
-from mha.tools import ToolContext
+from ox.tools import ToolContext
 
 
 class FakeBroker:
@@ -233,7 +233,7 @@ def test_full_session_to_finalize(tmp_path):
     assert broker.requests[1]["artifacts"]
     assert (run_dir / "bundle" / "architecture.json").is_file()
     assert (run_dir / "bundle" / "architecture.md").is_file()
-    assert "mha code" in res.output
+    assert "ox code" in res.output
     # every mutation emitted a full arch_state event
     assert events[-1]["phase"] == "finalized"
     assert events[-1]["state"]["components"]["db"]["facet"]["facet_kind"] == "store"
@@ -374,7 +374,7 @@ def test_critic_failure_is_silent(tmp_path):
 
 
 def _stub_component():
-    from mha.harnesses.arch.state import Component
+    from ox.harnesses.arch.state import Component
     return Component(id="x", name="x", kind="service", responsibility="r")
 
 
@@ -439,7 +439,7 @@ def test_persistence_and_resume(tmp_path):
 
 def test_toolset_composition(tmp_path):
     names = [t.name for t in arch_harness_tools()]
-    assert names == ["read", "kg_query", "WebSearch", "WebFetch",
+    assert names == ["read", "read_image", "kg_query", "WebSearch", "WebFetch",
                      "import_state",
                      "variant", "node", "link", "splice", "depth", "promote",
                      "brief", "component", "connect", "flow", "expand", "decide",

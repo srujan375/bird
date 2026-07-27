@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from mha.llm.ollama import DEFAULT_API_KEY_ENV, Ollama, OllamaError
+from ox.llm.ollama import DEFAULT_API_KEY_ENV, Ollama, OllamaError
 
 
 @pytest.fixture

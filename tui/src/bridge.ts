@@ -1,4 +1,4 @@
-// Spawns `mha serve` and speaks its JSON-lines protocol over stdio.
+// Spawns `ox serve` and speaks its JSON-lines protocol over stdio.
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -46,11 +46,11 @@ export interface BridgeOptions {
 }
 
 function findPython(repo: string): string {
-	if (process.env.MHA_PYTHON) return process.env.MHA_PYTHON;
-	// the mha source tree's venv (where `pip install -e .` put mha) beats the
-	// target repo's venv, which usually doesn't have mha installed
-	const mhaRoot = join(import.meta.dirname, "..", "..");
-	for (const root of [mhaRoot, repo]) {
+	if (process.env.OX_PYTHON) return process.env.OX_PYTHON;
+	// the ox source tree's venv (where `pip install -e .` put ox) beats the
+	// target repo's venv, which usually doesn't have ox installed
+	const oxRoot = join(import.meta.dirname, "..", "..");
+	for (const root of [oxRoot, repo]) {
 		const venv = join(root, ".venv", "bin", "python");
 		if (existsSync(venv)) return venv;
 	}
@@ -68,7 +68,7 @@ export class Bridge {
 	}
 
 	private serveArgs(resume?: string): string[] {
-		const args = ["-m", "mha", "serve", "--repo", this.opts.repo];
+		const args = ["-m", "ox", "serve", "--repo", this.opts.repo];
 		if (this.opts.model) args.push("--model", this.opts.model);
 		if (this.opts.noKg) args.push("--no-kg");
 		if (this.opts.harness) args.push("--harness", this.opts.harness);
@@ -109,10 +109,10 @@ export class Bridge {
 		});
 		proc.on("error", (err) => {
 			if (this.restarting) {
-				this.opts.onStderr(`failed to restart mha serve: ${err.message}`);
+				this.opts.onStderr(`failed to restart ox serve: ${err.message}`);
 				return;
 			}
-			this.opts.onStderr(`failed to start mha serve: ${err.message}`);
+			this.opts.onStderr(`failed to start ox serve: ${err.message}`);
 			this.opts.onExit(1);
 		});
 		return proc;
@@ -120,7 +120,7 @@ export class Bridge {
 
 	private restarting = false;
 
-	/** Respawn `mha serve` fresh from disk, resuming `runId`'s transcript.
+	/** Respawn `ox serve` fresh from disk, resuming `runId`'s transcript.
 	 * Used by /reload so code/skill/tool changes take effect without a new
 	 * terminal session. The old process is killed; the new one reuses the
 	 * same onMessage/onStderr handlers. */

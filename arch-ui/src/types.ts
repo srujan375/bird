@@ -1,5 +1,5 @@
 /**
- * The wire contract, mirrored from src/mha/harnesses/arch/state.py and serve.py.
+ * The wire contract, mirrored from src/ox/harnesses/arch/state.py and serve.py.
  *
  * ArchState is replaced wholesale by every `arch_state` event — the server is
  * the single source of truth for everything in here. Anything the browser owns

@@ -1,12 +1,12 @@
 # The Architecture Workbench — what the page does
 
-The page `mha arch` serves. Companion to `docs/arch-state-schema.md`, which owns
+The page `ox arch` serves. Companion to `docs/arch-state-schema.md`, which owns
 the state and the wire; this document owns behaviour — what the user sees, what
 they can change, and which of it never leaves the browser.
 
 Source: `arch-ui/` (Vite + React 18 + TS + `@xyflow/react` + Zustand), built into
-`src/mha/harnesses/arch/static/`. **The build output is committed on purpose** —
-`mha arch` has to work for someone who has never installed Node. Rebuild and
+`src/ox/harnesses/arch/static/`. **The build output is committed on purpose** —
+`ox arch` has to work for someone who has never installed Node. Rebuild and
 commit `index.html` and `assets/*` together; `tests/test_packaging.py` fails if
 they drift apart.
 
@@ -25,7 +25,7 @@ about *looking at* the architecture never leaves the browser.
 | Owned by the server (`store/session.ts`) | Owned by the browser (`store/canvas.ts`) |
 |---|---|
 | components, connections, flows, decisions, questions, concerns, obligations, the sketchbook | node positions and pins, viewport, which layer/variant is showing, rail tab, dialog size + which component is open |
-| replaced wholesale by every `arch_state` event | persisted to `localStorage["mha_arch_canvas:<run_id>"]`, never touched by an event |
+| replaced wholesale by every `arch_state` event | persisted to `localStorage["ox_arch_canvas:<run_id>"]`, never touched by an event |
 
 That split is why a mid-turn state push can add five components without moving a
 card the user dragged, and why a refresh comes back to the same viewport.
@@ -147,7 +147,7 @@ turn error · disconnected · finalized read-only.
 
 **Finalized** means: the canvas still pans, zooms and opens dialogs; every edit
 affordance and the composer are gone; the rail shows the bundle paths and
-`mha code` as the next step. A finalized session is never shown as disconnected,
+`ox code` as the next step. A finalized session is never shown as disconnected,
 even after the server exits.
 
 ## Not built

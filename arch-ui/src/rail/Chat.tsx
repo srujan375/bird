@@ -146,7 +146,7 @@ export function Chat() {
             {artifacts.length > 0 && (
               <div className="mono" style={{ marginTop: 4 }}>{artifacts.join("\n")}</div>
             )}
-            <div style={{ marginTop: 6 }}>Next step: <code className="mono">mha code</code></div>
+            <div style={{ marginTop: 6 }}>Next step: <code className="mono">ox code</code></div>
             <div style={{ marginTop: 6 }}>Close the tab when you are done — the server is
               only still up so you can read this.</div>
           </div>
