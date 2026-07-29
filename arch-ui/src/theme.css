@@ -511,13 +511,22 @@ button.pill { padding: 1px 5px; border-radius: 5px; }
   padding: 9px 10px;
   margin: 8px;
   background: color-mix(in oklch, var(--accent) 7%, var(--surface));
+  /* The gate sits in an implicit `auto` grid row, which sizes to content and
+     never shrinks — an unbounded finalize summary would push its own buttons
+     out through the rail's hidden overflow. Cap it and scroll the body, so
+     the title and the two rulings are always on screen. */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 50vh;
 }
+.gate-body { overflow: auto; min-height: 0; overscroll-behavior: contain; }
 .gate h4 { margin: 0 0 4px; font-size: 12.5px; }
 .gate p { margin: 0 0 6px; font-size: 11.5px; line-height: 1.5; }
 .gate .weigh { margin: 6px 0; }
 .gate .weigh li { font-size: 11px; color: var(--muted); line-height: 1.5; }
 .gate ul { margin: 4px 0; padding-left: 16px; }
-.gate .buttons { display: flex; gap: 6px; margin-top: 8px; }
+.gate .buttons { display: flex; gap: 6px; margin-top: 8px; flex: none; }
 .gate[data-kind="finalize"] { border-color: var(--ok); background: color-mix(in oklch, var(--ok) 7%, var(--surface)); }
 .gate .blocker-warn {
   border: 1px solid var(--danger);

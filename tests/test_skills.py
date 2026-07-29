@@ -196,11 +196,15 @@ def test_skill_tool_in_control_arm():
 # --- token budget ---
 
 def test_all_schemas_under_token_budget():
+    from .test_tools import SCHEMA_TOKEN_BUDGET
+
     tools = code_harness_tools(with_kg=True)
     assert len(tools) == 12
     wire = json.dumps([t.spec().to_openai() for t in tools])
     approx_tokens = len(wire) / 4
-    assert approx_tokens < 1600, f"schemas ≈ {approx_tokens:.0f} tokens, budget is 1600"
+    assert approx_tokens < SCHEMA_TOKEN_BUDGET, (
+        f"schemas ≈ {approx_tokens:.0f} tokens, budget is {SCHEMA_TOKEN_BUDGET}"
+    )
 
 
 # --- REPL completer ---

@@ -345,3 +345,58 @@ def test_server_runs_on_custom_transport(tmp_path):
         if e["type"] == "harness_event" and e["event"] == "assistant_delta"
     ]
     assert [d["data"]["text"] for d in deltas] == ["hi there"]
+
+
+# ---------- attachment ingestion ----------
+
+
+class _AttachTransport:
+    """Sends one message naming an image, then reaps the source file the way
+    macOS reaps a screenshot preview's temp file."""
+
+    def __init__(self, text, source):
+        self.events = []
+        self.text = text
+        self.source = source
+        self.done = threading.Event()
+
+    def emit(self, event):
+        self.events.append(event)
+        if event["type"] == "turn_end":
+            self.done.set()
+
+    def run(self, handlers):
+        handlers.on_user_input(self.text)
+        self.source.unlink()  # gone before the model could ever have read it
+        assert self.done.wait(timeout=5)
+
+
+def test_server_ingests_a_dragged_screenshot_before_it_is_reaped(tmp_path):
+    """End-to-end at the seam that matters: a quoted temp path arrives, the
+    image is copied into the session, the model is handed the copy, and the
+    original vanishing afterwards costs nothing."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    shot = tmp_path / "T" / "NSIRD_screencaptureui_x"  # outside the repo, like the real thing
+    shot.mkdir(parents=True)
+    src = shot / "Screenshot 2026-07-28 at 10.59.33 PM.png"
+    src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+
+    repl = make_repl(repo, [Message(role="assistant", content="ok")])
+    transport = _AttachTransport(f"'{src}', read this image?", src)
+    assert Server(repl, transport=transport).run() == 0
+
+    saved = [
+        e for e in transport.events
+        if e["type"] == "harness_event" and e["event"] == "attachment_saved"
+    ]
+    assert len(saved) == 1
+    rel = saved[0]["data"]["path"]
+    assert (repo / rel).is_file()          # survives the reaping
+    assert not src.exists()
+
+    # the model saw the copy's path, never the doomed temp one
+    user_text = next(m.content for m in repl.messages if m.role == "user")
+    assert rel in user_text
+    assert str(src) not in user_text
+    assert "read this image?" in user_text

@@ -150,6 +150,29 @@ def test_bash_payload_carries_the_command(tmp_path):
     assert p == {"kind": "bash", "cmd": "pytest -q"}
 
 
+def test_edit_payload_falls_back_when_path_is_null(tmp_path):
+    p = permission_payload("edit", {"path": None, "old_text": "x", "new_text": "y"},
+                           ToolContext(repo_root=tmp_path))
+    assert p["kind"] == "edit"
+    assert p["file"] == "?"  # not None — must not reach the TUI as null
+
+
+def test_write_payload_falls_back_when_path_is_null(tmp_path):
+    p = permission_payload("write", {"path": None, "content": "hi"},
+                           ToolContext(repo_root=tmp_path))
+    assert p["kind"] == "write"
+    assert p["file"] == "?"  # not None — must not reach the TUI as null
+    p = permission_payload("bash", {"command": None}, ToolContext(repo_root=tmp_path))
+    assert p["kind"] == "bash"
+    assert p["cmd"] == "bash"
+
+
+def test_bash_payload_falls_back_when_command_is_missing(tmp_path):
+    p = permission_payload("bash", {}, ToolContext(repo_root=tmp_path))
+    assert p["kind"] == "bash"
+    assert p["cmd"] == "bash"
+
+
 # --------------------------------------------------------------------- denial
 
 

@@ -20,6 +20,7 @@ except ImportError:  # Windows lacks readline; completion just won't work
     readline = None
 
 from .activity import attach_printer
+from .attachments import ingest_images
 from .context.kg import KG, KGError
 from .engine.compactor import compact, estimate_tokens
 from .engine.runner import Runner, repair_interrupted
@@ -152,8 +153,23 @@ class Repl:
             return f"ox interactive | {name} | model={spec} | /help for commands"
         return f"ox interactive | model={spec} | /help for commands"
 
+    def _ingest(self, line: str) -> str:
+        """Copy any image the user just named into the session dir and point
+        the text at the copy — see attachments.py for why this happens here and
+        not when the model calls read_image."""
+        try:
+            rewritten, found = ingest_images(
+                line, self.recorder.run_dir, self.runner.ctx.repo_root
+            )
+        except Exception:  # a convenience, never a reason to lose the turn
+            return line
+        for a in found:
+            print(f"  📎 saved {a.path} ({a.size:,} bytes)")
+        return rewritten
+
     def _turn(self, line: str) -> None:
         self._streamed = False
+        line = self._ingest(line)
         try:
             result = self.runner.chat(self.messages, line)
         except KeyboardInterrupt:

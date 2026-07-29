@@ -31,8 +31,10 @@ class ArchitectTool(Tool):
     description = (
         "Design the architecture for a feature or system before it is built. Runs an "
         "architecture session and produces a handoff design (components, contracts, "
-        "decisions). Call this before `code` for any non-trivial new feature. The "
-        "resulting design is passed to `code` automatically."
+        "decisions). For a new feature, the lead should first ask the user whether "
+        "they want the full Workbench design session or to skip straight to coding; "
+        "call this only when the user wants the Workbench (or is ambiguous and leans "
+        "toward design). The resulting design is passed to `code` automatically."
     )
     parameters = {
         "type": "object",
@@ -93,8 +95,10 @@ class CodeTool(Tool):
     description = (
         "Build or implement a task in the repository. If `architect` just finalized a "
         "design, it is provided to this sub-session as the authoritative spec "
-        "automatically. Use `code` directly (without `architect`) only for localized "
-        "changes or bug fixes."
+        "automatically. Use `code` directly (without `architect`) for localized "
+        "changes or bug fixes, and also for a new feature when the user explicitly "
+        "chose to skip architecture — in that case the code harness explores, calls "
+        "`plan` once, and implements from that pinned plan tracker."
     )
     parameters = {
         "type": "object",
@@ -125,6 +129,16 @@ class CodeTool(Tool):
         )
         ctx.emit("dispatch", {"harness": "code", "task": args["task"], "seeded": seed is not None})
         result = runner.run(args["task"])
+        # best-effort background KG refresh so the graph reflects the edits the
+        # code session just made. Non-blocking (subprocess), and a stale graph
+        # is never a failure — swallow everything.
+        if ctx.kg is not None:
+            try:
+                proc = ctx.kg.ensure_background()
+                if proc is not None:
+                    ctx.emit("dispatch_status", {"message": "kg: refreshing in background after code session"})
+            except Exception:
+                pass  # best-effort; a stale graph is not a failure
         # consume the bundle once — a later code call is a fresh task, not a re-build
         ctx.last_bundle = None
         return ToolResult(

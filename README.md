@@ -199,7 +199,10 @@ investigation that lands its findings in the knowledge graph). See
   you're pointed at, and the OpenRouter catalog, merged and deduped. Unreachable
   or unconfigured sources are skipped with a note, not an error.
 - Named roles in `models.json`: `default`, `architect`, `judge`, `compactor`,
-  `vision` — so the critic and the compactor are never the model under test.
+  `vision`, `kg` — so the critic and the compactor are never the model under test.
+- `kg` names the model that reads docs/papers into the graph. It wants context
+  (chunks are packed to 60k tokens) and clean JSON, not brilliance — code never
+  reaches it, so a cheap mid-tier model is the right choice here.
 
 **Safety & control**
 - Permission brokers: interactive UI, console prompt, auto-approve (`--yes`), and
@@ -278,8 +281,8 @@ the role aliases. Override per-run with `--models-json`.
 |---|---|
 | `OPENROUTER_API_KEY` | enables OpenRouter models + catalog discovery |
 | `OLLAMA_API_KEY` | enables Ollama Cloud |
-| `OX_KG_BACKEND` | LLM backend for semantic extraction of docs/papers/images; `none` disables. Auto-detected from provider keys when unset |
-| `OX_KG_MODEL` | model for that extraction |
+| `OX_KG_BACKEND` | override the `kg` alias with a raw `graphify.llm` backend, which then uses graphify's own env vars for URL and key; `none` disables semantic extraction entirely |
+| `OX_KG_MODEL` | model for that extraction — wins over the `kg` alias's model, and applies to either path |
 | `OX_PYTHON` | which Python the TUI spawns `ox serve` with |
 | `OX_URL` | dev only — the live `ox arch` port that `arch-ui`'s Vite dev server proxies to |
 

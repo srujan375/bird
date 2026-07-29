@@ -36,6 +36,11 @@ function Gate({ req, reason, onRespond }: {
   return (
     <div className="gate" data-kind={req.kind}>
       <h4>{finalize ? "Finalize this architecture?" : "Approve the top level?"}</h4>
+
+      {/* Everything the ruling is *about* scrolls; the ruling itself does not.
+          A finalize summary can run longer than the rail is tall, and a button
+          you cannot reach is the same as no button at all. */}
+      <div className="gate-body">
       <p>{req.summary}</p>
 
       {blockers.length > 0 && (
@@ -65,6 +70,7 @@ function Gate({ req, reason, onRespond }: {
       {finalize && (req.artifacts?.length ?? 0) > 0 && (
         <p className="mono faint">writes: {req.artifacts!.join(", ")}</p>
       )}
+      </div>
 
       <div className="buttons">
         <button

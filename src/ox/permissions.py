@@ -69,11 +69,11 @@ def permission_payload(name: str, args: dict[str, Any], ctx: ToolContext) -> dic
     if name == "edit":
         return {
             "kind": "edit",
-            "file": args.get("path", "?"),
+            "file": args.get("path") or "?",
             "lines": _diff_lines(args.get("old_text", ""), args.get("new_text", "")),
         }
     if name == "write":
-        path = args.get("path", "?")
+        path = args.get("path") or "?"
         content = args.get("content", "")
         old = ""
         with contextlib.suppress(Exception):
@@ -86,7 +86,7 @@ def permission_payload(name: str, args: dict[str, Any], ctx: ToolContext) -> dic
             "new_file": not old,
             "lines": _diff_lines(old, content),
         }
-    return {"kind": "bash", "cmd": args.get("command", name)}
+    return {"kind": "bash", "cmd": args.get("command") or name}
 
 
 # ------------------------------------------------------------------- wrapper
@@ -243,6 +243,11 @@ class ConsoleBroker:
         kind = payload.get("kind", "?")
         if kind == "bash":
             print(f"\n  ┌ bash: {payload.get('cmd', '')}", file=self.out)
+            print("  └", file=self.out)
+            return
+        if kind == "read_outside_repo":
+            print(f"\n  ┌ read (outside repo) {payload.get('path', '')}", file=self.out)
+            print(f"  │ requested by {payload.get('tool', '?')}", file=self.out)
             print("  └", file=self.out)
             return
         label = "write (new file)" if payload.get("new_file") else kind

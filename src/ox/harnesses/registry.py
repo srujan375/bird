@@ -34,6 +34,10 @@ class HarnessDef:
     # arch opens a browser and blocks on human gates; a harness with this set
     # cannot be dispatched headless without silently auto-approving those gates
     interactive: bool = False
+    # `done` refuses to close over files edited since the last passing check.
+    # Only for harnesses that edit the repo and can run its tests — arch and
+    # lead mutate through other means and have nothing to check.
+    require_verification: bool = False
 
 
 def _code_def() -> HarnessDef:
@@ -44,6 +48,7 @@ def _code_def() -> HarnessDef:
         tools=code_harness_tools,
         instructions_path=INSTRUCTIONS_PATH,
         default_model="default",
+        require_verification=True,
     )
 
 
@@ -122,6 +127,13 @@ def build_runner(
     d = get(name)
     resolved = tools if tools is not None else d.tools(with_kg=with_kg, with_web=with_web)
     resolved = gate_tools(resolved, ctx.broker)
+    # the ledger is a property of the harness, and starts empty: a ctx forked
+    # from a parent session (lead -> code) would otherwise inherit — by
+    # reference — whatever the parent had already edited
+    ctx.require_verification = d.require_verification
+    ctx.unverified_paths = []
+    ctx.last_verify = None
+    ctx.done_blocked_once = False
     return Runner(
         spec=spec,
         client=client,

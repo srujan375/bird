@@ -9,7 +9,7 @@ from typing import Any
 
 from ..llm.registry import RegistryError
 from ..llm.types import ContentPart, Message
-from .base import Tool, ToolContext, ToolError, ToolResult
+from .base import Tool, ToolContext, ToolError, ToolResult, gate_outside_repo_read
 
 MAX_READ_CHARS = 24_000
 
@@ -53,7 +53,7 @@ _TEXT_BOMS = [
 ]
 
 
-def _detect_image_mime(path: Path) -> tuple[str | None, bool]:
+def detect_image_mime(path: Path) -> tuple[str | None, bool]:
     """Detect whether a file is a raster image.
 
     Returns ``(mime, is_raster_image)``. `is_raster_image` is True only for
@@ -85,6 +85,32 @@ def _detect_image_mime(path: Path) -> tuple[str | None, bool]:
                 continue
             return sig_mime, True
     return mime, False
+
+
+def _not_found(path_str: str, resolved: Path) -> ToolError:
+    """A 'file not found' that says where the tool actually looked.
+
+    `path_str` is what the model passed; `resolved` is where that landed after
+    normalization. When the two disagree the difference is the whole diagnosis,
+    so show it. macOS screenshot temp dirs get a note of their own: those files
+    are reaped when the screenshot preview dismisses, so the path can be
+    perfectly correct and the file still gone by the time approval comes back.
+    """
+    detail = f"file not found: {path_str}"
+    if str(resolved) != path_str:
+        detail += f" (looked in {resolved})"
+    parent = resolved.parent
+    if parent.is_dir():
+        if "screencaptureui" in str(resolved) or "/TemporaryItems/" in str(resolved):
+            detail += (
+                " — the directory exists but the file is gone. macOS deletes "
+                "screenshot temp files when the preview thumbnail dismisses; "
+                "ask the user to save the image somewhere durable and re-send "
+                "the path."
+            )
+    else:
+        detail += f" — the directory {parent} does not exist either"
+    return ToolError(detail)
 
 
 def _looks_binary(path: Path) -> bool:
@@ -122,13 +148,14 @@ class ReadTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         p = ctx.resolve_path(args["path"])
+        gate_outside_repo_read(ctx, args["path"], p, self.name)
         if not p.is_file():
-            raise ToolError(f"file not found: {args['path']}")
+            raise _not_found(args["path"], p)
 
         # Image detection: a raster image file is garbled if read as text, so
         # nudge the model to read_image instead. SVG is excluded (it is XML
         # text) and falls through to normal reading below.
-        mime, is_raster = _detect_image_mime(p)
+        mime, is_raster = detect_image_mime(p)
         if is_raster:
             return ToolResult(
                 output=(
@@ -209,12 +236,13 @@ class ReadImageTool(Tool):
         path_str = args["path"]
         question = args.get("question") or "describe this image in detail"
         p = ctx.resolve_path(path_str)
+        gate_outside_repo_read(ctx, path_str, p, self.name)
         if not p.is_file():
-            raise ToolError(f"file not found: {path_str}")
+            raise _not_found(path_str, p)
 
         # SVG is a vector format — vision models can't process it and it is
         # XML text, so the model should use `read` instead.
-        mime, is_raster = _detect_image_mime(p)
+        mime, is_raster = detect_image_mime(p)
         if mime == "image/svg+xml":
             raise ToolError(
                 "SVG is a vector format — use read to see the XML source, or "
@@ -272,11 +300,14 @@ class ReadImageTool(Tool):
             msg = str(e)
             if "image" in msg.lower() or "400" in msg:
                 raise ToolError(
-                    "the configured vision model does not support inline image "
-                    "data — check that the 'vision' alias points to a "
-                    "vision-capable model"
+                    f"the 'vision' alias points at {vision_spec.spec}, which "
+                    f"rejected inline image data — it is probably not a "
+                    f"vision-capable model. Tell the user to repoint the "
+                    f"'vision' alias in models.json at a multimodal model."
                 ) from e
-            raise ToolError(f"vision model call failed: {e}") from e
+            raise ToolError(
+                f"vision model call failed ({vision_spec.spec}): {e}"
+            ) from e
 
         description = resp.message.content or ""
         return ToolResult(
@@ -309,9 +340,9 @@ class EditTool(Tool):
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        p = ctx.resolve_path(args["path"])
+        p = ctx.resolve_repo_path(args["path"])
         if not p.is_file():
-            raise ToolError(f"file not found: {args['path']}")
+            raise _not_found(args["path"], p)
         text = p.read_text(encoding="utf-8")
         old, new = args["old_text"], args["new_text"]
         if old == new:
@@ -349,7 +380,7 @@ class WriteTool(Tool):
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        p = ctx.resolve_path(args["path"])
+        p = ctx.resolve_repo_path(args["path"])
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(args["content"], encoding="utf-8")
         return ToolResult(

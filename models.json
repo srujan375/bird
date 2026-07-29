@@ -46,6 +46,16 @@
       "supports_tools": true,
       "constrained_decoding": false
     },
+    "ollama:kimi-k3": {
+      "context_window": 900000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:gemma4:31b": {
+      "context_window": 200000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
     "openrouter:anthropic/claude-sonnet-5": {
       "context_window": 200000,
       "supports_tools": true,
@@ -81,7 +91,8 @@
     "default": "ollama:glm-5.2",
     "architect": "ollama:glm-5.2",
     "judge": "ollama:glm-5.2",
-    "compactor": "ollama:glm-5.2",
-    "vision": "ollama:glm-5.2"
+    "compactor": "ollama:gemma4:31b",
+    "vision": "ollama:kimi-k2.7-code",
+    "kg": "ollama:kimi-k2.7-code"
   }
 }

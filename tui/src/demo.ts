@@ -17,6 +17,12 @@ const PERMIT_EDIT: PermissionSpec = {
 	],
 };
 
+const PERMIT_READ: PermissionSpec = {
+	kind: "read_outside_repo",
+	tool: "read",
+	path: "/etc/hosts",
+};
+
 interface DemoDeps {
 	tui: TUI;
 	chat: Container;
@@ -37,7 +43,12 @@ export function runDemoTurn({ tui, chat, thinking, addToChat, endTurn }: DemoDep
 				clearInterval(timer);
 				msg.setText(REPLY_TEXT, false);
 				const card = new PermissionCard(PERMIT_EDIT);
-				card.onResolve = () => endTurn();
+				card.onResolve = () => {
+					const readCard = new PermissionCard(PERMIT_READ);
+					readCard.onResolve = () => endTurn();
+					addToChat(readCard);
+					tui.setFocus(readCard);
+				};
 				addToChat(card);
 				tui.setFocus(card);
 			} else {

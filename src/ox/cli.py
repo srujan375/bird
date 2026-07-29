@@ -95,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     kg_cmd.add_argument("question", nargs="?", help="question (for query)")
     kg_cmd.add_argument("--repo", default=".")
     kg_cmd.add_argument("--budget", type=int, default=2000)
+    kg_cmd.add_argument("--models-json", default=None, help="path to a models.json override")
 
     args = parser.parse_args(argv)
     if args.command == "kg":
@@ -141,7 +142,7 @@ def _from_arch_seed(args):
 
 
 def _kg_main(args) -> int:
-    kg = KG(Path(args.repo))
+    kg = KG(Path(args.repo), models_json=args.models_json)
     if args.action == "status":
         print(f"store: {kg.out_dir}")
         print(f"ready: {kg.is_ready()}")
@@ -189,7 +190,7 @@ def _setup(args):
     kg = None
     build_proc = None
     if not args.no_kg:
-        kg = KG(repo_root)
+        kg = KG(repo_root, models_json=args.models_json)
         build_proc = kg.ensure_background()  # non-blocking (decision #9)
     return registry, spec, kg, build_proc, run_id, run_dir
 
@@ -263,6 +264,16 @@ def _code_main(args) -> int:
         if build_proc is not None:
             print("kg: building in background; harness starts now")
         result = runner.run(args.task)
+
+    # best-effort background KG refresh after the run; non-blocking and never a
+    # failure — a stale graph must not affect the exit code.
+    if kg is not None:
+        try:
+            proc = kg.ensure_background()
+            if proc is not None:
+                print("kg: refreshing in background")
+        except Exception:
+            pass
 
     print(f"\n[{result.status}] {result.summary}")
     print(

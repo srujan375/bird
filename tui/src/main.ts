@@ -248,6 +248,13 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 				endDispatch(!data.is_error, summary);
 			} else if (event === "tool_result" && data.is_error) {
 				addToChat(new Notice(`✕ ${data.name} failed`, "danger"));
+			} else if (event === "attachment_saved") {
+				// the image was copied out of its temp path before anything could
+				// reap it; say so, since the model will cite the copy's path
+				const kb = Math.max(1, Math.round(Number(data.size ?? 0) / 1024));
+				addToChat(new Notice(`📎 saved ${data.path} (${kb} KB)`, "accent"));
+			} else if (event === "attachment_failed") {
+				addToChat(new Notice(`⚠ could not save attachment: ${data.error}`, "danger"));
 			} else if (event === "kg_ready_notice") {
 				addToChat(new Notice("✓ knowledge graph ready — kg_query is live", "success"));
 			} else if (event === "bash_rejected") {
@@ -257,7 +264,11 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 		}
 		case "permission_request": {
 			const spec: PermissionSpec =
-				msg.kind === "bash" ? { kind: "bash", cmd: msg.cmd } : { kind: msg.kind, file: msg.file, lines: msg.lines };
+				msg.kind === "bash"
+					? { kind: "bash", cmd: msg.cmd }
+					: msg.kind === "read_outside_repo"
+						? { kind: "read_outside_repo", tool: msg.tool, path: msg.path }
+						: { kind: msg.kind, file: msg.file, lines: msg.lines };
 			// auto-approve mode: skip the card and approve immediately, like
 			// Claude Code's "auto-accept edits" (Shift+Tab). Scoped to edit/write
 			// on purpose — bash is gated too now, and it can write anywhere, so
@@ -436,6 +447,24 @@ tui.addInputListener((data) => {
 		addToChat(new Notice(hint.getAutoApprove() ? "⇧⇥ auto-approve ON — edits applied without asking" : "⇧⇥ auto-approve OFF — each edit asks", hint.getAutoApprove() ? "accent" : "muted"));
 		tui.requestRender();
 		return { consume: true };
+	}
+});
+
+// pi-tui renders from a timer callback, so an exception thrown by any
+// component's render() unwinds straight out of the event loop and takes the
+// process — and the session — with it. A bad frame is not worth losing a
+// conversation over: surface it in the transcript and keep running. Kept last
+// so it can't mask a startup failure, which should still exit loudly.
+process.on("uncaughtException", (err: Error) => {
+	try {
+		addToChat(new Notice(`⚠ internal error: ${err?.message ?? err}`, "danger"));
+		tui.requestRender();
+	} catch {
+		// the TUI itself is wedged — fall back to dying visibly rather than
+		// spinning in a broken render loop
+		tui.stop();
+		console.error(err);
+		process.exit(1);
 	}
 });
 

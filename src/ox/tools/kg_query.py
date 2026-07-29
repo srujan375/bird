@@ -22,9 +22,10 @@ STILL_BUILDING = (
 class KgQueryTool(Tool):
     name = "kg_query"
     description = (
-        "Ask the repository knowledge graph a question about code structure: where "
-        "something is defined, what calls/imports it, how modules relate. Faster and "
-        "more precise than searching with bash."
+        "Ask the repo knowledge graph about code structure: where something is defined, "
+        "what calls/imports it, how modules relate. Faster and more precise than bash "
+        "search. Results end with [path:line] — read that path, don't guess it. A file "
+        "path works as a question too."
     )
     parameters = {
         "type": "object",

@@ -2,6 +2,7 @@
 dispatch tools, and one real end-to-end (lead -> architect -> code)."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,6 +61,26 @@ def test_build_runner_applies_def_tuning():
     assert r.instructions_path == registry.get("arch").instructions_path
     assert "brief" in r.mutating_tools
     assert {t for t in r.tools} >= {"brief", "component", "done"}
+
+
+def test_verification_gate_is_per_harness_and_starts_empty():
+    """Only code edits the repo and runs its tests, so only code is gated. The
+    ledger is reset at construction: a ctx forked from a lead session would
+    otherwise arrive carrying the parent's edits (and the same list object)."""
+    assert registry.get("code").require_verification is True
+    assert registry.get("arch").require_verification is False
+    assert registry.get("lead").require_verification is False
+
+    parent = ToolContext(repo_root=".", registry=REG)
+    parent.unverified_paths.append("stale.py")
+    parent.last_verify = {"command": "pytest", "exit_code": 0}
+    child = replace(parent, plan=None)  # what the lead's dispatch does
+    registry.build_runner("code", spec=SPEC, client=None, registry=REG, ctx=child)
+
+    assert child.require_verification is True
+    assert child.unverified_paths == []
+    assert child.last_verify is None
+    assert parent.unverified_paths == ["stale.py"]  # not shared by reference
 
 
 def test_unknown_harness_raises():
@@ -156,6 +177,35 @@ def test_code_tool_seeds_and_forks_ctx(tmp_path, monkeypatch):
     assert ctx.last_bundle is None                   # bundle consumed once
     assert "[done] built" in res.output
     assert res.details["seeded"] is True
+
+
+def test_code_tool_triggers_background_kg_update(tmp_path, monkeypatch):
+    """After a code sub-session finishes, a best-effort background KG refresh is
+    kicked off (non-blocking). It must run when kg is on and be skipped when off."""
+    calls = {"ensure_background": 0}
+
+    def fake_build_runner(name, *, spec, client, registry, ctx, **kw):
+        return SimpleNamespace(run=lambda task: SimpleNamespace(
+            status="done", summary="built", turns=1))
+
+    monkeypatch.setattr("ox.harnesses.registry.build_runner", fake_build_runner)
+
+    fake_proc = SimpleNamespace(pid=123)
+    fake_kg = SimpleNamespace(ensure_background=lambda: (calls.__setitem__("ensure_background", calls["ensure_background"] + 1), fake_proc)[1])
+    emitted = []
+    ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path,
+                      kg=fake_kg, record=lambda et, data: emitted.append((et, data)))
+    res = CodeTool().run({"task": "build it"}, ctx)
+
+    assert calls["ensure_background"] == 1
+    assert res.output == "[done] built"
+    assert any(et == "dispatch_status" for et, _ in emitted)
+
+    # kg off → ensure_background is never touched
+    calls["ensure_background"] = 0
+    ctx_none = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path, kg=None)
+    CodeTool().run({"task": "build it"}, ctx_none)
+    assert calls["ensure_background"] == 0
 
 
 # ------------------------------------------------------------- architect tool
@@ -269,6 +319,39 @@ def test_arch_headless_reaches_finalized(tmp_path):
     assert arch.state.phase == "finalized"
     assert (run_dir / "bundle" / "architecture.md").is_file()
     assert (run_dir / "bundle" / "architecture.json").is_file()
+
+
+# ---------------------------------------------------------- skip-question policy
+
+def test_lead_instructions_describe_skip_question():
+    """The lead's routing policy lives in instructions.md, so the test reads that
+    file (via the same path the registry exposes) and asserts the skip-question
+    language is present: the lead asks the user before calling `architect`, and
+    offers a skip-to-code path. Off the network and off the dev KG, like the
+    rest of this file."""
+    lead = registry.get("lead")
+    text = lead.instructions_path.read_text(encoding="utf-8")
+
+    # the lead must ask the user (plain text, no tool call) before architect
+    assert "ask the user" in text.lower()
+    assert "plain text" in text.lower()
+    # both paths are named
+    assert "workbench" in text.lower()
+    assert "skip" in text.lower() and "code" in text.lower()
+    # the skip path calls code directly without architect
+    assert "do not call `architect`" in text.lower() or "do not call architect" in text.lower()
+    # the rules section sanctions the skip as an exception, not a violation
+    assert "exception" in text.lower()
+
+
+def test_code_tool_description_mentions_skip_path():
+    """CodeTool.description must reflect that it can be called directly for a new
+    feature when the user explicitly skips architecture."""
+    desc = CodeTool.description.lower()
+    assert "skip" in desc
+    assert "architecture" in desc
+    # and it should still cover the ordinary localized-change case
+    assert "localized" in desc or "bug fix" in desc
 
 
 # ------------------------------------------------------------- end to end

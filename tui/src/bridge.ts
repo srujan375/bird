@@ -14,6 +14,7 @@ export type ServerMessage =
 	| ({ type: "permission_request"; id: number } & (
 			| { kind: "bash"; cmd: string }
 			| { kind: "edit" | "write"; file: string; lines: DiffLine[] }
+			| { kind: "read_outside_repo"; tool: string; path: string }
 	  ))
 	| { type: "state"; model: string }
 	| {

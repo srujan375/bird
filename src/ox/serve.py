@@ -43,6 +43,7 @@ import sys
 import threading
 from typing import Any, Callable, Protocol
 
+from .attachments import ingest_images
 from .engine.runner import repair_interrupted
 from .engine.session import save_messages
 from .llm.discovery import discover_models
@@ -203,7 +204,7 @@ class Server:
     # ---- inbound handlers (the Handlers protocol) ----
 
     def on_user_input(self, text: str) -> None:
-        self._start_turn(text)
+        self._start_turn(self._ingest(text))
 
     def on_permission(self, req_id: int, approved: bool, feedback: str) -> None:
         self.broker.resolve(req_id, approved, feedback)
@@ -235,6 +236,25 @@ class Server:
         return {"ok": True, **(result or {})}
 
     # ---- session logic ----
+
+    def _ingest(self, text: str) -> str:
+        """Copy any image the user just named into the session, and point the
+        text at the copy. Runs on the transport thread, before the turn starts:
+        a screenshot's temp file has to be captured while it still exists, and
+        by the time the worker thread is asking for approval it may not."""
+        run_dir = getattr(self.repl.recorder, "run_dir", None)
+        try:
+            rewritten, found = ingest_images(text, run_dir, self.repl.runner.ctx.repo_root)
+        except Exception as e:  # ingestion is a convenience; never lose the turn
+            self._emit("harness_event", event="attachment_failed", data={"error": str(e)})
+            return text
+        for a in found:
+            self._emit(
+                "harness_event",
+                event="attachment_saved",
+                data={"path": a.path, "size": a.size, "original": a.original},
+            )
+        return rewritten
 
     def _start_turn(self, text: str) -> None:
         if self.worker and self.worker.is_alive():

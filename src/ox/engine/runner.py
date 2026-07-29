@@ -353,6 +353,10 @@ class Runner:
                         "file is already in the conversation above; do not read it again]"
                     )
                     self.ctx.emit("read_deduped", {"turn": turn, "args": tc.arguments_json})
+                # stamp the verification ledger before `done` is reached below:
+                # a turn that edits and then runs the tests must count both, in
+                # the order the model made the calls
+                self.ctx.note_tool_result(tc.name, result)
                 self.ctx.emit(
                     "tool_result",
                     {

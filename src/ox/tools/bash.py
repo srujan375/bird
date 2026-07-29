@@ -18,20 +18,46 @@ from .base import Tool, ToolContext, ToolError, ToolResult
 TIMEOUT_SECONDS = 120
 
 SEARCH_COMMANDS = {"rg", "grep", "find", "ls", "cat", "head", "tail", "wc", "file", "tree", "sort", "uniq", "cut", "awk", "sed", "xargs", "dirname", "basename", "echo", "which", "cd", "pwd"}
-LINT_COMMANDS = {"ruff", "flake8", "mypy", "pylint", "eslint", "tsc", "black", "isort"}
-TEST_COMMANDS = {"pytest", "tox"}
+LINT_COMMANDS = {"ruff", "flake8", "mypy", "pylint", "eslint", "tsc", "black", "isort", "pyright", "biome"}
+TEST_COMMANDS = {"pytest", "tox", "vitest", "jest"}
 GIT_READ_SUBCOMMANDS = {"status", "log", "diff", "show", "branch", "rev-parse", "ls-files", "blame", "grep", "remote", "tag", "describe", "shortlog"}
-PYTHON_MODULE_ALLOW = {"pytest", "unittest", "json.tool", "py_compile"}
+PYTHON_MODULE_ALLOW = {"pytest", "unittest", "json.tool", "py_compile", "compileall", "mypy", "ruff", "flake8", "pylint", "pyflakes"}
 NPM_LIKE = {"npm", "pnpm", "yarn"}
-MAKE_TARGETS = {"test", "tests", "lint", "check"}
-# sed/awk/xargs can write or execute; only their read-only usage is intended.
-WRITE_FLAGS = {"sed": {"-i"}, "xargs": set()}
+MAKE_TARGETS = {"test", "tests", "lint", "check", "typecheck", "build", "ci", "verify"}
+
+# `uv run pytest`, `npx tsc`, `poetry run mypy` — the prefix is not the command.
+# These are peeled off and what they actually run is checked instead, so
+# allowing them widens nothing: `uv run python evil.py` still lands on `python`
+# with no -m and is rejected exactly as `python evil.py` is.
+DELEGATING_PREFIXES = {
+    ("uv", "run"), ("uvx",), ("poetry", "run"), ("pipenv", "run"),
+    ("npx",), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "dlx"),
+}
+# Script runners: what follows is a package.json/pyproject script name, not a
+# command, so there is nothing to delegate to — the name is matched by prefix.
+SCRIPT_RUNNERS = {
+    ("npm", "run"), ("pnpm", "run"), ("yarn", "run"),
+    ("hatch", "run"), ("pdm", "run"), ("rye", "run"),
+}
+SCRIPT_PREFIXES = ("test", "lint", "check", "typecheck", "types", "build", "compile", "e2e", "unit", "integration", "ci", "verify")
+
+# Linters that *check* (vs. black/isort, which rewrite): only these count as
+# verification for `done`. A formatter run is not evidence the change works.
+CHECK_LINTERS = {"ruff", "flake8", "mypy", "pylint", "eslint", "tsc", "pyright", "biome"}
+FORMAT_SUBCOMMANDS = {"format", "fmt"}  # `ruff format` reformats; `ruff check` checks
+
+# Commands in the search set that can still write or execute. Only their
+# read-only use is intended — bash is not a way around edit/write, which is
+# where the permission broker sees a change before it lands.
+FIND_WRITE_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf"}
+XARGS_VALUE_FLAGS = {"-n", "-I", "-i", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--replace", "--max-procs", "--arg-file", "--delimiter"}
 
 CATEGORY_HELP = (
     "Allowed command categories: read-only search (rg, grep, find, ls, cat, head, tail, "
-    "wc, tree, cd, pwd), test runners (pytest, python -m pytest, npm test, go test, "
-    "cargo test, make test), linters (ruff, mypy, flake8, eslint), and git reads "
-    "(status, log, diff, show, branch, blame). Use the edit/write tools to change files."
+    "wc, tree, cd, pwd), test runners (pytest, python -m pytest, npm test/npm run test, "
+    "go test, cargo test, make test, prefixed with uv run / poetry run / npx if needed), "
+    "linters and type checks (ruff, mypy, flake8, eslint, tsc), and git reads (status, "
+    "log, diff, show, branch, blame). Use the edit/write tools to change files."
 )
 
 
@@ -85,55 +111,141 @@ def _split_unquoted(command: str) -> tuple[list[str], str]:
     return segments, "".join(bare)
 
 
-def check_command(command: str, categories: tuple[str, ...]) -> str | None:
-    """Return None if allowed, else a rejection reason."""
-    segments, bare = _split_unquoted(command)
-    if re.search(r"(?<!\d)>{1,2}|<\(", bare):
-        return "output redirection is not allowed; use the write tool to create files"
-    for seg in segments:
+def _strip_runner_prefix(tokens: list[str]) -> list[str]:
+    """Peel a delegating runner prefix (`uv run`, `npx`, `poetry run`, ...) off
+    the front so the segment is judged by what it actually runs. Longest prefix
+    first, and any flags belonging to the runner are skipped (`npx -y tsc`)."""
+    for depth in (2, 1):
+        if len(tokens) <= depth:
+            continue
+        if tuple(t.rsplit("/", 1)[-1] for t in tokens[:depth]) in DELEGATING_PREFIXES:
+            rest = tokens[depth:]
+            while rest and rest[0].startswith("-"):
+                rest = rest[1:]
+            return rest
+    return tokens
+
+
+def _segment_tokens(command: str) -> tuple[list[list[str]], str | None]:
+    """Split a command line into normalized per-segment token lists: env
+    assignments and runner prefixes stripped, ready to judge. Returns
+    (segments, parse_error)."""
+    out: list[list[str]] = []
+    for seg in _split_unquoted(command)[0]:
         seg = seg.strip()
         if not seg:
             continue
         try:
             tokens = shlex.split(seg)
         except ValueError as e:
-            return f"cannot parse command segment {seg!r}: {e}"
-        if not tokens:
-            continue
+            return out, f"cannot parse command segment {seg!r}: {e}"
         # skip leading env assignments (FOO=bar cmd ...)
         while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
             tokens = tokens[1:]
-        if not tokens:
-            continue
-        head = tokens[0].rsplit("/", 1)[-1]
-        reason = _check_segment(head, tokens, categories)
+        tokens = _strip_runner_prefix(tokens)
+        if tokens:
+            out.append(tokens)
+    return out, None
+
+
+def check_command(command: str, categories: tuple[str, ...]) -> str | None:
+    """Return None if allowed, else a rejection reason."""
+    if re.search(r"(?<!\d)>{1,2}|<\(", _split_unquoted(command)[1]):
+        return "output redirection is not allowed; use the write tool to create files"
+    segments, parse_error = _segment_tokens(command)
+    if parse_error:
+        return parse_error
+    for tokens in segments:
+        reason = _check_segment(tokens[0].rsplit("/", 1)[-1], tokens, categories)
         if reason:
             return reason
     return None
 
 
+def _is_check_linter(head: str, tokens: list[str]) -> bool:
+    """A linter/type checker in checking mode — `ruff format` rewrites files and
+    proves nothing, so it does not count."""
+    return head in CHECK_LINTERS and not (len(tokens) >= 2 and tokens[1] in FORMAT_SUBCOMMANDS)
+
+
+def _is_check_segment(head: str, tokens: list[str]) -> bool:
+    """True when this segment runs the project's tests (the "test" category).
+
+    Shared by the allowlist and by `done`'s verification gate, so the two can
+    never disagree: a command the model is told to verify with is always a
+    command it is allowed to run.
+    """
+    if head in TEST_COMMANDS:
+        return True
+    if head in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in PYTHON_MODULE_ALLOW:
+        return True
+    if head in NPM_LIKE and len(tokens) >= 2 and tokens[1] == "test":
+        return True
+    if len(tokens) >= 3 and (head, tokens[1]) in SCRIPT_RUNNERS and tokens[2].startswith(SCRIPT_PREFIXES):
+        return True
+    if head == "go" and len(tokens) >= 2 and tokens[1] in {"test", "vet", "build"}:
+        return True
+    if head == "cargo" and len(tokens) >= 2 and tokens[1] in {"test", "check", "clippy"}:
+        return True
+    if head == "make" and len(tokens) >= 2 and tokens[1] in MAKE_TARGETS:
+        return True
+    return False
+
+
+def is_verification_command(command: str) -> bool:
+    """True when the command line checks the work — a test run, type check or
+    linter in any of its segments. `done` uses this to tell a session that
+    verified its change from one that only asserted it did."""
+    segments, parse_error = _segment_tokens(command)
+    if parse_error:
+        return False
+    for tokens in segments:
+        head = tokens[0].rsplit("/", 1)[-1]
+        if _is_check_segment(head, tokens) or _is_check_linter(head, tokens):
+            return True
+    return False
+
+
+def _search_write_reason(head: str, tokens: list[str]) -> str | None:
+    """Read-only search commands that were handed write or exec flags."""
+    if head == "sed" and any(t == "-i" or t.startswith("-i") and len(t) <= 4 for t in tokens[1:]):
+        return "sed -i edits files; use the edit tool instead"
+    if head == "find" and any(t in FIND_WRITE_FLAGS for t in tokens[1:]):
+        return (
+            "find -delete/-exec can delete files or run any command; search with "
+            "-name/-path and use the edit/write tools to change files"
+        )
+    return None
+
+
+def _strip_xargs_flags(tokens: list[str]) -> list[str]:
+    """Drop xargs' own flags so what it will execute is left at the front."""
+    i = 0
+    while i < len(tokens) and tokens[i].startswith("-"):
+        flag = tokens[i].split("=", 1)[0]
+        i += 1
+        # -n 5 / -I {} take a separate value; -n5 / -I{} carry it inline
+        if flag in XARGS_VALUE_FLAGS and len(flag) <= 2 and i < len(tokens):
+            i += 1
+    return tokens[i:]
+
+
 def _check_segment(head: str, tokens: list[str], categories: tuple[str, ...]) -> str | None:
     if "search" in categories and head in SEARCH_COMMANDS:
-        if head == "sed" and any(t == "-i" or t.startswith("-i") and len(t) <= 4 for t in tokens[1:]):
-            return "sed -i edits files; use the edit tool instead"
-        return None
+        # xargs executes whatever it is given — judge that, not xargs
+        if head == "xargs":
+            inner = _strip_runner_prefix(_strip_xargs_flags(tokens[1:]))
+            if not inner:
+                return None  # bare xargs runs echo
+            inner_head = inner[0].rsplit("/", 1)[-1]
+            if inner_head == "xargs":
+                return "nested xargs is not allowed"
+            return _check_segment(inner_head, inner, categories)
+        return _search_write_reason(head, tokens)
     if "lint" in categories and head in LINT_COMMANDS:
         return None
-    if "test" in categories:
-        if head in TEST_COMMANDS:
-            return None
-        if head in {"python", "python3"} and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] in PYTHON_MODULE_ALLOW:
-            return None
-        if head in NPM_LIKE and len(tokens) >= 2 and (
-            tokens[1] == "test" or (tokens[1] == "run" and len(tokens) >= 3 and tokens[2].startswith(("test", "lint")))
-        ):
-            return None
-        if head == "go" and len(tokens) >= 2 and tokens[1] in {"test", "vet", "build"}:
-            return None
-        if head == "cargo" and len(tokens) >= 2 and tokens[1] in {"test", "check", "clippy"}:
-            return None
-        if head == "make" and len(tokens) >= 2 and tokens[1] in MAKE_TARGETS:
-            return None
+    if "test" in categories and _is_check_segment(head, tokens):
+        return None
     if "git_read" in categories and head == "git":
         sub = next((t for t in tokens[1:] if not t.startswith("-")), "")
         if sub in GIT_READ_SUBCOMMANDS:

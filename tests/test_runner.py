@@ -378,3 +378,58 @@ def test_custom_mutating_tools_suppress_explore_nudge(repo, make_runner):
     r2 = make_runner(list(script), explore_nudge="[system notice] {n} CUSTOM")
     result2 = r2.run("look around")
     assert any("CUSTOM" in (m.content or "") for m in result2.messages)
+
+
+# --- verification ledger: the runner stamps it, `done` reads it ---
+
+def _gated(make_runner, script):
+    r = make_runner(script)
+    r.ctx.require_verification = True
+    return r
+
+
+def test_done_is_blocked_until_a_check_passes(make_runner):
+    """End to end through the runner: the model edits, calls done, gets told to
+    run a check, runs it, and only then finishes."""
+    script = [
+        assistant(calls=[tc("edit", {"path": "f.py", "old_text": "x = 1", "new_text": "x = 2"}, id="c1")]),
+        assistant(calls=[tc("done", {"summary": "changed x"}, id="c2")]),
+        assistant(calls=[tc("bash", {"command": "python -m pytest --version"}, id="c3")]),
+        assistant(calls=[tc("done", {"summary": "changed x"}, id="c4")]),
+    ]
+    r = _gated(make_runner, script)
+    result = r.run("bump x")
+
+    assert result.status == "done"
+    assert any(t == "done_blocked_unverified" for t, _ in r.events)
+    blocked = next(m for m in result.messages if m.tool_call_id == "c2")
+    assert "f.py" in blocked.content
+    assert r.ctx.unverified_paths == []  # the passing check cleared the ledger
+
+
+def test_editing_after_a_green_check_reopens_the_gate(make_runner):
+    script = [
+        assistant(calls=[tc("edit", {"path": "f.py", "old_text": "x = 1", "new_text": "x = 2"}, id="c1")]),
+        assistant(calls=[tc("bash", {"command": "python -m pytest --version"}, id="c2")]),
+        assistant(calls=[tc("edit", {"path": "f.py", "old_text": "x = 2", "new_text": "x = 3"}, id="c3")]),
+        assistant(calls=[tc("done", {"summary": "changed x"}, id="c4")]),
+        assistant(calls=[tc("bash", {"command": "python -m pytest --version"}, id="c5")]),
+        assistant(calls=[tc("done", {"summary": "changed x"}, id="c6")]),
+    ]
+    r = _gated(make_runner, script)
+    result = r.run("bump x twice")
+
+    assert result.status == "done"
+    blocked = next(m for m in result.messages if m.tool_call_id == "c4")
+    assert "ran BEFORE these edits" in blocked.content
+
+
+def test_ungated_harness_keeps_the_old_done(make_runner):
+    """require_verification off (lead, arch, library use) — unchanged behaviour."""
+    script = [
+        assistant(calls=[tc("edit", {"path": "f.py", "old_text": "x = 1", "new_text": "x = 2"}, id="c1")]),
+        assistant(calls=[tc("done", {"summary": "changed x"}, id="c2")]),
+    ]
+    r = make_runner(script)
+    assert r.run("bump x").status == "done"
+    assert not any(t == "done_blocked_unverified" for t, _ in r.events)

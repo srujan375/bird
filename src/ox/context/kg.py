@@ -2,10 +2,16 @@
 
 Wraps the `graphify` library (pip pkg `graphifyy`). Code = pure AST
 extraction, zero LLM, no API keys. Docs/papers/images additionally go
-through graphify's semantic (LLM) extraction when a backend is available:
-explicit via `OX_KG_BACKEND` (any name in `graphify.llm.BACKENDS`, or
-"none" to disable) or auto-detected from provider API keys in the
-environment — no key, no LLM, same AST-only graph as before. Storage is
+through graphify's semantic (LLM) extraction, aimed by the `kg` alias in
+models.json: ox's provider is pointed at whichever graphify backend speaks
+its wire protocol, so the graph is built by the same models the harness
+runs on. `OX_KG_BACKEND`/`OX_KG_MODEL` still override the alias and "none"
+disables it; with neither, we fall back to graphify's env-key
+autodetection, which recognizes only first-party keys (GEMINI_API_KEY,
+ANTHROPIC_API_KEY, ...). That fallback is why the alias exists: an ox
+configured entirely through OpenRouter/Ollama set none of those keys, so
+autodetection returned None and the LLM half of the graph silently never
+ran. Storage is
 per-branch under `.ox/kg/<branch-slug>/graphify-out/` so switching
 branches never corrupts the graph; `to_json(force=True)` overrides
 graphify's #479 shrink-guard, which is legitimate here because each branch
@@ -16,12 +22,18 @@ with any direct /graphify runs on the same repo.
 Query matching is fully deterministic (decision #8): tokenize, split
 camelCase/snake_case, singularize, fuzzy/substring match against the graph's
 own vocabulary, IDF-rank — no LLM in the expansion step. Zero hits return
-the nearest vocab tokens so a small model can self-correct.
+the nearest vocab tokens so a small model can self-correct. Both labels and
+file paths are indexed, ranking survives into the traversal (best-first,
+capped), and every result line carries a `file:line` location the read tool
+can take verbatim — the three things that made search look broken from the
+model's side.
 """
 
 from __future__ import annotations
 
 import difflib
+import heapq
+import itertools
 import json
 import math
 import os
@@ -31,6 +43,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Callable
 
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -45,9 +58,69 @@ STOPWORDS = frozenset(
 )
 NEAREST_ON_MISS = 10
 SEMANTIC_TEXT_CATEGORIES = ("document", "paper")
+KG_ALIAS = "kg"  # models.json role that names the semantic-extraction model
+# ox provider → the graphify backend that speaks its wire protocol. Every ox
+# provider is OpenAI-compatible, so "openai" is the right default for a
+# provider added to models.json later; only the URL and key differ, and both
+# are supplied from the registry rather than graphify's env lookups.
+GRAPHIFY_BACKEND_FOR_PROVIDER = {"ollama": "ollama", "openrouter": "openai"}
+
+# ---- retrieval shape ----
+# Seeds are the nodes the query itself matched; everything else is reached by
+# traversal. Three seeds was too few to carry the ranking (one ambiguous label
+# and the answer was already out), and the traversal that followed was
+# unranked and uncapped — a query on a common term returned a fifth of the
+# graph and the char budget then threw most of it away at random.
+SEED_NODES = 8
+MAX_RESULT_NODES = 60
 BFS_DEPTH = 3
 DFS_DEPTH = 6
-_DFS_HINTS = ("how does", "reach", "path", "flow", "depend", "chain", "trace", "lead")
+# How much of a node's score a neighbour inherits. DFS questions ("how does X
+# reach Y") are about distance, so they decay slower.
+BFS_DECAY = 0.5
+DFS_DECAY = 0.8
+# A node this connected is a fine answer but a terrible doorway: expanding one
+# 400-degree bundle node pulls in the whole repo.
+HUB_EXPAND_DEGREE = 40
+# A symbol *named* `session` beats one that merely lives in `session.py`.
+PATH_TOKEN_WEIGHT = 0.4
+MAX_LABEL_CHARS = 80  # labels can be whole docstrings
+
+# Traversal mode. These must be *phrases*: bare "path" used to be in this
+# list, so "where is the file path resolved" — an ordinary lookup — ran a
+# depth-6 DFS over the graph.
+_DFS_PHRASES = (
+    "how does", "how do", "how is", "end to end", "end-to-end",
+    "path from", "path to", "path between", "reach", "reaches",
+    "call chain", "chain of", "flows through", "flow through",
+    "depends on", "depend on", "downstream", "upstream",
+    "trace", "traces", "leads to", "lead to", "connected to",
+)
+_DFS_RE = re.compile("|".join(rf"\b{re.escape(p)}\b" for p in _DFS_PHRASES))
+
+# Build output is not source. A committed bundle is minified, so its symbols
+# are single letters that poison the vocabulary every query is matched
+# against, and its file node becomes the graph's highest-degree hub — any
+# traversal touching it inhales the repo. In this repo one such bundle was
+# 16% of all nodes and the top hub at degree 392. Filtered at extraction, so
+# the junk never enters the graph rather than being hidden at render time.
+ARTIFACT_DIRS = frozenset({
+    "node_modules", "dist", "build", "out", "target", "coverage", "htmlcov",
+    ".venv", "venv", "__pycache__", "site-packages", ".mypy_cache", ".pytest_cache",
+    ".ox", "graphify-out", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache",
+})
+ARTIFACT_NAMES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "uv.lock", "Cargo.lock", "composer.lock", "Gemfile.lock", "go.sum",
+})
+_MINIFIED_SUFFIXES = (".min.js", ".min.css", ".min.mjs", ".bundle.js")
+# vite/webpack content-hashed emits: index-Dv8sdJDj.js, main.4f3a2b1c.css
+_HASHED_ASSET_RE = re.compile(r"[.-][A-Za-z0-9_-]{8,}\.(js|mjs|cjs|css)$")
+# Naming rules miss a bundle emitted under a plain name; line length doesn't.
+_SNIFF_EXTS = frozenset({".js", ".mjs", ".cjs", ".css", ".ts", ".tsx", ".jsx"})
+_LONG_LINE_CHARS = 500
+_LONG_LINES_FOR_MINIFIED = 3
+_SNIFF_LINES = 50
 
 
 def tokenize(text: str) -> list[str]:
@@ -99,6 +172,63 @@ def _node_file(nd: dict) -> str:
     return head if "/" in head or head.endswith(".py") else ""
 
 
+def _short_label(nd: dict, nid, limit: int = MAX_LABEL_CHARS) -> str:
+    """Labels can be whole docstrings; keep the first line, clipped."""
+    return str(nd.get("label", nid)).splitlines()[0].strip()[:limit]
+
+
+_LINE_RE = re.compile(r"L(\d+)\s*$")
+
+
+def _node_loc(nd: dict) -> str:
+    """'src/ox/tools/base.py:64' — a location the `read` tool can take verbatim.
+
+    graphify puts the path in `source_file` and the line, *alone*, in
+    `source_location` ("L64"); some graphs use "path:L64". Query output used
+    to print `source_location or source_file`, and since source_location is
+    almost never empty the path was discarded on every line — the model got a
+    bare line number, guessed the file, and the read failed. Nodes with no
+    file at all (unresolved cross-file names, and the arch harness's
+    `design:<id>` seeds) keep their raw location: it is all they have.
+    """
+    f = _node_file(nd)
+    raw = str(nd.get("source_location") or "")
+    if not f:
+        return raw
+    m = _LINE_RE.search(raw)
+    if m:
+        return f"{f}:{m.group(1)}"
+    return f"{f} ({raw})" if raw else f
+
+
+def _looks_minified(path: Path) -> bool:
+    """A generated bundle wears its shape on the outside: a handful of lines,
+    each thousands of characters long. Cheap enough to run per candidate file
+    (one open, first 50 lines) and it catches bundles no naming rule would."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            head = list(itertools.islice(fh, _SNIFF_LINES))
+    except OSError:
+        return False
+    return sum(1 for line in head if len(line) > _LONG_LINE_CHARS) >= _LONG_LINES_FOR_MINIFIED
+
+
+def is_artifact(path: Path) -> bool:
+    """True for generated files — build output, lockfiles, minified bundles.
+
+    These are checked-in *products*, not source. Indexing them costs nothing
+    but noise: nobody asks the graph a question whose answer is `dist/`.
+    """
+    if set(path.parts) & ARTIFACT_DIRS:
+        return True
+    name = path.name
+    if name in ARTIFACT_NAMES or name.endswith(_MINIFIED_SUFFIXES):
+        return True
+    if _HASHED_ASSET_RE.search(name):
+        return True
+    return path.suffix in _SNIFF_EXTS and _looks_minified(path)
+
+
 def _norm_path(p: str) -> str:
     p = str(p).replace("\\", "/")
     while p.startswith("./"):
@@ -133,6 +263,21 @@ class KGStats:
     action: str  # "built" | "updated" | "fresh" | "seeded"
 
 
+@dataclass
+class SemanticBackend:
+    """A resolved target for semantic extraction: which graphify backend, and
+    (when it came from models.json) the provider URL and key to aim it at.
+
+    `base_url`/`api_key` are None for a backend named via `OX_KG_BACKEND`,
+    which keeps that path exactly as it was — graphify reads its own env vars.
+    """
+
+    name: str  # a key in graphify.llm.BACKENDS
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+
+
 class KG:
     def __init__(
         self,
@@ -140,10 +285,12 @@ class KG:
         store_dir: Path | None = None,
         semantic_backend: str | None = None,
         semantic_model: str | None = None,
+        models_json: str | Path | None = None,
     ):
         self.repo_root = Path(repo_root).resolve()
         self.semantic_backend = semantic_backend or os.environ.get("OX_KG_BACKEND") or None
         self.semantic_model = semantic_model or os.environ.get("OX_KG_MODEL") or None
+        self.models_json = str(models_json) if models_json else None
         self.out_dir = (
             Path(store_dir)
             if store_dir
@@ -154,6 +301,7 @@ class KG:
         self._building_marker = self.out_dir / ".building"
         self._graph_cache: nx.Graph | None = None
         self._graph_mtime: float | None = None
+        self._artifacts_cache: tuple[float | None, list[str]] | None = None
 
     # ---------- lifecycle ----------
 
@@ -166,7 +314,12 @@ class KG:
         from graphify.detect import detect_incremental
 
         result = detect_incremental(self.repo_root, manifest_path=str(self.manifest_path))
-        return result.get("new_total", 0) > 0 or bool(result.get("deleted_files"))
+        if result.get("new_total", 0) > 0 or bool(result.get("deleted_files")):
+            return True
+        # A graph built before the artifact filter is stale even when nothing
+        # changed — without this the prune in update() is never reached and
+        # the bundle survives until someone rebuilds by hand.
+        return bool(self._indexed_artifacts())
 
     def build(self) -> KGStats:
         """Full build: AST for code, semantic (LLM) for docs when a backend
@@ -214,19 +367,23 @@ class KG:
             changed.get(cat) for cat in (*SEMANTIC_TEXT_CATEGORIES, "image")
         )
         deleted = list(result.get("deleted_files", []))
-        if not changed_code and not changed_semantic and not deleted:
+        # A graph built before the artifact filter existed still carries the
+        # bundle; drop it here so the fix reaches existing repos.
+        stale_artifacts = self._indexed_artifacts()
+        if not changed_code and not changed_semantic and not deleted and not stale_artifacts:
             return KGStats(*self._counts(), action="fresh")
 
         extraction = self._merge_extractions(
             self._extract_code(changed_code, collect_files, extract),
             self._extract_semantic(changed),
         )
-        # prune_sources is ONLY deleted files; build_merge's replace-on-re-extract
-        # reconciles changed files (graphify #1344/#1178).
+        # prune_sources is deleted files plus anything the artifact filter now
+        # rejects; build_merge's replace-on-re-extract reconciles changed files
+        # (graphify #1344/#1178).
         G = build_merge(
             [extraction],
             graph_path=str(self.graph_path),
-            prune_sources=deleted or None,
+            prune_sources=(deleted + stale_artifacts) or None,
             root=str(self.repo_root),
         )
         communities = cluster(G)
@@ -285,11 +442,10 @@ class KG:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._building_marker.touch()  # visible immediately so is_ready() is False
         log = (self.out_dir / "build.log").open("w")
-        return subprocess.Popen(
-            [sys.executable, "-m", "ox.context.kg", str(self.repo_root), str(self.out_dir)],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
+        cmd = [sys.executable, "-m", "ox.context.kg", str(self.repo_root), str(self.out_dir)]
+        if self.models_json:
+            cmd.append(self.models_json)  # the child resolves `kg` itself
+        return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
     @staticmethod
     def _extract_code(code_entries: list[str], collect_files, extract) -> dict:
@@ -297,23 +453,119 @@ class KG:
         for entry in code_entries:
             p = Path(entry)
             files.extend(collect_files(p) if p.is_dir() else [p])
+        files = [f for f in files if not is_artifact(f)]
         if not files:
             return {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
         return extract(files)
+
+    def _indexed_artifacts(self) -> list[str]:
+        """Source files already in the graph that the artifact filter now
+        rejects, so an existing graph cleans itself on the next update rather
+        than carrying a minified bundle until someone thinks to rebuild.
+
+        Memoised against the graph's mtime: `is_stale` calls this on every
+        session start, and the minified sniff opens files.
+        """
+        if not self.graph_path.exists():
+            return []
+        try:
+            G = self._load_graph()
+        except (OSError, ValueError):
+            return []
+        if self._artifacts_cache is not None and self._artifacts_cache[0] == self._graph_mtime:
+            return self._artifacts_cache[1]
+        stale: set[str] = set()
+        for _, nd in G.nodes(data=True):
+            f = _node_file(nd)
+            if f and f not in stale and is_artifact(self.repo_root / f):
+                stale.add(f)
+        found = sorted(stale)
+        self._artifacts_cache = (self._graph_mtime, found)
+        return found
 
     @staticmethod
     def _empty_extraction() -> dict:
         return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
 
-    def _resolve_semantic_backend(self) -> str | None:
-        """Explicit backend name wins; "none"/"off" disables; unset falls back
-        to graphify's env-key autodetection (no key anywhere → None)."""
+    def _resolve_semantic_backend(self) -> SemanticBackend | None:
+        """Explicit backend name wins; "none"/"off" disables; otherwise the
+        `kg` alias in models.json decides, and only with no alias do we fall
+        back to graphify's env-key autodetection."""
         if self.semantic_backend:
             name = self.semantic_backend.lower()
-            return None if name in ("none", "off") else self.semantic_backend
+            if name in ("none", "off"):
+                return None
+            return SemanticBackend(name=self.semantic_backend, model=self.semantic_model)
+        from_alias = self._backend_from_alias()
+        if from_alias is not None:
+            return from_alias
         from graphify.llm import detect_backend
 
-        return detect_backend()
+        detected = detect_backend()
+        return SemanticBackend(name=detected, model=self.semantic_model) if detected else None
+
+    def _backend_from_alias(self) -> SemanticBackend | None:
+        """models.json's `kg` alias → a graphify backend aimed at ox's provider.
+
+        Returns None quietly when the alias is absent (nothing was asked for),
+        but says so on stderr when the alias is present and unusable: a missing
+        key silently degrading to an AST-only graph is the failure mode this
+        whole path exists to fix, so it must never look like success.
+        """
+        from ..llm.registry import Registry, RegistryError
+
+        try:
+            registry = Registry.load(self.models_json)
+        except (OSError, ValueError) as e:
+            print(f"[ox kg] cannot read models.json ({e}) — semantic extraction off", file=sys.stderr)
+            return None
+        if KG_ALIAS not in registry.aliases:
+            return None
+        try:
+            spec = registry.resolve(KG_ALIAS)
+        except RegistryError as e:
+            print(f"[ox kg] {e} — semantic extraction off", file=sys.stderr)
+            return None
+        if not spec.provider.api_key:
+            print(
+                f"[ox kg] '{KG_ALIAS}' alias is {spec.spec} but "
+                f"{spec.provider.api_key_env} is unset — building an AST-only graph",
+                file=sys.stderr,
+            )
+            return None
+        return SemanticBackend(
+            name=GRAPHIFY_BACKEND_FOR_PROVIDER.get(spec.provider.name, "openai"),
+            model=self.semantic_model or spec.model,  # OX_KG_MODEL still wins
+            api_key=spec.provider.api_key,
+            base_url=spec.provider.base_url,
+        )
+
+    @staticmethod
+    def _aim_backend(backend: SemanticBackend) -> bool:
+        """Point graphify's backend entry at ox's provider. False = don't send.
+
+        graphify captures each backend's base_url from the environment at
+        import time, so an ox provider URL can only reach it by being written
+        back into `BACKENDS` — setting OLLAMA_BASE_URL here would be read too
+        late. The corpus and the API key both travel to whatever that URL
+        names, so it goes through graphify's own exfiltration guard first, and
+        a rejected URL disables extraction rather than falling through to
+        graphify's default (localhost, or the wrong vendor entirely).
+        """
+        from graphify.llm import BACKENDS, provider_base_url_ok
+
+        if backend.name not in BACKENDS:
+            print(
+                f"[ox kg] no graphify backend named {backend.name!r} "
+                f"(known: {sorted(BACKENDS)}) — semantic extraction off",
+                file=sys.stderr,
+            )
+            return False
+        if backend.base_url:
+            if not provider_base_url_ok(backend.base_url, f"ox:{backend.name}"):
+                return False
+            BACKENDS[backend.name]["base_url"] = backend.base_url
+        return True
 
     def _extract_semantic(self, files_by_category: dict) -> dict:
         """Semantic (LLM) extraction for docs/papers/images via graphify's
@@ -324,8 +576,13 @@ class KG:
         the same content-hashed location the AST cache already uses (and that
         the /graphify skill shares), so it's branch-independent: unchanged
         docs are never re-extracted after a branch switch."""
-        entries = [f for cat in SEMANTIC_TEXT_CATEGORIES for f in files_by_category.get(cat, [])]
-        images = list(files_by_category.get("image", []))
+        entries = [
+            f
+            for cat in SEMANTIC_TEXT_CATEGORIES
+            for f in files_by_category.get(cat, [])
+            if not is_artifact(Path(f))
+        ]
+        images = [f for f in files_by_category.get("image", []) if not is_artifact(Path(f))]
         if not entries and not images:
             return self._empty_extraction()
         backend = self._resolve_semantic_backend()
@@ -334,7 +591,12 @@ class KG:
         from graphify.cache import check_semantic_cache, save_semantic_cache
         from graphify.llm import BACKENDS, extract_corpus_parallel
 
-        if BACKENDS.get(backend, {}).get("vision"):
+        if not self._aim_backend(backend):
+            return self._empty_extraction()
+        # Images ride along only where graphify will actually send pixels; on a
+        # text-only backend they'd render as bare path references, and a chunk
+        # the provider rejects takes its docs down with it.
+        if BACKENDS[backend.name].get("vision"):
             entries += images
         cached_nodes, cached_edges, cached_hyper, uncached = check_semantic_cache(
             entries, root=self.repo_root
@@ -345,8 +607,9 @@ class KG:
             # it completes; this final save just makes the result authoritative.
             new = extract_corpus_parallel(
                 uncached,
-                backend=backend,
-                model=self.semantic_model,
+                backend=backend.name,
+                api_key=backend.api_key,  # None → graphify falls back to its env key
+                model=backend.model,
                 root=self.repo_root,
             )
             save_semantic_cache(
@@ -394,18 +657,53 @@ class KG:
             self._graph_mtime = mtime
         return self._graph_cache
 
+    @staticmethod
+    def _vocabulary(G: nx.Graph) -> tuple[Counter[str], dict[str, set[str]], dict[str, set[str]]]:
+        """Document frequency plus per-node label and *path* tokens.
+
+        Paths are indexed because scoring ran on labels alone: a question
+        phrased as a file or directory ("what is in tools/files.py") could not
+        match anything, and two of the forty nodes labelled `.run()` were
+        indistinguishable to the ranker. Kept separate from label tokens so a
+        path match can be weighted below a name match.
+        """
+        df: Counter[str] = Counter()
+        node_tokens: dict[str, set[str]] = {}
+        path_tokens: dict[str, set[str]] = {}
+        for nid, nd in G.nodes(data=True):
+            toks = set(tokenize(str(nd.get("label", nid))))
+            ptoks = set(tokenize(_node_file(nd))) - toks
+            node_tokens[nid] = toks
+            path_tokens[nid] = ptoks
+            df.update(toks | ptoks)
+        return df, node_tokens, path_tokens
+
+    @staticmethod
+    def _scorer(
+        expanded: list[str],
+        df: Counter[str],
+        node_tokens: dict[str, set[str]],
+        path_tokens: dict[str, set[str]],
+        n_nodes: int,
+    ) -> Callable[[str], float]:
+        """IDF relevance of a node against the expanded query terms."""
+        idf = {t: math.log(n_nodes / (1 + df.get(t, 0))) + 1.0 for t in expanded}
+
+        def relevance(nid: str) -> float:
+            labels = node_tokens.get(nid) or ()
+            paths = path_tokens.get(nid) or ()
+            return sum(idf[t] for t in expanded if t in labels) + PATH_TOKEN_WEIGHT * sum(
+                idf[t] for t in expanded if t in paths
+            )
+
+        return relevance
+
     def query(self, question: str, budget: int = 2000) -> KGQueryResult:
         if not self.is_ready():
             raise KGError("knowledge graph is not ready")
         G = self._load_graph()
 
-        # vocabulary + document frequency over node labels
-        df: Counter[str] = Counter()
-        node_tokens: dict[str, set[str]] = {}
-        for nid, nd in G.nodes(data=True):
-            toks = set(tokenize(str(nd.get("label", nid))))
-            node_tokens[nid] = toks
-            df.update(toks)
+        df, node_tokens, path_tokens = self._vocabulary(G)
         n_nodes = max(G.number_of_nodes(), 1)
         vocab = set(df)
 
@@ -425,16 +723,11 @@ class KG:
                 mode="none",
             )
 
-        def idf(t: str) -> float:
-            return math.log(n_nodes / (1 + df.get(t, 0))) + 1.0
+        relevance = self._scorer(expanded, df, node_tokens, path_tokens, n_nodes)
 
-        scored = []
-        for nid, toks in node_tokens.items():
-            s = sum(idf(t) for t in expanded if t in toks)
-            if s > 0:
-                scored.append((s, str(nid)))
+        scored = [(s, str(nid)) for nid in node_tokens if (s := relevance(nid)) > 0]
         scored.sort(key=lambda x: (-x[0], x[1]))
-        starts = [nid for _, nid in scored[:3]]
+        starts = [nid for _, nid in scored[:SEED_NODES]]
         if not starts:
             nearest = self._nearest_vocab(question, vocab)
             return KGQueryResult(
@@ -447,21 +740,18 @@ class KG:
                 mode="none",
             )
 
-        mode = "dfs" if any(h in question.lower() for h in _DFS_HINTS) else "bfs"
-        sub_nodes, sub_edges = self._traverse(G, starts, mode)
-
-        def relevance(nid: str) -> float:
-            return sum(idf(t) for t in expanded if t in node_tokens.get(nid, set()))
+        mode = "dfs" if _DFS_RE.search(question.lower()) else "bfs"
+        sub_nodes, sub_edges = self._traverse(G, starts, mode, relevance, MAX_RESULT_NODES)
 
         lines = [
             f"[{mode.upper()} from: "
-            + ", ".join(str(G.nodes[n].get("label", n)) for n in starts)
+            + ", ".join(_short_label(G.nodes[n], n) for n in starts[:3])
             + f" | matched terms: {' '.join(expanded)} | {len(sub_nodes)} nodes]"
         ]
         for nid in sorted(sub_nodes, key=lambda n: (-relevance(n), str(n))):
             nd = G.nodes[nid]
-            loc = nd.get("source_location", "") or nd.get("source_file", "")
-            lines.append(f"NODE {nd.get('label', nid)}" + (f"  [{loc}]" if loc else ""))
+            loc = _node_loc(nd)
+            lines.append(f"NODE {_short_label(nd, nid)}" + (f"  [{loc}]" if loc else ""))
         for u, v in sub_edges:
             if u in sub_nodes and v in sub_nodes:
                 ed = G[u][v]
@@ -469,8 +759,13 @@ class KG:
                     ed = next(iter(ed.values()), {})
                 rel = ed.get("relation", "related")
                 lines.append(
-                    f"EDGE {G.nodes[u].get('label', u)} --{rel}--> {G.nodes[v].get('label', v)}"
+                    f"EDGE {_short_label(G.nodes[u], u)} --{rel}--> {_short_label(G.nodes[v], v)}"
                 )
+        if len(sub_nodes) >= MAX_RESULT_NODES:
+            lines.append(
+                f"[capped at {MAX_RESULT_NODES} highest-scoring nodes — ask a narrower "
+                "question if the answer is not here]"
+            )
 
         text = "\n".join(lines)
         char_budget = budget * 4
@@ -483,8 +778,7 @@ class KG:
         most symbols plus the highest-degree hub nodes — the pre-computed
         answer to the 'what is this codebase?' query every session starts with."""
         def short_label(nd: dict, nid) -> str:
-            # labels can be whole docstrings; keep the first line, tightly
-            return str(nd.get("label", nid)).splitlines()[0].strip()[:48]
+            return _short_label(nd, nid, 48)  # tighter than query output
 
         G = self._load_graph()
         by_file: dict[str, set[str]] = {}
@@ -611,34 +905,52 @@ class KG:
 
     @staticmethod
     def _traverse(
-        G: nx.Graph, starts: list[str], mode: str
+        G: nx.Graph,
+        starts: list[str],
+        mode: str,
+        relevance: Callable[[str], float] | None = None,
+        limit: int = MAX_RESULT_NODES,
     ) -> tuple[set[str], list[tuple[str, str]]]:
+        """Best-first expansion from the seeds, capped at `limit` nodes.
+
+        The previous version flooded: an unranked, uncapped BFS/DFS to a fixed
+        depth. Ranking decided the three seeds and then stopped mattering, so
+        "where is resolve_path defined" came back with 523 nodes — a fifth of
+        the graph — of which the char budget kept an arbitrary prefix. Here
+        the frontier is a priority queue ordered by the node's own relevance
+        plus a decayed share of the parent's, so the cap keeps the *best*
+        nodes rather than the first ones the walk happened to reach.
+
+        A hub is still returned when it matches; it is just not expanded
+        *through*. One 392-degree bundle node is enough to pull in the repo,
+        and the nodes behind it are related to each other, not to the query.
+        """
+        score_of = relevance or (lambda _n: 0.0)
+        decay = DFS_DECAY if mode == "dfs" else BFS_DECAY
+        depth_cap = DFS_DEPTH if mode == "dfs" else BFS_DEPTH
         sub_nodes: set[str] = set(starts)
         sub_edges: list[tuple[str, str]] = []
-        if mode == "dfs":
-            visited: set[str] = set()
-            stack = [(n, 0) for n in reversed(starts)]
-            while stack:
-                node, depth = stack.pop()
-                if node in visited or depth > DFS_DEPTH:
+        # (-score, depth, tiebreak, node) — the str tiebreak keeps heapq from
+        # ever comparing node objects themselves.
+        heap: list[tuple[float, int, str, Any]] = [
+            (-score_of(n), 0, str(n), n) for n in starts
+        ]
+        heapq.heapify(heap)
+        while heap and len(sub_nodes) < limit:
+            neg_score, depth, _, node = heapq.heappop(heap)
+            if depth >= depth_cap:
+                continue
+            if depth and G.degree(node) > HUB_EXPAND_DEGREE:
+                continue
+            inherited = -neg_score * decay
+            for nb in sorted(G.neighbors(node), key=lambda n: (-score_of(n), str(n))):
+                if nb in sub_nodes:
                     continue
-                visited.add(node)
-                sub_nodes.add(node)
-                for nb in G.neighbors(node):
-                    if nb not in visited:
-                        stack.append((nb, depth + 1))
-                        sub_edges.append((node, nb))
-        else:
-            frontier = set(starts)
-            for _ in range(BFS_DEPTH):
-                nxt: set[str] = set()
-                for n in frontier:
-                    for nb in G.neighbors(n):
-                        if nb not in sub_nodes:
-                            nxt.add(nb)
-                            sub_edges.append((n, nb))
-                sub_nodes.update(nxt)
-                frontier = nxt
+                sub_nodes.add(nb)
+                sub_edges.append((node, nb))
+                heapq.heappush(heap, (-(score_of(nb) + inherited), depth + 1, str(nb), nb))
+                if len(sub_nodes) >= limit:
+                    break
         return sub_nodes, sub_edges
 
 
@@ -647,9 +959,20 @@ class KGError(Exception):
 
 
 def _main() -> int:
-    """Subprocess entrypoint for background builds: kg <repo_root> [out_dir]."""
+    """Subprocess entrypoint for background builds:
+    kg <repo_root> [out_dir] [models_json]."""
+    from dotenv import load_dotenv
+
+    # The build resolves the `kg` alias itself, so it needs the provider key.
+    # A spawned child inherits it from the parent's load_dotenv(); this is for
+    # `python -m ox.context.kg` run by hand. Never overrides what's already set.
+    load_dotenv()
     repo_root = Path(sys.argv[1])
-    kg = KG(repo_root, store_dir=Path(sys.argv[2]) if len(sys.argv) > 2 else None)
+    kg = KG(
+        repo_root,
+        store_dir=Path(sys.argv[2]) if len(sys.argv) > 2 else None,
+        models_json=sys.argv[3] if len(sys.argv) > 3 else None,
+    )
     stats = kg.ensure()
     print(f"kg {stats.action}: {stats.nodes} nodes, {stats.edges} edges")
     return 0

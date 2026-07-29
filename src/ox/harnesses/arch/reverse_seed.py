@@ -122,13 +122,9 @@ def scope_subgraph(
     if G.number_of_nodes() == 0:
         return Subgraph()
 
-    # vocabulary + document frequency, exactly as kg.query builds it
-    df: Counter[str] = Counter()
-    node_tokens: dict[str, set[str]] = {}
-    for nid, nd in G.nodes(data=True):
-        toks = set(kgmod.tokenize(str(nd.get("label", nid))))
-        node_tokens[nid] = toks
-        df.update(toks)
+    # vocabulary + document frequency, exactly as kg.query builds it — same
+    # call, so label/path indexing and IDF weighting can never drift apart
+    df, node_tokens, path_tokens = kgmod.KG._vocabulary(G)
     n_nodes = max(G.number_of_nodes(), 1)
     vocab = set(df)
 
@@ -136,21 +132,15 @@ def scope_subgraph(
     if not expanded:
         return Subgraph()
 
-    def idf(t: str) -> float:
-        import math
-        return math.log(n_nodes / (1 + df.get(t, 0))) + 1.0
-
-    scored = []
-    for nid, toks in node_tokens.items():
-        s = sum(idf(t) for t in expanded if t in toks)
-        if s > 0:
-            scored.append((s, str(nid)))
+    relevance = kgmod.KG._scorer(expanded, df, node_tokens, path_tokens, n_nodes)
+    scored = [(s, str(nid)) for nid in node_tokens if (s := relevance(nid)) > 0]
     scored.sort(key=lambda x: (-x[0], x[1]))
-    starts = [nid for _, nid in scored[:3]]
+    starts = [nid for _, nid in scored[:kgmod.SEED_NODES]]
     if not starts:
         return Subgraph()
 
-    sub_nodes, sub_edges = kgmod.KG._traverse(G, starts, "bfs")
+    # the node cap is this function's own (max_nodes), not kg_query's
+    sub_nodes, sub_edges = kgmod.KG._traverse(G, starts, "bfs", relevance, max_nodes)
 
     # _traverse caps depth at BFS_DEPTH (3); honor a tighter max_depth too.
     if max_depth < kgmod.BFS_DEPTH:
@@ -175,10 +165,16 @@ def scope_subgraph(
                 data = next(iter(ed.values()), {})
             edges.append({"source": u, "target": v, **data})
 
-    truncated = False
+    # the ranked traversal stops at max_nodes itself, so reaching the cap is
+    # the truncation signal; _retraverse (tight max_depth) is still uncapped
+    # and can overshoot, which the block below trims.
+    truncated = len(sub_nodes) >= max_nodes
     if len(nodes) > max_nodes:
-        # keep the highest-scoring nodes (the starts and their nearest neighbours)
-        keep = {n for n, _ in scored[:max_nodes]} | set(starts)
+        # keep the highest-scoring nodes (the starts and their nearest
+        # neighbours). `scored` holds (score, id) — unpacking it the other way
+        # round filled `keep` with floats, so nothing ever matched and the cap
+        # fell through to plain traversal order.
+        keep = {nid for _, nid in scored[:max_nodes]} | set(starts)
         if len(keep) < max_nodes:
             # fill from BFS order (insertion order of sub_nodes) until the cap
             for n in sub_nodes:
