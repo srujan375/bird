@@ -2,10 +2,10 @@ import json
 
 import pytest
 
-from ox.harnesses.code import code_harness_tools
-from ox.tools import BashTool, DoneTool, EditTool, ReadImageTool, ReadTool, WriteTool
-from ox.tools.base import ToolContext
-from ox.tools.bash import check_command, is_verification_command
+from bird.harnesses.code import code_harness_tools
+from bird.tools import BashTool, DoneTool, EditTool, LsTool, ReadImageTool, ReadTool, WriteTool
+from bird.tools.base import ToolContext
+from bird.tools.bash import check_command, is_verification_command
 
 
 class _StubBroker:
@@ -113,7 +113,7 @@ def test_quoted_path_still_gated_outside_repo(repo, tmp_path):
 
 
 def test_write_cannot_escape_repo_via_quoting(ctx, repo):
-    r = WriteTool().execute({"path": "'/tmp/ox-escape-probe.txt'", "content": "x"}, ctx)
+    r = WriteTool().execute({"path": "'/tmp/bird-escape-probe.txt'", "content": "x"}, ctx)
     assert r.is_error
     assert "escapes the repository root" in r.output
 
@@ -202,7 +202,7 @@ class _FakeVisionClient:
         self.calls.append({"spec": spec, "messages": messages, "tools": tools})
         if self._error is not None:
             raise self._error
-        from ox.llm.types import LLMResponse, Message, Usage
+        from bird.llm.types import LLMResponse, Message, Usage
         return LLMResponse(
             message=Message(role="assistant", content=self._description),
             usage=Usage(),
@@ -213,7 +213,7 @@ class _FakeVisionClient:
 
 class _FakeRegistry:
     def __init__(self, spec_str="ollama:llava:7b"):
-        from ox.llm.registry import ModelSpec, ProviderConfig
+        from bird.llm.registry import ModelSpec, ProviderConfig
         self._spec = ModelSpec(
             spec=spec_str,
             provider=ProviderConfig(name="ollama", base_url="http://x"),
@@ -222,7 +222,7 @@ class _FakeRegistry:
 
     def resolve(self, name):
         if name != "vision":
-            from ox.llm.registry import RegistryError
+            from bird.llm.registry import RegistryError
             raise RegistryError(f"unknown alias {name}")
         return self._spec
 
@@ -344,7 +344,7 @@ def test_read_image_refuses_oversized(ctx, repo):
 
 
 def test_read_image_no_vision_alias(ctx, repo):
-    from ox.llm.registry import RegistryError
+    from bird.llm.registry import RegistryError
 
     class _NoVisionRegistry:
         def resolve(self, name):
@@ -702,7 +702,7 @@ def test_control_arm_has_no_kg_query():
     names = [t.name for t in code_harness_tools(with_kg=False)]
     assert "kg_query" not in names
     assert names == [
-        "read", "read_image", "edit", "write", "bash",
+        "read", "read_image", "ls", "edit", "write", "bash",
         "WebSearch", "WebFetch",
         "plan", "plan_update", "skill", "done",
     ]
@@ -714,4 +714,147 @@ def test_offline_control_arm_strips_web_too():
     assert "WebSearch" not in names
     assert "WebFetch" not in names
     assert "kg_query" not in names
-    assert names == ["read", "read_image", "edit", "write", "bash", "plan", "plan_update", "skill", "done"]
+    assert names == ["read", "read_image", "ls", "edit", "write", "bash", "plan", "plan_update", "skill", "done"]
+
+
+# --- ls ---
+
+def test_ls_lists_directory(ctx, repo):
+    r = LsTool().execute({"path": "src"}, ctx)
+    assert not r.is_error, r.output
+    # repo-relative path, type, size — one line per entry
+    assert "src/app.py  (file)" in r.output
+    assert "src/" not in r.output  # the listed dir itself isn't an entry
+
+
+def test_ls_dirs_first_and_suffixed(ctx, repo):
+    (repo / "src" / "sub").mkdir()
+    (repo / "src" / "zfile.py").write_text("x\n")
+    (repo / "src" / "afile.py").write_text("x\n")
+    r = LsTool().execute({"path": "src"}, ctx)
+    lines = r.output.splitlines()
+    # directories first, then alphabetical; dir suffixed with '/'
+    assert lines[0] == "src/sub/  (dir)  ?" or lines[0].startswith("src/sub/  (dir)")
+    assert "src/sub/" in lines[0]
+    # files alphabetical after the dir
+    file_lines = [l for l in lines if "(file)" in l]
+    assert file_lines == sorted(file_lines)
+
+
+def test_ls_pattern_filters_files_only(ctx, repo):
+    (repo / "src" / "sub").mkdir()
+    (repo / "src" / "a.py").write_text("x\n")
+    (repo / "src" / "b.txt").write_text("x\n")
+    r = LsTool().execute({"path": "src", "pattern": "*.py"}, ctx)
+    assert not r.is_error, r.output
+    assert "src/a.py" in r.output
+    assert "src/b.txt" not in r.output
+    # directories always shown regardless of pattern
+    assert "src/sub/" in r.output
+
+
+def test_ls_on_file_points_to_read(ctx, repo):
+    r = LsTool().execute({"path": "src/app.py"}, ctx)
+    assert r.is_error
+    assert "is a file, not a directory" in r.output
+    assert "read tool" in r.output
+
+
+def test_read_on_directory_points_to_ls(ctx, repo):
+    r = ReadTool().execute({"path": "src"}, ctx)
+    assert r.is_error
+    assert "is a directory" in r.output
+    assert "ls tool" in r.output
+
+
+def test_ls_missing_directory(ctx, repo):
+    r = LsTool().execute({"path": "nope"}, ctx)
+    assert r.is_error
+    assert "not found" in r.output
+
+
+def test_ls_missing_reports_where_it_looked(ctx, repo):
+    r = LsTool().execute({"path": "'nope'"}, ctx)
+    assert r.is_error
+    assert "looked in" in r.output
+
+
+def test_ls_accepts_shell_quoted_path(ctx, repo):
+    r = LsTool().execute({"path": "'src'"}, ctx)
+    assert not r.is_error, r.output
+    assert "src/app.py" in r.output
+
+
+def test_ls_truncates_with_offset_marker(ctx, repo, monkeypatch):
+    import bird.tools.files as files_mod
+    monkeypatch.setattr(files_mod, "MAX_LS_ENTRIES", 2)
+    # 4 files in a dir, cap at 2
+    d = repo / "big"
+    d.mkdir()
+    for i in range(4):
+        (d / f"f{i}.py").write_text("x\n")
+    r = LsTool().execute({"path": "big"}, ctx)
+    assert not r.is_error, r.output
+    assert "truncated" in r.output
+    assert "offset=3" in r.output  # next page starts at offset+cap = 1+2
+
+
+def test_ls_offset_pages(ctx, repo, monkeypatch):
+    import bird.tools.files as files_mod
+    monkeypatch.setattr(files_mod, "MAX_LS_ENTRIES", 2)
+    d = repo / "big"
+    d.mkdir()
+    for i in range(4):
+        (d / f"f{i}.py").write_text("x\n")
+    r = LsTool().execute({"path": "big", "offset": 3}, ctx)
+    assert not r.is_error, r.output
+    lines = [l for l in r.output.splitlines() if "(file)" in l]
+    assert len(lines) == 2  # the remaining two entries
+    assert "showing 2 of 4" in r.output
+
+
+def test_ls_broken_symlink_classified(ctx, repo):
+    (repo / "broken").symlink_to(repo / "does_not_exist")
+    r = LsTool().execute({"path": "."}, ctx)
+    assert not r.is_error, r.output
+    assert "broken  (symlink)" in r.output
+    # broken symlink target can't be stat'd -> size '?'
+    assert "broken  (symlink)  ?" in r.output
+
+
+def test_ls_symlink_to_dir_is_navigable(ctx, repo):
+    (repo / "realdir").mkdir()
+    (repo / "realdir" / "inside.py").write_text("x\n")
+    (repo / "linkdir").symlink_to(repo / "realdir")
+    r = LsTool().execute({"path": "."}, ctx)
+    # symlink-to-dir follows symlinks -> classified 'dir', suffixed '/'
+    assert "linkdir/  (dir)" in r.output
+
+
+def test_ls_outside_repo_gated(repo, tmp_path):
+    outside = tmp_path.parent / "outside_dir"
+    outside.mkdir()
+    broker = _StubBroker(approve=False)
+    c = ToolContext(repo_root=repo, broker=broker)
+    r = LsTool().execute({"path": str(outside)}, c)
+    assert r.is_error
+    assert "DENIED" in r.output
+    assert broker.seen[0]["kind"] == "read_outside_repo"
+
+
+def test_ls_outside_repo_no_broker_refused(repo, tmp_path):
+    outside = tmp_path.parent / "outside_dir2"
+    outside.mkdir()
+    c = ToolContext(repo_root=repo)  # no broker
+    r = LsTool().execute({"path": str(outside)}, c)
+    assert r.is_error
+    assert "permission" in r.output.lower()
+
+
+def test_ls_mounted_in_all_harnesses():
+    from bird.harnesses.arch.tools import arch_harness_tools
+    from bird.harnesses.lead import lead_harness_tools
+
+    assert "ls" in [t.name for t in code_harness_tools()]
+    assert "ls" in [t.name for t in lead_harness_tools()]
+    assert "ls" in [t.name for t in arch_harness_tools()]

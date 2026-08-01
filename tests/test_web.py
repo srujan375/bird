@@ -19,9 +19,9 @@ from urllib.parse import quote
 import httpx
 import pytest
 
-from ox.harnesses.code import code_harness_tools
-from ox.tools import WebFetchTool, WebSearchTool
-from ox.tools.base import ToolContext, ToolError
+from bird.harnesses.code import code_harness_tools
+from bird.tools import WebFetchTool, WebSearchTool
+from bird.tools.base import ToolContext, ToolError
 
 
 # ---------- fixtures ----------
@@ -206,7 +206,7 @@ def test_webfetch_happy_path_html_to_md(ctx, repo):
     assert "[prompt: summarize this]" in r.output
     assert r.details["from_cache"] is False
     # cache file is written on first call
-    cache_file = repo / ".ox" / "cache" / "webfetch"
+    cache_file = repo / ".bird" / "cache" / "webfetch"
     assert cache_file.is_dir()
     assert any(cache_file.iterdir())
 

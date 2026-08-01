@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from ox.harnesses.arch.state import (
+from bird.harnesses.arch.state import (
     ApiFacet,
     ArchState,
     Brief,
@@ -279,7 +279,7 @@ def test_json_round_trip_with_facets():
                                      kind="sync", failure_mode="503"))
     st.questions.append(OpenQuestion(id="q", question="?", blocking=True, source="judge"))
     st.compute_obligations()
-    st.amendments.append(__import__("ox.harnesses.arch.state", fromlist=["Amendment"]).Amendment(
+    st.amendments.append(__import__("bird.harnesses.arch.state", fromlist=["Amendment"]).Amendment(
         turn=1, description="renamed", structural=False))
 
     wire = json.dumps(st.to_dict())

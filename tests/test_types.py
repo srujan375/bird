@@ -1,6 +1,6 @@
 import json
 
-from ox.llm.types import ContentPart, LLMResponse, Message, ToolCall, ToolSpec, Usage
+from bird.llm.types import ContentPart, LLMResponse, Message, ToolCall, ToolSpec, Usage
 
 
 def test_toolspec_to_openai():

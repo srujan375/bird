@@ -2,13 +2,13 @@ import json
 
 import pytest
 
-from ox.engine.runner import Runner
-from ox.engine.session import SessionRecorder, load_messages
-from ox.llm.registry import ModelSpec, ProviderConfig, Registry
-from ox.llm.types import LLMResponse, Message, ToolCall, Usage
-from ox.repl import Repl
-from ox.harnesses.code import code_harness_tools
-from ox.tools import ToolContext
+from bird.engine.runner import Runner
+from bird.engine.session import SessionRecorder, load_messages
+from bird.llm.registry import ModelSpec, ProviderConfig, Registry
+from bird.llm.types import LLMResponse, Message, ToolCall, Usage
+from bird.repl import Repl
+from bird.harnesses.code import code_harness_tools
+from bird.tools import ToolContext
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -32,7 +32,7 @@ class FakeClient:
 
 def make_repl(tmp_path, script):
     (tmp_path / "f.py").write_text("x = 1\n")
-    recorder = SessionRecorder(tmp_path / ".ox" / "sessions" / "t")
+    recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     runner = Runner(
@@ -481,12 +481,12 @@ def test_sessions_filter_narrows_list(tmp_path, monkeypatch, capsys):
 
 
 def test_load_messages_falls_back_to_events_jsonl(tmp_path):
-    """Older ox versions recorded the transcript inline in events.jsonl
+    """Older bird versions recorded the transcript inline in events.jsonl
     without ever writing messages.jsonl. /continue must still be able to
     resume those sessions — load_messages reconstructs the user seed from
     run_start.data.task and pulls assistant content from assistant events."""
     import json
-    from ox.engine.session import load_messages
+    from bird.engine.session import load_messages
     run_dir = tmp_path / "legacy_session"
     run_dir.mkdir()
     events = [
@@ -507,7 +507,7 @@ def test_load_messages_missing_events_returns_none(tmp_path):
     """If neither messages.jsonl nor events.jsonl exists, /continue can't
     resume — we must return None so the caller can report a clean error
     rather than fabricate a transcript."""
-    from ox.engine.session import load_messages
+    from bird.engine.session import load_messages
     run_dir = tmp_path / "empty_session"
     run_dir.mkdir()
     assert load_messages(run_dir) is None

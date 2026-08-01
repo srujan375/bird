@@ -1,6 +1,6 @@
 import json
 
-from ox.activity import MAX_LABEL_LEN, format_activity
+from bird.activity import MAX_LABEL_LEN, format_activity
 
 
 def assistant_event(*calls):

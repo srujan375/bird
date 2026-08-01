@@ -2,11 +2,11 @@ import json
 
 import pytest
 
-from ox.engine.runner import PLAN_TRACKER_PREFIX, Runner
-from ox.llm.registry import ModelSpec, ProviderConfig, Registry
-from ox.llm.types import LLMResponse, Message, ToolCall, Usage
-from ox.harnesses.code import code_harness_tools
-from ox.tools import DoneTool, PlanTool, PlanUpdateTool, ToolContext
+from bird.engine.runner import PLAN_TRACKER_PREFIX, Runner
+from bird.llm.registry import ModelSpec, ProviderConfig, Registry
+from bird.llm.types import LLMResponse, Message, ToolCall, Usage
+from bird.harnesses.code import code_harness_tools
+from bird.tools import DoneTool, PlanTool, PlanUpdateTool, ToolContext
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -162,7 +162,7 @@ def kg_repo(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def kg(kg_repo):
-    from ox.context.kg import KG
+    from bird.context.kg import KG
 
     kg = KG(kg_repo)
     kg.build()
@@ -183,7 +183,7 @@ def test_affected_files_bridges_bare_name_nodes(tmp_path):
     import networkx as nx
     from networkx.readwrite import json_graph
 
-    from ox.context.kg import KG
+    from bird.context.kg import KG
 
     G = nx.Graph()
     G.add_node("core_store", label="Store", source_file="core.py")

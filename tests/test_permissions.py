@@ -2,7 +2,7 @@
 broker each surface gets.
 
 The regression that motivated this module: gating used to happen in
-Server.__init__, so anything that built a Runner without a Server — `ox code`,
+Server.__init__, so anything that built a Runner without a Server — `bird code`,
 the plain REPL, and the sub-session the lead's `code` tool dispatches mid-turn —
 ran edit/write raw. bash was never gated anywhere.
 """
@@ -12,10 +12,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from ox.harnesses import registry
-from ox.harnesses.lead.tools import CodeTool
-from ox.llm.registry import ModelSpec, ProviderConfig, Registry
-from ox.permissions import (
+from bird.harnesses import registry
+from bird.harnesses.lead.tools import CodeTool
+from bird.llm.registry import ModelSpec, ProviderConfig, Registry
+from bird.permissions import (
     AutoApproveBroker,
     ConsoleBroker,
     DenyBroker,
@@ -24,7 +24,7 @@ from ox.permissions import (
     gate_tools,
     permission_payload,
 )
-from ox.tools import BashTool, EditTool, ReadTool, ToolContext, WriteTool
+from bird.tools import BashTool, EditTool, ReadTool, ToolContext, WriteTool
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -112,7 +112,7 @@ def test_lead_dispatched_code_session_inherits_the_gate(tmp_path):
 
     ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path,
                       client=None, broker=broker)
-    import ox.harnesses.registry as reg_mod
+    import bird.harnesses.registry as reg_mod
     orig = reg_mod.build_runner
     reg_mod.build_runner = spy
     try:
@@ -256,13 +256,13 @@ def test_console_broker_interrupt_denies():
 
 
 def test_headless_broker_yes_flag_auto_approves():
-    from ox.cli import _headless_broker
+    from bird.cli import _headless_broker
 
     assert isinstance(_headless_broker(SimpleNamespace(yes=True)), AutoApproveBroker)
 
 
 def test_headless_broker_denies_when_nobody_can_answer(monkeypatch):
-    from ox.cli import _headless_broker
+    from bird.cli import _headless_broker
 
     monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: False))
     broker = _headless_broker(SimpleNamespace(yes=False))
@@ -271,7 +271,7 @@ def test_headless_broker_denies_when_nobody_can_answer(monkeypatch):
 
 
 def test_headless_broker_prompts_on_a_tty(monkeypatch):
-    from ox.cli import _headless_broker
+    from bird.cli import _headless_broker
 
     monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
     assert isinstance(_headless_broker(SimpleNamespace(yes=False)), ConsoleBroker)

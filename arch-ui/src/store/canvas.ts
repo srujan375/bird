@@ -14,9 +14,20 @@ import type { Layer } from "../types";
 
 export interface XY { x: number; y: number }
 
-const STORAGE_PREFIX = "ox_arch_canvas:";
-const CHAT_KEY = "ox_arch_chat_h"; // shared with the old page on purpose
-const DEFAULT_RAIL = 380;
+const STORAGE_PREFIX = "bird_arch_canvas:";
+const CHAT_KEY = "bird_arch_chat_h"; // shared with the old page on purpose
+const RAIL_KEY = "bird_arch_rail_w"; // width follows you into the next run, like the chat height
+export const DEFAULT_RAIL = 380;
+const MIN_RAIL = 260;
+/** The canvas keeps at least this much of the window, however far the rail is dragged. */
+const MIN_STAGE = 320;
+
+/** Kept honest against the viewport: a width saved on a wide monitor must not
+ *  swallow the canvas whole when the same session is reopened on a laptop. */
+export function clampRail(w: number, viewport = window.innerWidth): number {
+  const max = Math.max(MIN_RAIL, Math.min(760, viewport - MIN_STAGE));
+  return Math.round(Math.min(max, Math.max(MIN_RAIL, w)));
+}
 
 export interface Overlay {
   positions: Record<string, XY>;
@@ -43,7 +54,7 @@ function emptyOverlay(): Overlay {
     layer: null,
     variant: null,
     railTab: "chat",
-    railWidth: DEFAULT_RAIL,
+    railWidth: clampRail(Number(localStorage.getItem(RAIL_KEY)) || DEFAULT_RAIL),
     chatHeight: Number(localStorage.getItem(CHAT_KEY)) || 320,
     openComponent: null,
     dialogTab: "",
@@ -69,6 +80,9 @@ interface CanvasState extends Overlay {
   setLayer: (l: Layer | null) => void;
   setVariant: (v: string | null) => void;
   setRailTab: (t: string) => void;
+  /** A frame of a rail drag: width only, not written to storage. */
+  dragRail: (w: number) => void;
+  setRailWidth: (w: number) => void;
   setChatHeight: (h: number) => void;
   select: (key: string | null) => void;
   isPinned: (key: string) => boolean;
@@ -83,6 +97,7 @@ function save(runId: string | null, o: Overlay): void {
   try {
     localStorage.setItem(STORAGE_PREFIX + runId, JSON.stringify(o));
     localStorage.setItem(CHAT_KEY, String(o.chatHeight));
+    localStorage.setItem(RAIL_KEY, String(o.railWidth));
   } catch {
     /* private mode / quota — the session still works, it just won't persist */
   }
@@ -105,7 +120,7 @@ export const useCanvas = create<CanvasState>((set, get) => ({
     } catch {
       /* corrupt entry: fall back to a fresh overlay rather than failing to boot */
     }
-    set({ ...overlay, runId });
+    set({ ...overlay, railWidth: clampRail(overlay.railWidth), runId });
   },
 
   /**
@@ -162,6 +177,11 @@ export const useCanvas = create<CanvasState>((set, get) => ({
   setLayer: (layer) => set((s) => persist(s, { layer })),
   setVariant: (variant) => set((s) => persist(s, { variant })),
   setRailTab: (railTab) => set((s) => persist(s, { railTab })),
+
+  // same split as a node drag: every frame is state, only the drop is storage
+  dragRail: (railWidth) => set({ railWidth: clampRail(railWidth) }),
+  setRailWidth: (railWidth) => set((s) => persist(s, { railWidth: clampRail(railWidth) })),
+
   setChatHeight: (chatHeight) => set((s) => persist(s, { chatHeight })),
   select: (selected) => set({ selected }),
   isPinned: (key) => get().pinned.includes(key),

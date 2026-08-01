@@ -1,9 +1,9 @@
-"""Input-time image ingestion — see src/ox/attachments.py for the why."""
+"""Input-time image ingestion — see src/bird/attachments.py for the why."""
 
 import pytest
 
-from ox.attachments import ATTACHMENTS_DIRNAME, ingest_images
-from ox.tools.files import MAX_IMAGE_BYTES
+from bird.attachments import ATTACHMENTS_DIRNAME, ingest_images
+from bird.tools.files import MAX_IMAGE_BYTES
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 JPEG = b"\xff\xd8\xff" + b"\x00" * 64
@@ -19,7 +19,7 @@ def repo(tmp_path):
 
 @pytest.fixture
 def run_dir(repo):
-    return repo / ".ox" / "sessions" / "20260728-172930-ce432e"
+    return repo / ".bird" / "sessions" / "20260728-172930-ce432e"
 
 
 @pytest.fixture
@@ -66,7 +66,7 @@ def test_the_copy_survives_the_original_being_reaped(repo, run_dir, outside):
 
 
 def test_copy_lands_in_repo_so_no_permission_card_fires(repo, run_dir, outside):
-    from ox.tools.base import ToolContext
+    from bird.tools.base import ToolContext
 
     shot = _shot(outside)
     _, found = ingest_images(f"'{shot}'", run_dir, repo)
@@ -77,7 +77,7 @@ def test_copy_lands_in_repo_so_no_permission_card_fires(repo, run_dir, outside):
 def test_slug_has_no_spaces(repo, run_dir, outside):
     _, found = ingest_images(f"'{_shot(outside)}'", run_dir, repo)
     assert " " not in found[0].path
-    assert found[0].path.startswith(f".ox/sessions/20260728-172930-ce432e/{ATTACHMENTS_DIRNAME}/")
+    assert found[0].path.startswith(f".bird/sessions/20260728-172930-ce432e/{ATTACHMENTS_DIRNAME}/")
     assert found[0].path.endswith(".png")
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 import networkx as nx
 import pytest
 
-from ox.context.kg import (
+from bird.context.kg import (
     HUB_EXPAND_DEGREE,
     KG,
     _DFS_RE,
@@ -70,7 +70,7 @@ def kg(repo):
 
 def test_build_creates_branch_aware_store(kg, repo):
     assert kg.graph_path.exists()
-    assert str(kg.graph_path).startswith(str(repo / ".ox" / "kg" / "no-git"))
+    assert str(kg.graph_path).startswith(str(repo / ".bird" / "kg" / "no-git"))
     assert kg.manifest_path.exists()
     assert kg.is_ready()
 
@@ -150,7 +150,7 @@ def test_ensure_background_detaches_from_terminal(tmp_path, monkeypatch):
         captured["kwargs"] = kwargs
         return FakeProc()
 
-    monkeypatch.setattr("ox.context.kg.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("bird.context.kg.subprocess.Popen", fake_popen)
     proc = kg.ensure_background()
     assert proc is not None
     assert captured["kwargs"].get("start_new_session") is True
@@ -308,7 +308,7 @@ def _no_ambient_kg_config(monkeypatch):
     """
     from graphify.llm import BACKENDS
 
-    for var in ("OLLAMA_API_KEY", "OPENROUTER_API_KEY", "OX_KG_BACKEND", "OX_KG_MODEL"):
+    for var in ("OLLAMA_API_KEY", "OPENROUTER_API_KEY", "BIRD_KG_BACKEND", "BIRD_KG_MODEL"):
         monkeypatch.delenv(var, raising=False)
     for name in ("ollama", "openai"):
         monkeypatch.setitem(BACKENDS[name], "base_url", BACKENDS[name]["base_url"])
@@ -437,7 +437,7 @@ def test_semantic_cache_skips_second_extraction(doc_repo, monkeypatch):
 # ---------- the models.json `kg` alias ----------
 
 
-def test_kg_alias_aims_graphify_at_ox_provider(doc_repo, tmp_path, monkeypatch):
+def test_kg_alias_aims_graphify_at_bird_provider(doc_repo, tmp_path, monkeypatch):
     """The whole point: models.json decides, and the provider's URL and key
     travel with it — graphify's own env lookups are never consulted."""
     from graphify.llm import BACKENDS
@@ -486,20 +486,20 @@ def test_alias_without_provider_key_is_ast_only_and_says_so(
     assert "OLLAMA_API_KEY is unset" in capsys.readouterr().err
 
 
-def test_ox_kg_model_overrides_the_alias_model(doc_repo, tmp_path, monkeypatch):
+def test_bird_kg_model_overrides_the_alias_model(doc_repo, tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(
         "graphify.llm.extract_corpus_parallel", _fake_corpus_extractor([], seen)
     )
     monkeypatch.setenv("OLLAMA_API_KEY", "sk-ollama-test")
-    monkeypatch.setenv("OX_KG_MODEL", "glm-5.2")
+    monkeypatch.setenv("BIRD_KG_MODEL", "glm-5.2")
     KG(doc_repo, models_json=_models_json(tmp_path)).build()
     assert seen[0]["model"] == "glm-5.2"
 
 
 def test_explicit_backend_beats_the_alias(doc_repo, tmp_path, monkeypatch):
-    """OX_KG_BACKEND/semantic_backend keeps graphify's own env-key path, so an
-    ox provider key is never handed to a backend the user named directly."""
+    """BIRD_KG_BACKEND/semantic_backend keeps graphify's own env-key path, so an
+    bird provider key is never handed to a backend the user named directly."""
     seen = []
     monkeypatch.setattr(
         "graphify.llm.extract_corpus_parallel", _fake_corpus_extractor([], seen)

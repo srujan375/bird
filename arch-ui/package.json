@@ -1,9 +1,9 @@
 {
-  "name": "ox-arch-ui",
+  "name": "bird-arch-ui",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Architecture Workbench — React canvas for the ox arch harness",
+  "description": "Architecture Workbench — React canvas for the bird arch harness",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

@@ -1,9 +1,9 @@
 {
-  "name": "ox-tui",
+  "name": "bird-tui",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Terminal UI for ox (multi-harness agent) — Claude Native design direction, built on pi-tui",
+  "description": "Terminal UI for bird (multi-harness agent) — Claude Native design direction, built on pi-tui",
   "scripts": {
     "start": "tsx src/main.ts",
     "dev": "tsx src/main.ts",

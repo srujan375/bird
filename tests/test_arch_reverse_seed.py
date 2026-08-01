@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import pytest
 
-from ox.context.kg import KG
-from ox.harnesses.arch.reverse_seed import (
+from bird.context.kg import KG
+from bird.harnesses.arch.reverse_seed import (
     DEPENDENCY_RELATIONS,
     Subgraph,
     _extract_facet,
@@ -29,15 +29,15 @@ from ox.harnesses.arch.reverse_seed import (
     reverse_seed,
     scope_subgraph,
 )
-from ox.harnesses.arch.session import ArchSession
-from ox.harnesses.arch.state import ArchState, ApiFacet, StoreFacet
-from ox.harnesses.arch.tools import (
+from bird.harnesses.arch.session import ArchSession
+from bird.harnesses.arch.state import ArchState, ApiFacet, StoreFacet
+from bird.harnesses.arch.tools import (
     ArchDoneTool,
     ComponentTool,
     ConnectTool,
     ImportStateTool,
 )
-from ox.tools import ToolContext
+from bird.tools import ToolContext
 
 
 # ----------------------------------------------------------- pure transform
@@ -54,7 +54,7 @@ def test_symbol_name_strips_call_punctuation():
 
 
 def test_file_to_cid_is_kebab_and_stable():
-    assert _file_to_cid("src/ox/context/kg.py") == "context-kg"
+    assert _file_to_cid("src/bird/context/kg.py") == "context-kg"
     # drops common top-level dirs, strips extension
     assert _file_to_cid("lib/store/orders_repo.py") == "store-orders-repo"
     # idempotent + starts with a letter (validate_component requires it)
@@ -63,7 +63,7 @@ def test_file_to_cid_is_kebab_and_stable():
 
 
 def test_file_to_name_is_basename_without_extension():
-    assert _file_to_name("src/ox/context/kg.py") == "kg"
+    assert _file_to_name("src/bird/context/kg.py") == "kg"
     assert _file_to_name("lib/store/orders_repo.py") == "orders_repo"
 
 
@@ -364,7 +364,7 @@ def test_import_state_then_finalize_still_seeds_kg(tmp_path):
     """The existing arch→KG seed must still work on a design that started as a
     reverse-seed import. End-to-end: import → fill brief → done (top level) →
     done (finalize) → kg has design nodes."""
-    from ox.harnesses.arch.tools import BriefTool
+    from bird.harnesses.arch.tools import BriefTool
 
     class _Broker:
         """Approves every gate (top-level, then finalize)."""

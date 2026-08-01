@@ -2,9 +2,9 @@
 
 import pytest
 
-from ox.harnesses.arch.session import ArchSession
-from ox.harnesses.arch.state import ArchState
-from ox.harnesses.arch.tools import (
+from bird.harnesses.arch.session import ArchSession
+from bird.harnesses.arch.state import ArchState
+from bird.harnesses.arch.tools import (
     AmendTool,
     AnswerTool,
     ArchDoneTool,
@@ -17,7 +17,7 @@ from ox.harnesses.arch.tools import (
     FlowTool,
     arch_harness_tools,
 )
-from ox.tools import ToolContext
+from bird.tools import ToolContext
 
 
 class FakeBroker:
@@ -233,7 +233,7 @@ def test_full_session_to_finalize(tmp_path):
     assert broker.requests[1]["artifacts"]
     assert (run_dir / "bundle" / "architecture.json").is_file()
     assert (run_dir / "bundle" / "architecture.md").is_file()
-    assert "ox code" in res.output
+    assert "bird code" in res.output
     # every mutation emitted a full arch_state event
     assert events[-1]["phase"] == "finalized"
     assert events[-1]["state"]["components"]["db"]["facet"]["facet_kind"] == "store"
@@ -374,7 +374,7 @@ def test_critic_failure_is_silent(tmp_path):
 
 
 def _stub_component():
-    from ox.harnesses.arch.state import Component
+    from bird.harnesses.arch.state import Component
     return Component(id="x", name="x", kind="service", responsibility="r")
 
 

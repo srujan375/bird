@@ -1,11 +1,11 @@
-from ox.engine.compactor import (
+from bird.engine.compactor import (
     compact,
     estimate_tokens,
     needs_compaction,
     stub_tool_results,
 )
-from ox.llm.registry import Registry
-from ox.llm.types import Message
+from bird.llm.registry import Registry
+from bird.llm.types import Message
 
 
 def big_tool_msg(i, size=2000):
@@ -50,7 +50,7 @@ def test_stub_leaves_small_results_alone():
 
 def test_compact_offline_falls_back_to_trim(monkeypatch):
     """No compactor model reachable → stub + trim, never raises."""
-    from ox.llm.wire.openai_compat import WireError
+    from bird.llm.wire.openai_compat import WireError
 
     class DeadClient:
         def complete(self, *a, **k):

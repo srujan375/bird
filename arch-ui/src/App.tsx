@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Canvas, useTidyUp } from "./canvas/Canvas";
 import { ComponentDialog } from "./dialog/ComponentDialog";
 import { Rail } from "./rail/Rail";
@@ -202,6 +202,7 @@ export default function App() {
   const arch = useSession((s) => s.arch);
   const runId = useSession((s) => s.ready?.run_id);
   const restore = useCanvas((s) => s.restore);
+  const railWidth = useCanvas((s) => s.railWidth);
   const { layer, variant, variants } = useLayer();
   useOpenShortcut();
 
@@ -216,7 +217,8 @@ export default function App() {
       : Object.keys(arch?.components ?? {}).length;
 
   return (
-    <div className="app">
+    // the grip writes the width here; the grid column reads it
+    <div className="app" style={{ "--rail": `${railWidth}px` } as CSSProperties}>
       <TopBar layer={layer} variants={variants} />
 
       <main className="stage">

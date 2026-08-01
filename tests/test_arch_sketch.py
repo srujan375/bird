@@ -4,14 +4,14 @@ same wire as the strict state)."""
 
 import json
 
-from ox.harnesses.arch.sketch import (
+from bird.harnesses.arch.sketch import (
     DEPTHS,
     Sketchbook,
     SketchLink,
     SketchNode,
     Variant,
 )
-from ox.harnesses.arch.state import ArchState
+from bird.harnesses.arch.state import ArchState
 
 
 def _book() -> Sketchbook:

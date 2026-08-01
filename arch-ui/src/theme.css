@@ -383,7 +383,36 @@ button.pill { padding: 1px 5px; border-radius: 5px; }
   border-left: 1px solid var(--hairline);
   background: var(--surface);
   min-height: 0;
+  position: relative;
+  /* over the minimap and the zoom pill, which sit at the canvas's right edge
+     exactly where the grip has to be grabbable */
+  z-index: 6;
 }
+
+/* the drag handle: a hit target wider than the hairline it moves */
+.rail-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 9px;
+  cursor: col-resize;
+  z-index: 2;
+  touch-action: none; /* a touch drag must resize, not scroll the rail */
+}
+.rail-grip::after {
+  content: "";
+  position: absolute;
+  inset: 0 4px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.rail-grip:hover::after, .rail-grip:focus-visible::after { opacity: 0.55; }
+.rail-grip:focus-visible { outline: none; }
+/* while a drag is live the pointer is captured, so the cursor and the
+   no-select have to be declared on the whole page, not on the handle */
+body[data-resizing] { cursor: col-resize; user-select: none; }
 .rail-tabs { display: flex; border-bottom: 1px solid var(--hairline); }
 .rail-tabs button {
   flex: 1;
@@ -396,6 +425,16 @@ button.pill { padding: 1px 5px; border-radius: 5px; }
   background: transparent;
 }
 .rail-tabs button[data-on="true"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+/* a ruling raised while you are on another tab still has to be findable */
+.rail-tabs .alert-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-left: 4px;
+  vertical-align: 1px;
+  background: var(--accent);
+}
 .rail-tabs .count {
   font-family: var(--mono);
   font-size: 9.5px;
@@ -488,6 +527,85 @@ button.pill { padding: 1px 5px; border-radius: 5px; }
 }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* ---------- markdown ---------- */
+
+/* The agent writes markdown, so the rail renders markdown. Everything here is
+   sized down from the browser defaults: this is a 380px column, not an article
+   page, and a default h1 in it reads as shouting. */
+.md {
+  white-space: normal; /* the surrounding .msg is pre-wrap; blocks own their own wrapping */
+  word-break: break-word;
+}
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; line-height: 1.55; }
+.md h3, .md h4, .md h5, .md h6 {
+  margin: 12px 0 5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.md h3 { font-size: 1.12em; }
+.md h4 { font-size: 1.04em; }
+.md h5, .md h6 { font-size: 1em; color: var(--muted); }
+
+.md ul, .md ol { margin: 0 0 8px; padding-left: 19px; }
+.md li { margin: 2px 0; line-height: 1.55; }
+.md li > p { margin: 0 0 4px; }
+.md li > :last-child { margin-bottom: 0; }
+.md ul ul, .md ul ol, .md ol ul, .md ol ol { margin-bottom: 0; }
+
+.md code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: color-mix(in oklch, var(--ink) 7%, transparent);
+  border-radius: 4px;
+  padding: 0.5px 4px;
+}
+.md pre {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--canvas);
+  overflow-x: auto; /* code keeps its columns; the rail does not grow to fit it */
+}
+.md pre code {
+  background: none;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.md blockquote {
+  margin: 0 0 8px;
+  padding-left: 9px;
+  border-left: 2px solid var(--hairline);
+  color: var(--muted);
+}
+.md hr { border: 0; border-top: 1px solid var(--hairline); margin: 10px 0; }
+
+.md-table { overflow-x: auto; margin-bottom: 8px; }
+.md table { border-collapse: collapse; font-size: 0.94em; }
+.md th, .md td {
+  border: 1px solid var(--hairline);
+  padding: 3px 7px;
+  text-align: left;
+  vertical-align: top;
+}
+.md th { font-weight: 600; background: color-mix(in oklch, var(--ink) 4%, transparent); }
+
+/* prose that has to sit inside a line of text, not below it */
+.md.inline, .md.inline p { display: inline; margin: 0; }
+
+/* in a card the wrapper carries the colour, so the paragraphs inherit it
+   instead of the `.card p` muted default */
+.card .md { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+.card .md p { margin: 0 0 4px; color: inherit; font-size: inherit; }
+.card .md > :last-child { margin-bottom: 0; }
+.gate .md p { font-size: 11.5px; line-height: 1.5; }
+
 .composer { border-top: 1px solid var(--hairline); padding: 8px; display: grid; gap: 6px; }
 .composer textarea {
   width: 100%;
@@ -505,29 +623,113 @@ button.pill { padding: 1px 5px; border-radius: 5px; }
 .composer .actions { display: flex; gap: 6px; align-items: center; }
 .composer .actions .spacer { flex: 1; }
 
+/* ---------- the gate, as a note ---------- */
+
+/* It hangs off the chat instead of sitting inside it: a ruling that pushed the
+   transcript out of the column was asking you to weigh a conversation it had
+   just hidden. Fixed, so the rail's own scrolling never moves it, and anchored
+   to --rail so it stays glued to the chat edge as the rail is dragged. */
+.gate, .gate-pill {
+  --note: var(--accent);
+  --note-bg: color-mix(in oklch, var(--accent) 7%, var(--surface));
+  position: fixed;
+  right: calc(var(--rail) + 16px);
+  bottom: 20px;
+  z-index: 35; /* over an open component dialog: the ruling is what blocks the run */
+}
+.gate[data-kind="finalize"], .gate-pill[data-kind="finalize"] {
+  --note: var(--ok);
+  --note-bg: color-mix(in oklch, var(--ok) 7%, var(--surface));
+}
+
 .gate {
-  border: 1px solid var(--accent);
-  border-radius: 10px;
-  padding: 9px 10px;
-  margin: 8px;
-  background: color-mix(in oklch, var(--accent) 7%, var(--surface));
-  /* The gate sits in an implicit `auto` grid row, which sizes to content and
-     never shrinks — an unbounded finalize summary would push its own buttons
-     out through the rail's hidden overflow. Cap it and scroll the body, so
-     the title and the two rulings are always on screen. */
+  /* it holds a question and two buttons — the design it is about is on the
+     canvas behind it and in the transcript beside it */
+  width: min(340px, calc(100vw - var(--rail) - 44px));
+  min-width: 240px;
+  /* the summary scrolls, the two rulings never do — a button you cannot reach
+     is the same as no button at all */
   display: flex;
   flex-direction: column;
   min-height: 0;
-  max-height: 50vh;
+  max-height: min(72vh, 640px);
+  padding: 8px 12px 11px;
+  border: 1px solid var(--note);
+  border-radius: 12px;
+  background: var(--note-bg);
+  box-shadow: 0 16px 44px rgb(0 0 0 / 0.18);
 }
-.gate-body { overflow: auto; min-height: 0; overscroll-behavior: contain; }
-.gate h4 { margin: 0 0 4px; font-size: 12.5px; }
+
+/* the tip, aimed back at the composer it wants you to reply in */
+.gate::after, .gate-pill::after {
+  content: "";
+  position: absolute;
+  right: -6px;
+  width: 11px;
+  height: 11px;
+  background: var(--note-bg);
+  border-top: 1px solid var(--note);
+  border-right: 1px solid var(--note);
+  border-radius: 0 3px 0 0;
+  transform: rotate(45deg);
+}
+.gate::after { bottom: 26px; }
+.gate-pill::after { bottom: 9px; }
+
+.gate-head { display: flex; align-items: center; gap: 8px; }
+.gate-head .spacer { flex: 1; }
+.gate-head h4 { margin: 0 0 2px; font-size: 12.5px; }
+.gate .tuck { padding: 0 6px; font-size: 13px; line-height: 18px; color: var(--muted); }
+.gate .tuck:hover { color: var(--ink); }
+
+.gate-body { overflow: auto; min-height: 0; overscroll-behavior: contain; padding-right: 2px; }
+
+/* what is unsettled, as counts that take you to where you can settle it */
+.gate .unsettled { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
+.linkish {
+  border: 0;
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  font-size: inherit;
+  color: var(--accent);
+  border-bottom: 1px solid color-mix(in oklch, var(--accent) 40%, transparent);
+}
+.linkish:hover:not(:disabled) { border-bottom-color: var(--accent); }
 .gate p { margin: 0 0 6px; font-size: 11.5px; line-height: 1.5; }
 .gate .weigh { margin: 6px 0; }
 .gate .weigh li { font-size: 11px; color: var(--muted); line-height: 1.5; }
 .gate ul { margin: 4px 0; padding-left: 16px; }
 .gate .buttons { display: flex; gap: 6px; margin-top: 8px; flex: none; }
-.gate[data-kind="finalize"] { border-color: var(--ok); background: color-mix(in oklch, var(--ok) 7%, var(--surface)); }
+
+/* tucked away: still on screen, still the loudest thing on it */
+.gate-pill {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: min(420px, calc(100vw - var(--rail) - 44px));
+  padding: 5px 12px;
+  font-size: 11.5px;
+  text-align: left;
+  border: 1px solid var(--note);
+  border-radius: 999px;
+  background: var(--note-bg);
+  box-shadow: 0 10px 26px rgb(0 0 0 / 0.16);
+  animation: note-nudge 2.6s ease-in-out infinite;
+}
+.gate-pill:hover { border-color: var(--note); }
+@keyframes note-nudge {
+  0%, 88%, 100% { box-shadow: 0 10px 26px rgb(0 0 0 / 0.16); }
+  94% { box-shadow: 0 10px 26px rgb(0 0 0 / 0.16), 0 0 0 4px color-mix(in oklch, var(--note) 22%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) { .gate-pill { animation: none; } }
+
+/* too narrow to sit beside the rail: sit on top of it and drop the pointer */
+@media (max-width: 820px) {
+  .gate, .gate-pill { right: 14px; }
+  .gate { width: min(460px, calc(100vw - 28px)); }
+  .gate::after, .gate-pill::after { display: none; }
+}
 .gate .blocker-warn {
   border: 1px solid var(--danger);
   border-radius: 8px;

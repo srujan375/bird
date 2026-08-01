@@ -3,8 +3,8 @@
 import httpx
 import pytest
 
-from ox.llm.discovery import discover_models
-from ox.llm.registry import ProviderConfig, Registry
+from bird.llm.discovery import discover_models
+from bird.llm.registry import ProviderConfig, Registry
 
 
 def make_registry(providers=None, models=None):

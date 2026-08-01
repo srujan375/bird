@@ -1,7 +1,7 @@
-# ox — a multi-harness coding agent
+# bird — a multi-harness coding agent
 
 A coding agent built for **small open models**. Instead of one giant prompt and a
-grep loop, `ox` gives the model a **knowledge graph of your repo** to ask
+grep loop, `bird` gives the model a **knowledge graph of your repo** to ask
 questions of, and splits the work across **specialized harnesses** — a
 conversational lead, an architect that designs on a live canvas, and a coder that
 edits the repo — all running on one shared engine.
@@ -11,7 +11,7 @@ you can swap the model mid-conversation without losing the conversation.
 
 ```
                  ┌──────────────────────────────────────────┐
-   ox ──────────▶│  lead — talks, researches, dispatches     │
+   bird ──────────▶│  lead — talks, researches, dispatches     │
                  └──────────────┬──────────────────┬────────┘
                                 │                  │
                  ┌──────────────▼───────┐   ┌──────▼──────────────┐
@@ -34,7 +34,7 @@ module for one function. By the time it knows where to make the change, the
 window is full and the plan is gone. The bottleneck isn't reasoning — it's
 *context acquisition*.
 
-So the bet behind `ox` is: **stop making the model explore, and answer it
+So the bet behind `bird` is: **stop making the model explore, and answer it
 instead.**
 
 - **A knowledge graph, not a grep loop.** The repo is extracted into a graph
@@ -68,7 +68,7 @@ instead.**
 ## Install
 
 ```bash
-git clone <this repo> && cd ox
+git clone <this repo> && cd bird
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 
@@ -96,14 +96,14 @@ cd arch-ui  && npm install    # only needed to rebuild the architecture canvas
 ```bash
 cd /path/to/your/project
 
-ox                                       # talk to the lead — the front door
-ox lead "add rate limiting to the API"   # one-shot: it routes and builds
-ox code "fix the failing test in tests/test_pricing.py"
-ox arch "design a job queue for this service"   # opens the canvas
+bird                                       # talk to the lead — the front door
+bird lead "add rate limiting to the API"   # one-shot: it routes and builds
+bird code "fix the failing test in tests/test_pricing.py"
+bird arch "design a job queue for this service"   # opens the canvas
 ```
 
 The first run builds the knowledge graph **in the background** — the harness
-starts immediately. Until the graph is ready, `kg_query` tells the model to fall
+starts immediately. Until the graph is ready, `kg_query` tells the model to fallyy
 back to bash search, and the runner injects a notice the moment the graph comes
 online.
 
@@ -113,7 +113,7 @@ online.
 
 Three ship today; two more are in progress.
 
-### `lead` — the front door *(bare `ox`)*
+### `lead` — the front door *(bare `bird`)*
 
 The conversational layer. It answers questions, explores the repo, researches the
 web, and decides each turn whether to reply or to **dispatch**.
@@ -128,7 +128,7 @@ while answering a question" is structurally impossible.
 | A new feature or non-trivial structural work | `architect` → (user approves) → `code` |
 | A localized change or bug fix | `code` directly |
 
-### `arch` — architecture on a live canvas *(`ox arch`)*
+### `arch` — architecture on a live canvas *(`bird arch`)*
 
 Opens a browser page and designs *with* you. The model mutates typed state; the
 page renders it. The conversation is the work — the tools are the memory.
@@ -152,14 +152,14 @@ page renders it. The conversation is the work — the tools are the memory.
   those gates and nothing else.
 - **A real handoff.** Finalize writes `bundle/architecture.md` + `.json`, *and*
   seeds the knowledge graph with a node per component, entity, endpoint and
-  module — so turn one of `ox code` can query a system that doesn't exist yet.
+  module — so turn one of `bird code` can query a system that doesn't exist yet.
 
 ```bash
-ox arch "design a multi-tenant billing service"
-ox code "build it" --from-arch latest      # or let the lead do both
+bird arch "design a multi-tenant billing service"
+bird code "build it" --from-arch latest      # or let the lead do both
 ```
 
-### `code` — the builder *(`ox code`, `ox chat`)*
+### `code` — the builder *(`bird code`, `bird chat`)*
 
 The ReAct coding loop: read → plan → edit → verify.
 
@@ -184,7 +184,7 @@ investigation that lands its findings in the knowledge graph). See
 ## Features
 
 **Context engine**
-- Per-branch knowledge graph at `.ox/kg/<branch>/` — switching branches never
+- Per-branch knowledge graph at `.bird/kg/<branch>/` — switching branches never
   corrupts it. Content-hashed extraction cache shared across branches.
 - Code via pure AST extraction (no LLM, no keys). Docs, papers and images
   additionally go through semantic extraction when a backend is available.
@@ -212,7 +212,7 @@ investigation that lands its findings in the knowledge graph). See
 - Allowlisted bash; every rejection logged as a session event.
 
 **Sessions**
-- Everything logged to `.ox/sessions/<run-id>/events.jsonl`.
+- Everything logged to `.bird/sessions/<run-id>/events.jsonl`.
 - `/sessions` to browse, `/continue` to resume, `/rename` to label,
   `/reload` to respawn on freshly-loaded code *without losing the conversation*.
 - Two-stage compaction at 90% of the window: stub old tool results (free), then
@@ -222,7 +222,7 @@ investigation that lands its findings in the knowledge graph). See
 - Markdown procedures with front-matter, loaded on demand via the `skill` tool or
   a `/<skill-name>` slash command. Only the one-line index sits in the system
   prompt; the body loads when it's relevant.
-- Discovery order: project `.ox/skills/` → user `~/.ox/skills/` → built-in.
+- Discovery order: project `.bird/skills/` → user `~/.bird/skills/` → built-in.
 
 **Research**
 - `web_search` (DuckDuckGo, no API key) and `web_fetch` (HTML → markdown, cached
@@ -236,21 +236,21 @@ investigation that lands its findings in the knowledge graph). See
 - **Architecture Workbench** in the browser (React + `@xyflow/react` + Zustand)
   with a clickable, editable canvas, a five-tab rail, and localStorage-persisted
   viewport. Ships pre-built — no Node required to use it.
-- `ox serve`: JSON-lines over stdio, for embedding anywhere.
+- `bird serve`: JSON-lines over stdio, for embedding anywhere.
 
 ---
 
 ## Commands
 
 ```bash
-ox                          # interactive lead (TUI if installed, else REPL)
-ox lead "task"              # one-shot lead: routes and builds
-ox chat                     # interactive code harness
-ox code "task"              # one-shot code harness
-ox code "task" --from-arch latest   # seed from a finalized architecture
-ox arch ["what to design"]  # architecture session in the browser
-ox kg status|build|update|query "question"
-ox serve [--harness code|lead]      # JSON-lines bridge over stdio
+bird                          # interactive lead (TUI if installed, else REPL)
+bird lead "task"              # one-shot lead: routes and builds
+bird chat                     # interactive code harness
+bird code "task"              # one-shot code harness
+bird code "task" --from-arch latest   # seed from a finalized architecture
+bird arch ["what to design"]  # architecture session in the browser
+bird kg status|build|update|query "question"
+bird serve [--harness code|lead]      # JSON-lines bridge over stdio
 ```
 
 **Flags** — shared by `code` / `chat` / `lead` / `serve` / `arch`:
@@ -281,15 +281,15 @@ the role aliases. Override per-run with `--models-json`.
 |---|---|
 | `OPENROUTER_API_KEY` | enables OpenRouter models + catalog discovery |
 | `OLLAMA_API_KEY` | enables Ollama Cloud |
-| `OX_KG_BACKEND` | override the `kg` alias with a raw `graphify.llm` backend, which then uses graphify's own env vars for URL and key; `none` disables semantic extraction entirely |
-| `OX_KG_MODEL` | model for that extraction — wins over the `kg` alias's model, and applies to either path |
-| `OX_PYTHON` | which Python the TUI spawns `ox serve` with |
-| `OX_URL` | dev only — the live `ox arch` port that `arch-ui`'s Vite dev server proxies to |
+| `BIRD_KG_BACKEND` | override the `kg` alias with a raw `graphify.llm` backend, which then uses graphify's own env vars for URL and key; `none` disables semantic extraction entirely |
+| `BIRD_KG_MODEL` | model for that extraction — wins over the `kg` alias's model, and applies to either path |
+| `BIRD_PYTHON` | which Python the TUI spawns `bird serve` with |
+| `BIRD_URL` | dev only — the live `bird arch` port that `arch-ui`'s Vite dev server proxies to |
 
 **On disk** (inside the target repo)
 
 ```
-.ox/
+.bird/
   kg/<branch-slug>/graphify-out/     the knowledge graph
   sessions/<run-id>/                 events.jsonl, artifacts/, bundle/
   skills/*.md                        project-local skills
@@ -301,7 +301,7 @@ graphify-out/cache/                  content-hashed extraction cache
 ## Layout
 
 ```
-src/ox/
+src/bird/
   cli.py            entry point — every subcommand
   engine/           runner (ReAct loop, guards, nudges), compactor, session log
   context/kg.py     the knowledge graph
@@ -342,15 +342,15 @@ python3 scripts/arch_devserver.py    # the real arch stack, scripted model —
                                      # for working on the Workbench page
 ```
 
-The Workbench build output in `src/ox/harnesses/arch/static/` **is committed on
-purpose**, so `ox arch` works for someone who has never installed Node. Rebuild
+The Workbench build output in `src/bird/harnesses/arch/static/` **is committed on
+purpose**, so `bird arch` works for someone who has never installed Node. Rebuild
 (`cd arch-ui && npm run build`) and commit `index.html` and `assets/*` together —
 `tests/test_packaging.py` fails if they drift apart.
 
 To try the agent end to end, run it from inside any repository you have, or
-point it at one with `--repo` (a subcommand flag: `ox lead --repo
+point it at one with `--repo` (a subcommand flag: `bird lead --repo
 /path/to/project`). A small project with a deliberately planted bug makes the
-best manual smoke test — run `ox code "fix the failing test"` and watch which
+best manual smoke test — run `bird code "fix the failing test"` and watch which
 tools it reaches for.
 
 ---
@@ -380,5 +380,5 @@ gain the knowledge graph, session resume, model swapping and skills for free.
   instead of re-reading it.
 
 Contributions and issues are welcome — the harness registry
-(`src/ox/harnesses/registry.py`) is the extension point if you want to build
+(`src/bird/harnesses/registry.py`) is the extension point if you want to build
 your own.

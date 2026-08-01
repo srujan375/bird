@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from ox.llm.registry import Registry, RegistryError
+from bird.llm.registry import Registry, RegistryError
 
 
 @pytest.fixture

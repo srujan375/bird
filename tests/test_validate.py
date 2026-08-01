@@ -1,5 +1,5 @@
-from ox.llm.types import ToolCall, ToolSpec
-from ox.llm.validate import validate_tool_call
+from bird.llm.types import ToolCall, ToolSpec
+from bird.llm.validate import validate_tool_call
 
 READ = ToolSpec(
     name="read",

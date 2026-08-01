@@ -2,11 +2,11 @@ import json
 
 import pytest
 
-from ox.engine.runner import Runner
-from ox.llm.registry import ModelSpec, ProviderConfig, Registry
-from ox.llm.types import LLMResponse, Message, ToolCall, Usage
-from ox.harnesses.code import code_harness_tools
-from ox.tools import ToolContext
+from bird.engine.runner import Runner
+from bird.llm.registry import ModelSpec, ProviderConfig, Registry
+from bird.llm.types import LLMResponse, Message, ToolCall, Usage
+from bird.harnesses.code import code_harness_tools
+from bird.tools import ToolContext
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -244,7 +244,7 @@ class StubKG:
         return "[repo map]"
 
     def query(self, question, budget=2000):
-        from ox.context.kg import KGQueryResult
+        from bird.context.kg import KGQueryResult
 
         return KGQueryResult(text="NODE x [f.py:1]", hit_count=1)
 
@@ -319,7 +319,7 @@ def test_no_drift_nudge_without_kg_tool(make_runner):
 
 
 def test_repair_interrupted_answers_dangling_calls():
-    from ox.engine.runner import repair_interrupted
+    from bird.engine.runner import repair_interrupted
 
     messages = [
         Message(role="user", content="go"),
@@ -338,7 +338,7 @@ def test_repair_interrupted_answers_dangling_calls():
 
 
 def test_repair_interrupted_noop_on_clean_transcript():
-    from ox.engine.runner import repair_interrupted
+    from bird.engine.runner import repair_interrupted
 
     messages = [Message(role="user", content="go"), assistant(content="hi")]
     repair_interrupted(messages)

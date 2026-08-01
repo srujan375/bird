@@ -6,6 +6,9 @@ import { useState } from "react";
 import { useCanvas } from "../store/canvas";
 import { resolveConcern, useSession } from "../store/session";
 import { Chat } from "./Chat";
+import { Gate } from "./Gate";
+import { Markdown } from "./Markdown";
+import { RailGrip } from "./RailGrip";
 import type { ArchState, Concern } from "../types";
 
 const SEVERITY_RANK: Record<string, number> = { blocker: 0, risk: 1, smell: 2 };
@@ -97,9 +100,9 @@ function ConcernsPanel({ arch, gaps }: { arch: ArchState; gaps: Record<string, s
             <span className="spacer" style={{ flex: 1 }} />
             <span className="tag">{c.status === "open" ? c.source : c.status}</span>
           </div>
-          <p style={{ color: "var(--ink)" }}>{c.claim}</p>
-          {c.alternative && <p>instead: {c.alternative}</p>}
-          {c.resolution && <p className="faint">→ {c.resolution}</p>}
+          <Markdown text={c.claim} style={{ color: "var(--ink)" }} />
+          {c.alternative && <Markdown text={`instead: ${c.alternative}`} />}
+          {c.resolution && <Markdown text={`→ ${c.resolution}`} className="md faint" />}
           {editable && c.status === "open" && <ConcernActions c={c} />}
         </div>
       ))}
@@ -131,7 +134,7 @@ function DecisionsPanel({ arch }: { arch: ArchState }) {
             {d.status === "deferred" && <span className="tag">deferred</span>}
           </div>
           <h4>{d.topic} → {d.choice}</h4>
-          <p>{d.rationale}</p>
+          <Markdown text={d.rationale} />
           {d.options.length > 0 && (
             <p className="faint mono" style={{ fontSize: 10.5 }}>
               weighed: {d.options.map((o) => o.name).join(" · ")}
@@ -156,8 +159,8 @@ function QuestionsPanel({ arch }: { arch: ArchState }) {
             <span className="tag">{q.source}</span>
             {q.blocking && !q.resolution && <span className="tag">blocking</span>}
           </div>
-          <p style={{ color: "var(--ink)" }}>{q.question}</p>
-          {q.answer && <p className="faint">→ {q.answer}</p>}
+          <Markdown text={q.question} style={{ color: "var(--ink)" }} />
+          {q.answer && <Markdown text={`→ ${q.answer}`} className="md faint" />}
         </div>
       ))}
     </div>
@@ -190,14 +193,19 @@ function FlowsPanel({ arch }: { arch: ArchState }) {
 export function Rail() {
   const arch = useSession((s) => s.arch);
   const gaps = useSession((s) => s.gaps);
+  const permission = useSession((s) => s.permission);
   const tab = useCanvas((s) => s.railTab);
   const setTab = useCanvas((s) => s.setRailTab);
+  /** The composer's text, held here because the gate spends it too: a ruling
+   *  carries whatever you had typed as its reason, and the gate outlives the
+   *  Chat tab it was raised in. */
+  const [draft, setDraft] = useState("");
 
   const openConcerns = arch?.concerns.filter((c) => c.status === "open").length ?? 0;
   const openQuestions = arch?.questions.filter((q) => !q.resolution).length ?? 0;
 
-  const tabs: { id: string; label: string; count?: number }[] = [
-    { id: "chat", label: "Chat" },
+  const tabs: { id: string; label: string; count?: number; alert?: boolean }[] = [
+    { id: "chat", label: "Chat", alert: !!permission },
     { id: "concerns", label: "Concerns", count: openConcerns },
     { id: "decisions", label: "Decisions", count: arch?.decisions.length ?? 0 },
     { id: "questions", label: "Questions", count: openQuestions },
@@ -206,15 +214,24 @@ export function Rail() {
 
   return (
     <aside className="rail">
+      <RailGrip />
       <div className="rail-tabs">
         {tabs.map((t) => (
           <button key={t.id} data-on={tab === t.id} onClick={() => setTab(t.id)}>
             {t.label}
+            {t.alert ? <span className="alert-dot" title="waiting on you" /> : null}
             {t.count ? <span className="count">{t.count}</span> : null}
           </button>
         ))}
       </div>
-      {tab === "chat" && <Chat />}
+
+      {/* outside the tab switch: an unanswered ruling is the one thing that
+          must not disappear because you went to read the concerns */}
+      {permission && (
+        <Gate req={permission} reason={draft.trim()} onRespond={() => setDraft("")} />
+      )}
+
+      {tab === "chat" && <Chat draft={draft} setDraft={setDraft} />}
       {tab !== "chat" && !arch && <div className="rail-body"><div className="empty-note">Waiting for state…</div></div>}
       {tab === "concerns" && arch && <ConcernsPanel arch={arch} gaps={gaps} />}
       {tab === "decisions" && arch && <DecisionsPanel arch={arch} />}

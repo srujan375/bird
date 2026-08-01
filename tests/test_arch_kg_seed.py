@@ -9,9 +9,9 @@ import json
 
 import pytest
 
-from ox.context.kg import KG
-from ox.harnesses.arch.kg_seed import build_seed, seed_kg
-from ox.harnesses.arch.state import (
+from bird.context.kg import KG
+from bird.harnesses.arch.kg_seed import build_seed, seed_kg
+from bird.harnesses.arch.state import (
     ApiFacet,
     ArchState,
     Component,
@@ -172,9 +172,9 @@ def test_no_kg_is_not_an_error():
 def test_finalize_seeds_the_graph(tmp_path):
     """Through the real gate: `done` writes the bundle and the graph together,
     because a builder needs both — the prose to read and the graph to ask."""
-    from ox.harnesses.arch.session import ArchSession
-    from ox.harnesses.arch.tools import ArchDoneTool
-    from ox.tools import ToolContext
+    from bird.harnesses.arch.session import ArchSession
+    from bird.harnesses.arch.tools import ArchDoneTool
+    from bird.tools import ToolContext
 
     class Broker:
         def request(self, payload):

@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from ox.http_transport import HttpTransport
+from bird.http_transport import HttpTransport
 
 
 class Handlers:

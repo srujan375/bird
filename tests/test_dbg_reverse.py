@@ -1,5 +1,5 @@
 import re
-from ox.harnesses.arch.reverse_seed import _extract_facet, _symbol_name
+from bird.harnesses.arch.reverse_seed import _extract_facet, _symbol_name
 
 
 def test_dbg_api():

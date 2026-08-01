@@ -1,5 +1,5 @@
 [project]
-name = "ox"
+name = "bird"
 version = "0.1.0"
 description = "Multi-harness coding agent with a knowledge-graph context engine for small open models"
 requires-python = ">=3.11"
@@ -16,7 +16,7 @@ dependencies = [
 dev = ["pytest>=8.0", "pytest-httpx>=0.30"]
 
 [project.scripts]
-ox = "ox.cli:main"
+bird = "bird.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -31,12 +31,12 @@ where = ["src"]
 # harness/ became engine/ and the instructions moved into harnesses/<name>/ —
 # so wheels shipped no system prompts and no arch page at all. Editable
 # installs hid it, because they import straight from the source tree.
-ox = ["skills/builtin/*.md"]
-"ox.harnesses.code" = ["instructions.md"]
-"ox.harnesses.lead" = ["instructions.md"]
+bird = ["skills/builtin/*.md"]
+"bird.harnesses.code" = ["instructions.md"]
+"bird.harnesses.lead" = ["instructions.md"]
 # static/ is the built Workbench (source in arch-ui/, `npm run build`); the
 # asset filenames are content-hashed, hence the glob.
-"ox.harnesses.arch" = ["instructions.md", "static/index.html", "static/assets/*"]
+"bird.harnesses.arch" = ["instructions.md", "static/index.html", "static/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
