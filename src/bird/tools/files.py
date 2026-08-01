@@ -371,6 +371,7 @@ def _rel_path(repo_root: Path, dir_path: Path, name: str, is_dir: bool) -> str:
     return s
 
 
+class ReadImageTool(Tool):
     """Read an image file via the vision model sidecar.
 
     The main conversation model never sees image bytes: this tool's parameter
