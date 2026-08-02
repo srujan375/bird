@@ -11,8 +11,26 @@ multi-harness architecture.excalidraw
 tui/node_modules
 .playwright-mcp/
 
+# benchmark output: trial repos and raw results are large and machine-specific.
+# The published REPORT.md is committed by hand when a sweep is worth quoting.
+# The glob (not just evals/results/) matters: a sweep against a private repo
+# writes to evals/results-private/, whose work/ holds full copies of that repo.
+evals/results*/
+# same for the design benchmark, whose work/ holds every arm's raw transcript
+# and _plans/ holds the generated plans
+evals/design/results*/
+
+# benchmark tasks that point at private or proprietary repos. These are for
+# local validation only — they can never be part of a published benchmark
+# (a reader can't reproduce them), and their patches quote closed source.
+evals/tasks-private/
+
 # local design/handover material — kept on disk, not in the repo
 Arch Canvas Handover.pdf
 Arch harness React redesign/
 docs/
 _demo_reverse_seed.py
+
+# design-benchmark tasks pointing at the proprietary A2V2 repo. Local validation
+# only — a reader cannot reproduce them and the trap text quotes closed source.
+evals/design/tasks-private/

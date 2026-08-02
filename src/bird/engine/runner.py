@@ -302,6 +302,11 @@ class Runner:
                         for tc in assistant.tool_calls
                     ],
                     "stop_reason": resp.stop_reason,
+                    # per-turn cost, so an analysis can bound spend to a point in
+                    # the run ("tokens burned before the first edit") instead of
+                    # only reading the total at the end
+                    "input_tokens": resp.usage.input_tokens,
+                    "output_tokens": resp.usage.output_tokens,
                 },
             )
 

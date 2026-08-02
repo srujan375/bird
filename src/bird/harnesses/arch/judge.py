@@ -69,17 +69,27 @@ def _review_prompt(state: ArchState) -> str:
     return "\n\n".join(parts)
 
 
-_LINE_RE = re.compile(r"^\s*[-*]\s*(?:\[(?P<sev>\w+)\]\s*)?(?P<rest>.+)$")
+# A finding is a line that is bulleted, or tagged with a [severity], or both.
+# Requiring the bullet — as this once did — silently threw away every finding
+# from any model that emits the severity tag without one, which is common and
+# which the critic cannot report, because a critic that returns nothing is
+# indistinguishable from a critic that found nothing. Requiring *one of the
+# two* is what keeps ordinary prose ("Here are my findings:") from becoming a
+# concern now that the bullet is optional.
+_LINE_RE = re.compile(r"^\s*(?:(?P<bullet>[-*])\s*)?(?:\[(?P<sev>\w+)\]\s*)?(?P<rest>.+)$")
 
 
 def parse_findings(text: str) -> list[dict[str, str]]:
     """Tolerant parser: the strict form is '- [sev] target | claim | alternative',
-    but a bare '- something is wrong' still lands as a risk against the design."""
+    but a bare '- something is wrong' still lands as a risk against the design,
+    and so does an unbulleted '[sev] target | claim'."""
     findings: list[dict[str, str]] = []
     for line in text.splitlines():
         m = _LINE_RE.match(line)
         if not m:
             continue
+        if not (m.group("bullet") or m.group("sev")):
+            continue  # unmarked prose: a preamble, not a finding
         rest = m.group("rest").strip()
         if len(rest) < 10:
             continue

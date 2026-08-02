@@ -67,6 +67,13 @@ class SessionRecorder:
         record = {
             "seq": self._seq,
             "ts": time.time(),
+            # `ts` says *when* something happened and is comparable across
+            # processes, but it is wall clock: it jumps on an NTP correction and
+            # keeps counting while the machine is asleep. `mono` never goes
+            # backwards and excludes suspend, so it is the one to subtract when
+            # measuring how long something took. A laptop that slept mid-run
+            # otherwise reports the nap as model latency.
+            "mono": time.monotonic(),
             "type": event_type,
             "data": data,
         }

@@ -13,7 +13,7 @@ from .context.kg import KG
 from .engine.runner import Runner
 from .engine.session import SessionRecorder, new_run_id
 from .llm.ollama import Ollama, OllamaError
-from .llm.registry import Registry
+from .llm.registry import Registry, RegistryError
 from .llm.wire.openai_compat import OpenAICompatClient
 from .harnesses.handoff import read_seed
 from .harnesses.lead import lead_harness_tools
@@ -32,6 +32,9 @@ def _add_common(p) -> None:
     p.add_argument("--repo", default=".", help="repository root (default: cwd)")
     p.add_argument("--model", default="default", help="model alias or provider:model spec")
     p.add_argument("--no-kg", action="store_true", help="control arm: no kg_query tool")
+    p.add_argument("--no-web", action="store_true",
+                   help="drop web_search/web_fetch — a network-free run, so an "
+                        "eval measures the context engine and not the internet")
     p.add_argument("--max-turns", type=int, default=40)
     p.add_argument("--models-json", default=None, help="path to a models.json override")
     p.add_argument(
@@ -88,6 +91,18 @@ def main(argv: list[str] | None = None) -> int:
     arch = sub.add_parser("arch", help="architecture session in a browser page")
     arch.add_argument("task", nargs="?", default=None, help="what to design, in natural language")
     arch.add_argument("--no-open", action="store_true", help="don't open the browser (tests/headless)")
+    arch.add_argument("--headless", action="store_true",
+                      help="no browser and no human gates: design to a finalized bundle and "
+                           "exit. Both rulings auto-approve, so this is for evals and "
+                           "scripting — the product path is the Workbench")
+    arch.add_argument("--judge-model", default=None, metavar="MODEL",
+                      help="override the model the critic runs on (default: the `judge` "
+                           "alias). Point it at --model to make the whole session one "
+                           "model, which is what a 'small model' claim requires")
+    arch.add_argument("--no-critic", action="store_true",
+                      help="control arm: no second model reviewing the design. The critic is "
+                           "what arch adds over a single-pass planner, so this is the flag "
+                           "that makes that claim falsifiable")
     _add_common(arch)
 
     kg_cmd = sub.add_parser("kg", help="knowledge graph maintenance")
@@ -236,6 +251,7 @@ def _make_runner(args, registry, spec, kg, recorder, *, harness="code",
         ctx=ctx,
         max_turns=args.max_turns,
         with_kg=not args.no_kg,
+        with_web=not getattr(args, "no_web", False),
         tools=tools,
         seed_context=seed_context,
     )
@@ -339,6 +355,26 @@ def _serve_main(args) -> int:
         return Server(repl, broker=broker).run()
 
 
+def _apply_judge_override(registry, args) -> int | None:
+    """Repoint the `judge` alias for this session only.
+
+    Resolved to a concrete provider:model before it is stored, because an alias
+    whose value is another alias name has no ':' and would fail to resolve on
+    the critic's first pass — mid-run, on a background thread, where it
+    degrades to silence and looks like a critic that simply found nothing.
+    Returns an exit code on failure, None on success.
+    """
+    name = getattr(args, "judge_model", None)
+    if not name:
+        return None
+    try:
+        registry.aliases["judge"] = registry.resolve(name).spec
+    except RegistryError as e:
+        print(f"error: --judge-model {name!r}: {e}", file=sys.stderr)
+        return 2
+    return None
+
+
 def _arch_main(args) -> int:
     import time
     import webbrowser
@@ -346,6 +382,9 @@ def _arch_main(args) -> int:
     from .harnesses.arch import harness as arch_def
     from .harnesses.arch.judge import make_judge
     from .harnesses.arch.session import ArchSession
+
+    if args.headless:
+        return _arch_headless_main(args)
     from .http_transport import HttpTransport
     from .permissions import PermissionBroker
     from .repl import Repl
@@ -359,6 +398,9 @@ def _arch_main(args) -> int:
     if isinstance(setup, int):
         return setup
     registry, spec, kg, _build_proc, run_id, run_dir = setup
+    rc = _apply_judge_override(registry, args)
+    if rc is not None:
+        return rc
 
     with SessionRecorder(run_dir) as recorder:
         # arch mounts no gated tools (it designs, it doesn't touch the repo);
@@ -389,7 +431,7 @@ def _arch_main(args) -> int:
         else:
             arch = ArchSession(run_dir=run_dir)  # opens on the sketch layer
         arch.broker = server.broker
-        arch.judge = make_judge(registry, OpenAICompatClient())
+        arch.judge = None if args.no_critic else make_judge(registry, OpenAICompatClient())
 
         def on_state(payload: dict) -> None:
             # slim record (full state lives in arch_state.json); full payload to the page
@@ -424,6 +466,60 @@ def _arch_main(args) -> int:
                 print(f"  {p}")
             print("next: bird code")
         return rc
+
+
+def _arch_headless_main(args) -> int:
+    """`bird arch --headless`: design to a bundle with no browser and no human.
+
+    Both rulings (top-level approval, finalize) auto-approve, because there is
+    nobody to ask — which is exactly why this is not the product path. It exists
+    so an eval can run the arch harness as a subprocess and read the same
+    artifacts a Workbench session leaves behind: events.jsonl for the metrics,
+    arch_state.json for the design, and the bundle if the session finalized.
+
+    Prints `session=<run_dir>` on its last line, the same handle `bird code`
+    gives, so a harness can find the session without guessing at mtimes.
+    """
+    from .harnesses.arch.run import run_arch_headless
+
+    if not args.task:
+        print("bird arch --headless needs a task to design", file=sys.stderr)
+        return 2
+    if args.model == "default":
+        args.model = "architect"
+    setup = _setup(args)
+    if isinstance(setup, int):
+        return setup
+    registry, spec, kg, _build_proc, run_id, run_dir = setup
+    rc = _apply_judge_override(registry, args)
+    if rc is not None:
+        return rc
+
+    critic = "off" if args.no_critic else registry.aliases.get("judge", "judge")
+    print(f"bird arch --headless | model={spec.spec} | kg={'off' if args.no_kg else 'on'} "
+          f"| critic={critic} | session={run_id}")
+    with SessionRecorder(run_dir) as recorder:
+        arch = run_arch_headless(
+            repo_root=Path(args.repo).resolve(),
+            task=args.task,
+            registry=registry,
+            client=OpenAICompatClient(),
+            run_dir=run_dir,
+            kg=kg,
+            record=recorder.event,
+            model=args.model,
+            max_turns=args.max_turns,
+            critic=not args.no_critic,
+            with_web=not args.no_web,
+        )
+
+    phase = arch.state.phase
+    print(f"\n[{phase}] components={len(arch.state.components)} "
+          f"concerns={len(arch.state.concerns)} session={run_dir}")
+    # a session that ran out of turns still leaves a readable design in
+    # arch_state.json — it is a weaker result, not a crash, so it is not an
+    # error exit. The caller reads `phase` to tell the two apart.
+    return 0 if phase == "finalized" else 1
 
 
 def _lead_main(args) -> int:

@@ -115,9 +115,17 @@ def run_arch_headless(
     record: Callable[[str, dict], None] | None = None,
     model: str = "architect",
     max_turns: int = 40,
+    critic: bool = True,
+    with_web: bool = True,
 ) -> ArchSession:
     """Design `task` to a finalized bundle. Returns the ArchSession; the caller
-    checks `.state.phase == "finalized"` and reads the bundle from `run_dir`."""
+    checks `.state.phase == "finalized"` and reads the bundle from `run_dir`.
+
+    `critic=False` is the control arm: the second model that reviews the design
+    is simply absent, so nothing files a Concern the architect didn't think of.
+    `with_web=False` drops web_search/web_fetch, so a measured run can't
+    substitute a lucky search for design judgement.
+    """
     spec = registry.resolve(model)
     ctx = ToolContext(
         repo_root=repo_root,
@@ -129,7 +137,7 @@ def run_arch_headless(
     )
     arch = ArchSession(run_dir=run_dir)
     arch.broker = None  # no broker -> request_gate auto-approves both gates
-    arch.judge = make_judge(registry, client)
+    arch.judge = make_judge(registry, client) if critic else None
     if record is not None:
         arch.on_state = lambda payload: record(
             "arch_state", {"phase": payload["phase"], "changed": payload.get("changed")}
@@ -144,6 +152,7 @@ def run_arch_headless(
         ctx=ctx,
         max_turns=max_turns,
         with_kg=kg is not None,
+        with_web=with_web,
     )
     runner.run(task)
     return arch

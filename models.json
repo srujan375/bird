@@ -51,6 +51,11 @@
       "supports_tools": true,
       "constrained_decoding": false
     },
+    "ollama:deepseek-v4-flash": {
+      "context_window": 900000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
     "ollama:gemma4:31b": {
       "context_window": 200000,
       "supports_tools": true,
