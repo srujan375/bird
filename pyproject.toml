@@ -31,7 +31,9 @@ where = ["src"]
 # harness/ became engine/ and the instructions moved into harnesses/<name>/ —
 # so wheels shipped no system prompts and no arch page at all. Editable
 # installs hid it, because they import straight from the source tree.
-bird = ["skills/builtin/*.md"]
+# models.json lived at the repo root and hit the same failure — it moved into
+# the package so there is one copy, shipped and importable, not two that drift.
+bird = ["skills/builtin/*.md", "models.json"]
 "bird.harnesses.code" = ["instructions.md"]
 "bird.harnesses.lead" = ["instructions.md"]
 # static/ is the built Workbench (source in arch-ui/, `npm run build`); the

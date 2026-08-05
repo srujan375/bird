@@ -69,8 +69,22 @@ instead.**
 
 ```bash
 git clone <this repo> && cd bird
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+python3 -m venv .venv && .venv/bin/pip3 install -e '.[dev]'
 ```
+
+That gives you `.venv/bin/bird`, which runs from any directory without
+activating anything — its shebang is absolute. To get `bird` on your `PATH`
+everywhere, either symlink it (`ln -s "$PWD/.venv/bin/bird" ~/.local/bin/bird`)
+or install with [pipx](https://pipx.pypa.io), which manages the venv for you:
+
+```bash
+pipx install .              # from a clone
+pipx install git+<this repo>
+```
+
+Don't `pip3 install` without a venv: on Homebrew or system Python that fails
+with `externally-managed-environment` (PEP 668), and `--break-system-packages`
+"fixes" it by writing bird's dependencies into an interpreter your OS owns.
 
 Requires Python 3.11+, plus at least one model source:
 
@@ -273,7 +287,10 @@ graph tool). Then `-y/--yes` (auto-approve, for unattended `code`/`lead` runs) �
 ## Configuration
 
 **`models.json`** — providers, per-model context windows and capabilities, and
-the role aliases. Override per-run with `--models-json`.
+the role aliases. It ships inside the package at `src/bird/models.json`, so a
+checkout and an installed wheel read the same file. Override per-run with
+`--models-json`, which is also the way to keep your own config when bird is
+installed somewhere you'd rather not edit.
 
 **Environment**
 

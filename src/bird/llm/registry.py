@@ -20,7 +20,13 @@ DEFAULT_CONTEXT_WINDOW = 32768
 
 _warned_unknown_specs: set[str] = set()
 
-_BUILTIN_MODELS_JSON = Path(__file__).resolve().parents[3] / "models.json"
+# Package data (see pyproject), so this resolves to one file in both worlds:
+# src/bird/models.json in a checkout, bird/models.json in an installed wheel.
+# The old path was parents[3] — the repo root, which only exists in a source
+# tree. models.json shipped in no wheel at all, so every non-editable install
+# raised FileNotFoundError in load(); editable installs hid it by importing
+# straight from the source tree.
+_BUILTIN_MODELS_JSON = Path(__file__).resolve().parents[1] / "models.json"
 
 
 class RegistryError(Exception):
@@ -75,17 +81,28 @@ class Registry:
     def set_default(self, spec: str, context_window: int | None = None) -> bool:
         """Make `spec` the `default` alias, remembering its context window when
         discovery learned one. Persists by rewriting only the touched keys of
-        the loaded models.json; returns False when there is no file to write."""
+        the loaded models.json; returns False when there is no file to write, or
+        when the file is not writable — now reachable, since an installed wheel
+        can sit in a root-owned prefix. The in-memory alias applies either way,
+        so the current run still honours the choice; only persistence is lost."""
         self.aliases["default"] = spec
         if context_window and spec not in self.models:
             self.models[spec] = {"context_window": context_window}
         if self.path is None:
             return False
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        data.setdefault("aliases", {})["default"] = spec
-        if spec in self.models:
-            data.setdefault("models", {}).setdefault(spec, self.models[spec])
-        self.path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data.setdefault("aliases", {})["default"] = spec
+            if spec in self.models:
+                data.setdefault("models", {}).setdefault(spec, self.models[spec])
+            self.path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError as e:
+            print(
+                f"warning: could not persist default to {self.path} ({e}); "
+                f"pass --models-json to use a writable config",
+                file=sys.stderr,
+            )
+            return False
         return True
 
     def resolve(self, name: str) -> ModelSpec:

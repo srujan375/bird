@@ -81,12 +81,12 @@
       "supports_tools": true,
       "constrained_decoding": false
     },
-    "openrouter:moonshotai/kimi-k3": {
-      "context_window": 200000,
+    "openrouter:thinkingmachines/inkling": {
+      "context_window": 1000000,
       "supports_tools": true,
       "constrained_decoding": false
     },
-    "openrouter:thinkingmachines/inkling": {
+    "openrouter:moonshotai/kimi-k3": {
       "context_window": 1000000,
       "supports_tools": true,
       "constrained_decoding": false
@@ -94,7 +94,7 @@
   },
   "aliases": {
     "default": "ollama:glm-5.2",
-    "architect": "ollama:glm-5.2",
+    "architect": "openrouter:moonshotai/kimi-k3",
     "judge": "ollama:glm-5.2",
     "compactor": "ollama:gemma4:31b",
     "vision": "ollama:kimi-k2.7-code",
