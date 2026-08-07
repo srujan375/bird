@@ -17,7 +17,7 @@ export interface XY { x: number; y: number }
 const STORAGE_PREFIX = "bird_arch_canvas:";
 const CHAT_KEY = "bird_arch_chat_h"; // shared with the old page on purpose
 const RAIL_KEY = "bird_arch_rail_w"; // width follows you into the next run, like the chat height
-export const DEFAULT_RAIL = 380;
+export const DEFAULT_RAIL = 560; // §2: 210px Flows + the Chat column
 const MIN_RAIL = 260;
 /** The canvas keeps at least this much of the window, however far the rail is dragged. */
 const MIN_STAGE = 320;
@@ -35,7 +35,6 @@ export interface Overlay {
   viewport: { x: number; y: number; zoom: number } | null;
   layer: Layer | null; // null = follow the session (design once something is promoted)
   variant: string | null; // which sketch variant is on the canvas
-  railTab: string;
   railWidth: number;
   chatHeight: number;
   /** Which component's internals are open. Persisted like everything else here:
@@ -53,7 +52,6 @@ function emptyOverlay(): Overlay {
     viewport: null,
     layer: null,
     variant: null,
-    railTab: "chat",
     railWidth: clampRail(Number(localStorage.getItem(RAIL_KEY)) || DEFAULT_RAIL),
     chatHeight: Number(localStorage.getItem(CHAT_KEY)) || 320,
     openComponent: null,
@@ -66,6 +64,19 @@ function emptyOverlay(): Overlay {
 interface CanvasState extends Overlay {
   runId: string | null;
   selected: string | null; // namespaced node key
+  /**
+   * Which flow the canvas is lighting up, and how far through it playback is.
+   *
+   * Ephemeral and deliberately outside `Overlay`: this is a hover state, and
+   * persisting it would restore a session with two thirds of its canvas dimmed
+   * for a flow nobody is pointing at. `flowStep` is -1 when not playing.
+   */
+  flowLit: string | null;
+  flowPlaying: string | null;
+  flowStep: number;
+  litFlow: (id: string | null) => void;
+  playFlow: (id: string | null) => void;
+  setFlowStep: (i: number) => void;
   /** Bumped to ask the canvas to frame the graph again. Ephemeral, never saved:
    *  Tidy up lives in the top bar, outside the React Flow provider. */
   refitNonce: number;
@@ -79,7 +90,6 @@ interface CanvasState extends Overlay {
   setViewport: (v: { x: number; y: number; zoom: number }) => void;
   setLayer: (l: Layer | null) => void;
   setVariant: (v: string | null) => void;
-  setRailTab: (t: string) => void;
   /** A frame of a rail drag: width only, not written to storage. */
   dragRail: (w: number) => void;
   setRailWidth: (w: number) => void;
@@ -108,6 +118,18 @@ export const useCanvas = create<CanvasState>((set, get) => ({
   runId: null,
   selected: null,
   refitNonce: 0,
+  flowLit: null,
+  flowPlaying: null,
+  flowStep: -1,
+
+  // hovering off a flow must not cancel one that is playing — playback is a
+  // deliberate act and the pointer wanders
+  litFlow: (id) => set((s) => (s.flowPlaying ? {} : { flowLit: id })),
+  playFlow: (id) =>
+    set(id === null
+      ? { flowPlaying: null, flowStep: -1 }
+      : { flowPlaying: id, flowLit: id, flowStep: 0 }),
+  setFlowStep: (i) => set({ flowStep: i }),
 
   requestRefit: () => set((s) => ({ refitNonce: s.refitNonce + 1 })),
 
@@ -176,7 +198,6 @@ export const useCanvas = create<CanvasState>((set, get) => ({
 
   setLayer: (layer) => set((s) => persist(s, { layer })),
   setVariant: (variant) => set((s) => persist(s, { variant })),
-  setRailTab: (railTab) => set((s) => persist(s, { railTab })),
 
   // same split as a node drag: every frame is state, only the drop is storage
   dragRail: (railWidth) => set({ railWidth: clampRail(railWidth) }),
@@ -201,7 +222,6 @@ function current(s: CanvasState): Overlay {
     viewport: s.viewport,
     layer: s.layer,
     variant: s.variant,
-    railTab: s.railTab,
     railWidth: s.railWidth,
     chatHeight: s.chatHeight,
     openComponent: s.openComponent,

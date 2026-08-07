@@ -26,6 +26,7 @@ import "@xyflow/react/dist/style.css";
 import {
   DESIGN_SIZE,
   SKETCH_SIZE,
+  obstructions,
   edgeKey,
   findBackEdges,
   layout,
@@ -34,9 +35,10 @@ import {
   type Size,
 } from "../layout";
 import { designKey, sketchKey, useCanvas, type XY } from "../store/canvas";
-import { useSession } from "../store/session";
+import { CHANGE_RING_MS, useSession } from "../store/session";
 import { palette, useTheme, type Palette } from "../theme";
 import { edgeTypes } from "./edges";
+import { NOTE_COL, Notes } from "./Notes";
 import {
   HANDLE,
   nodeTypes,
@@ -47,6 +49,11 @@ import type { ArchState, Concern, Layer, Variant } from "../types";
 
 /** Below this a card's responsibility line stops being legible. */
 const READABLE_ZOOM = 0.62;
+
+/** How long a card's two-beat entrance takes (pop 200ms + settle 400ms), and
+ *  therefore how long an arrow into it waits before it starts drawing. Must
+ *  match the `.node` animation in theme.css. */
+const ENTRANCE_MS = 600;
 
 const EDGE_STYLE: Record<string, { strokeDasharray?: string; strokeWidth: number }> = {
   sync: { strokeWidth: 1.6 },
@@ -65,10 +72,14 @@ const EDGE_STYLE: Record<string, { strokeDasharray?: string; strokeWidth: number
  * every few pixels of a drag it picks a different one — the line snaps between
  * layouts while the card moves smoothly. A curve just bends.
  */
-function wire(stroke: string, feedback: boolean): Partial<Edge> {
+function wire(stroke: string, feedback: boolean, clearAbove?: number): Partial<Edge> {
+  // A feedback edge already loops clear underneath, so an obstruction in its
+  // corridor is one it is going around rather than through.
+  const skip = !feedback && clearAbove !== undefined;
   return {
-    type: feedback ? "feedback" : "default", // custom arc / bezier
-    pathOptions: feedback ? undefined : { curvature: 0.32 },
+    type: feedback ? "feedback" : skip ? "skip" : "default", // custom arcs / bezier
+    data: skip ? { top: clearAbove } : undefined,
+    pathOptions: feedback || skip ? undefined : { curvature: 0.32 },
     sourceHandle: feedback ? HANDLE.loopOut : HANDLE.out,
     targetHandle: feedback ? HANDLE.loopIn : HANDLE.in,
     markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15, color: stroke },
@@ -103,11 +114,57 @@ const rank = (s: string) => (s === "blocker" ? 0 : s === "risk" ? 1 : 2);
  * the back-edge search over the entire graph with it. Neither depends on where
  * a card sits, so neither belongs on the drag path.
  */
+function questionsByTarget(questions: ArchState["questions"]): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  for (const q of questions) {
+    // `resolution === null` is open; a question with no target is about the
+    // design generally and belongs in the rail, not on a card.
+    if (q.resolution || !q.target) continue;
+    if (!map.has(q.target)) map.set(q.target, []);
+    map.get(q.target)!.push(q.question);
+  }
+  return map;
+}
+
+/**
+ * What a hovered or playing flow lights up (§4).
+ *
+ * `null` members mean nothing is lit — deliberately distinct from an empty set,
+ * which would mean "a flow is lit and touches nothing" and would correctly dim
+ * the entire canvas. A flow with no steps must not black the room out.
+ */
+export interface FlowLight {
+  comps: Set<string> | null;
+  edges: Set<string> | null;
+  /** the one hop currently playing, as `src->dst` */
+  step: string | null;
+}
+
+const DARK: FlowLight = { comps: null, edges: null, step: null };
+
+function flowLight(arch: ArchState | null, litId: string | null, step: number): FlowLight {
+  if (!arch || !litId) return DARK;
+  const flow = arch.flows.find((f) => f.id === litId);
+  if (!flow || flow.steps.length === 0) return DARK;
+  const comps = new Set<string>();
+  const edges = new Set<string>();
+  for (const s of flow.steps) {
+    comps.add(s.src);
+    comps.add(s.dst);
+    edges.add(`${s.src}->${s.dst}`);
+  }
+  const current = step >= 0 && step < flow.steps.length ? flow.steps[step] : null;
+  return { comps, edges, step: current ? `${current.src}->${current.dst}` : null };
+}
+
 function designCards(
   arch: ArchState,
   gaps: Record<string, string[]>,
   concerns: Map<string, Concern[]>,
+  questions: Map<string, string[]>,
   recentlyChanged: Record<string, number>,
+  light: FlowLight,
+  bornWith: Record<string, true>,
 ): Record<string, ComponentNodeData> {
   const owed = new Set(arch.obligations.filter((o) => o.status === "pending").map((o) => o.component_id));
   const out: Record<string, ComponentNodeData> = {};
@@ -116,8 +173,12 @@ function designCards(
       component: c,
       gaps: gaps[c.id] ?? [],
       concerns: concerns.get(c.id) ?? [],
+      questions: questions.get(c.id) ?? [],
       owes: owed.has(c.id),
       changed: (recentlyChanged[c.id] ?? 0) > Date.now(),
+      dim: light.comps !== null && !light.comps.has(c.id),
+      lit: light.comps !== null && light.comps.has(c.id),
+      born: !!bornWith[c.id],
     };
   }
   return out;
@@ -176,24 +237,56 @@ function designEdges(
   arch: ArchState,
   gaps: Record<string, string[]>,
   ink: Palette,
+  light: FlowLight,
+  recentlyChanged: Record<string, number>,
+  blocked: Map<string, number>,
 ): Edge[] {
   const back = findBackEdges(
     Object.keys(arch.components),
     arch.connections.map((c) => ({ src: c.src, dst: c.dst })),
   );
-  return arch.connections.map((conn, i) => {
+  return arch.connections.map((conn) => {
     const key = `${conn.src}->${conn.dst}`;
     const thin = (gaps[key] ?? []).length > 0;
     const feedback = back.has(edgeKey(conn.src, conn.dst));
     const stroke = thin ? ink.changed : feedback ? ink.edgeBack : ink.edge;
+    // Class names rather than inline colour: the highlight is a CSS transition
+    // on an attribute flip (§7), so playback stepping every 820ms never depends
+    // on React re-rendering the edge in time.
+    const onFlow = light.edges !== null && light.edges.has(key);
+    // §7: a connection that just arrived draws itself along its own path —
+    // but only once the components it runs between have finished arriving.
+    // `connect` refuses an endpoint that does not exist yet, so a new edge
+    // always follows its components; when it follows them *closely* the arrow
+    // would otherwise be drawn into a card still mid-pop.
+    const now = Date.now();
+    const fresh = (recentlyChanged[key] ?? 0) > now;
+    const landed = Math.max(
+      (recentlyChanged[conn.src] ?? 0) - CHANGE_RING_MS,
+      (recentlyChanged[conn.dst] ?? 0) - CHANGE_RING_MS,
+    );
+    const wait = fresh ? Math.max(0, landed + ENTRANCE_MS - now) : 0;
+    const cls = [
+      feedback ? "feedback" : "",
+      light.edges === null ? "" : onFlow ? "lit" : "dim",
+      light.step === key ? "walking" : "",
+      fresh ? "drawing" : "",
+    ].filter(Boolean).join(" ");
     return {
-      id: `${key}:${conn.label}:${i}`,
+      // src->dst alone: `connect` upserts by the pair, so there is exactly one
+      // connection per pair and the label/index are not needed to disambiguate.
+      // They were active harm — an index shifts when a connection is inserted
+      // ahead of this one, which changes the id, which remounts the edge in the
+      // middle of a live turn.
+      id: key,
       source: designKey(conn.src),
       target: designKey(conn.dst),
       label: conn.mechanism ? `${conn.label} via ${conn.mechanism}` : conn.label,
-      className: feedback ? "feedback" : undefined,
-      ...wire(stroke, feedback),
-      style: { ...EDGE_STYLE[conn.kind], stroke },
+      className: cls || undefined,
+      ...wire(stroke, feedback, blocked.get(key)),
+      // inline, because the wait is per-edge: the shorthand in the stylesheet
+      // sets no delay, and a longhand set here wins over it
+      style: { ...EDGE_STYLE[conn.kind], stroke, animationDelay: `${wait}ms` },
     };
   });
 }
@@ -202,6 +295,7 @@ function sketchCards(
   variant: Variant,
   concerns: Map<string, Concern[]>,
   recentlyChanged: Record<string, number>,
+  bornWith: Record<string, true>,
 ): Record<string, SketchNodeData> {
   const out: Record<string, SketchNodeData> = {};
   for (const n of Object.values(variant.nodes)) {
@@ -209,12 +303,13 @@ function sketchCards(
       node: n,
       concerns: concerns.get(n.id) ?? [],
       changed: (recentlyChanged[n.id] ?? 0) > Date.now(),
+      born: !!bornWith[n.id],
     };
   }
   return out;
 }
 
-function sketchEdges(variant: Variant, ink: Palette): Edge[] {
+function sketchEdges(variant: Variant, ink: Palette, blocked: Map<string, number>): Edge[] {
   const back = findBackEdges(
     Object.keys(variant.nodes),
     variant.links.map((l) => ({ src: l.src, dst: l.dst })),
@@ -222,13 +317,14 @@ function sketchEdges(variant: Variant, ink: Palette): Edge[] {
   return variant.links.map((l, i) => {
     const feedback = back.has(edgeKey(l.src, l.dst));
     const stroke = feedback ? ink.edgeBack : ink.sketchLine;
+    const clearAbove = blocked.get(`${l.src}->${l.dst}`);
     return {
       id: `${variant.id}:${l.src}->${l.dst}:${i}`,
       source: sketchKey(variant.id, l.src),
       target: sketchKey(variant.id, l.dst),
       label: l.label || undefined,
       className: feedback ? "feedback" : undefined,
-      ...wire(stroke, feedback),
+      ...wire(stroke, feedback, clearAbove),
       style: { ...EDGE_STYLE[l.kind] ?? EDGE_STYLE.sync, stroke },
     };
   });
@@ -267,6 +363,7 @@ function CanvasInner({ layer, variant }: Props) {
   const [frameTick, askForFrame] = useReducer((n: number) => n + 1, 0);
 
   const concerns = useMemo(() => concernsByTarget(arch?.concerns ?? []), [arch?.concerns]);
+  const questions = useMemo(() => questionsByTarget(arch?.questions ?? []), [arch?.questions]);
 
   // ---- ids + edges for whichever layer is showing ----
   const graph = useMemo(() => {
@@ -381,7 +478,11 @@ function CanvasInner({ layer, variant }: Props) {
     };
 
     const PAD = 48;
-    const room = { w: flowW - PAD * 2, h: flowH - PAD * 2 };
+    // §2 reserves the right margin for the note column, so the graph is framed
+    // into what is left of the canvas. Reserved unconditionally, not just when
+    // a concern exists: a canvas that re-frames itself the moment the critic
+    // files something would move every card out from under the reader.
+    const room = { w: flowW - NOTE_COL - PAD * 2, h: flowH - PAD * 2 };
     const whole = Math.min(room.w / box.w, room.h / box.h);
     const zoom = Math.min(1.05, Math.max(READABLE_ZOOM, whole));
     const place = (span: number, avail: number, origin: number) =>
@@ -408,18 +509,44 @@ function CanvasInner({ layer, variant }: Props) {
 
   const sketching = layer === "sketch" && variant !== null;
 
+  const bornWith = useSession((s) => s.bornWith);
+  const flowLit = useCanvas((s) => s.flowLit);
+  const flowStep = useCanvas((s) => s.flowStep);
+  const light = useMemo(() => flowLight(arch, flowLit, flowStep), [arch, flowLit, flowStep]);
+
   // everything that does not depend on where a card sits
   const cards = useMemo(() => {
     if (!arch) return {};
     return sketching && variant
-      ? sketchCards(variant, concerns, recentlyChanged)
-      : designCards(arch, gapsBySubject, concerns, recentlyChanged);
-  }, [arch, sketching, variant, concerns, recentlyChanged, gapsBySubject]);
+      ? sketchCards(variant, concerns, recentlyChanged, bornWith)
+      : designCards(arch, gapsBySubject, concerns, questions, recentlyChanged, light, bornWith);
+  }, [arch, sketching, variant, concerns, questions, recentlyChanged, gapsBySubject, light,
+      bornWith]);
+
+  // Which lines would be drawn through a card. Depends on where the cards
+  // actually are, so it recomputes as they move — a hand-placed node that
+  // wanders into a corridor makes the edge arc over it.
+  const blocked = useMemo(() => {
+    if (!arch) return new Map<string, number>();
+    return sketching && variant
+      ? obstructions(
+          Object.keys(variant.nodes),
+          variant.links.map((l) => ({ src: l.src, dst: l.dst })),
+          positions, (id) => sketchKey(variant.id, id), SKETCH_SIZE,
+        )
+      : obstructions(
+          Object.keys(arch.components),
+          arch.connections.map((c) => ({ src: c.src, dst: c.dst })),
+          positions, designKey, DESIGN_SIZE,
+        );
+  }, [arch, sketching, variant, positions]);
 
   const edges = useMemo(() => {
     if (!arch) return [];
-    return sketching && variant ? sketchEdges(variant, ink) : designEdges(arch, gapsBySubject, ink);
-  }, [arch, sketching, variant, gapsBySubject, ink]);
+    return sketching && variant
+      ? sketchEdges(variant, ink, blocked)
+      : designEdges(arch, gapsBySubject, ink, light, recentlyChanged, blocked);
+  }, [arch, sketching, variant, gapsBySubject, ink, light, recentlyChanged, blocked]);
 
   // and the thin part that does
   const nodes = useNodeObjects(
@@ -468,6 +595,11 @@ function CanvasInner({ layer, variant }: Props) {
       maxZoom={3}
     >
       <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="var(--grid)" />
+
+      {/* §5: objections live in the canvas's right margin, beside the thing
+          they are against. A child of ReactFlow rather than of the viewport —
+          the notes must not pan or zoom away from the reader. */}
+      <Notes />
       {/* concrete colours, not tokens: the minimap paints SVG fill attributes,
           which do not resolve a custom property — same trap as the arrowheads */}
       <MiniMap
@@ -507,6 +639,11 @@ export function useTidyUp(layer: Layer, variant: Variant | null) {
             designKey,
             DESIGN_SIZE,
           );
+    // §7: a damped spring with a small overshoot, not a jump. The class is
+    // transient — a permanent transition on the node transform would also
+    // animate dragging, which must track the cursor exactly.
+    document.body.classList.add("tidying");
+    window.setTimeout(() => document.body.classList.remove("tidying"), 600);
     clearPins();
     setPositions(fresh);
     requestRefit();

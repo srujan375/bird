@@ -10,6 +10,11 @@ Which tools are gated is a property of the tool (`Tool.requires_permission`),
 not a name list kept in some other module — a new mutating tool is gated by
 declaring itself so, next to its own implementation.
 
+A gated tool may still waive an individual call via `Tool.needs_permission`,
+which `bash` uses to run search-only commands unprompted (they have already
+been proven read-only by the category allowlist, so the prompt asked a
+question with one answer). Waived calls are logged as `auto_approved`.
+
 A broker is anything with `.request(payload) -> (approved, feedback)`:
 
   PermissionBroker  blocks the calling thread until a UI answers (serve/TUI,
@@ -104,6 +109,12 @@ class GatedTool(Tool):
         self.requires_permission = False  # already gated; never wrap twice
 
     def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        # The tool gets to say this particular call is provably safe (bash
+        # running a search-only command). Logged either way: an unprompted
+        # run must still be auditable in the session record.
+        if not self.inner.needs_permission(args, ctx):
+            ctx.emit("auto_approved", {"tool": self.name, "args": args})
+            return self.inner.execute(args, ctx)
         payload = permission_payload(self.name, args, ctx)
         approved, feedback = self.broker.request(payload)
         if not approved:
@@ -223,6 +234,8 @@ class ConsoleBroker:
         if self.auto_edits and kind in ("edit", "write"):
             print(f"  ✓ auto-approved {kind} {payload.get('file', '')}", file=self.out)
             return True, ""
+        if kind == "offer":
+            return self._offer(payload)
         self._render(payload)
         while True:
             try:
@@ -238,6 +251,27 @@ class ConsoleBroker:
                 self.auto_edits = True
                 return True, ""
             print("  answer y, n, or a", file=self.out)
+
+    def _offer(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        """A multiple-choice question, not an approval. The answer travels back
+        as the feedback string — the broker protocol is (approved, feedback) and
+        an offer's feedback IS the chosen option."""
+        options = [str(o) for o in payload.get("options", [])]
+        print(f"\n  ┌ {payload.get('question', '?')}", file=self.out)
+        for i, opt in enumerate(options, 1):
+            print(f"  │ {i}. {opt}", file=self.out)
+        print("  └", file=self.out)
+        while True:
+            try:
+                answer = self.ask(f"  choose [1-{len(options)}, or d=don't know] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print(file=self.out)
+                return False, ""
+            if answer in ("d", "", "n"):
+                return False, ""
+            if answer.isdigit() and 1 <= int(answer) <= len(options):
+                return True, options[int(answer) - 1]
+            print(f"  answer 1-{len(options)}, or d", file=self.out)
 
     def _render(self, payload: dict[str, Any]) -> None:
         kind = payload.get("kind", "?")

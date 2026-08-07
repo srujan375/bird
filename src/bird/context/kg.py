@@ -57,6 +57,69 @@ STOPWORDS = frozenset(
     "were has have had not you your our its all any use used using work works".split()
 )
 NEAREST_ON_MISS = 10
+
+# ---- questions the graph is the wrong tool for ----
+# A code graph knows symbols, files and the edges between them. It does not
+# know the git index, and it cannot enumerate filenames by pattern. Asked
+# anyway it does not fail — expansion finds *some* matching token, the
+# traversal fills its node cap, and sixty confident-looking nodes come back.
+# One logged session asked "list all files whose path contains mcp" five times,
+# reworded each time, and got sixty nodes every time. Recognising the shape of
+# the question and naming the right tool is the only honest answer.
+_OUT_OF_SCOPE = (
+    (
+        re.compile(
+            r"\bgit (status|diff|stash|working)\b|\buntracked\b|\buncommitted\b"
+            r"|\bworking (tree|directory|copy)\b|\bstaged\b|\bunstaged\b"
+            r"|\brecently (added|modified|changed|created)\b"
+        ),
+        "the state of the git working tree",
+        "bash: `git status`, `git diff --name-only`",
+    ),
+    (
+        re.compile(
+            r"\blist (all|any|every|the) files?\b"
+            r"|\bfiles? whose (name|path|filename)\b"
+            r"|\bfiles?\b.{0,40}\bin (its|their|the) (name|path|filename)\b"
+            r"|\b(any|all|every) files? (named|called)\b"
+            r"|\bfilenames?\b.{0,30}\b(contain|match)"
+            r"|\bfiles? .{0,20}\b(contain|containing|matching)\b.{0,30}\bin (the )?(name|path|filename)\b"
+        ),
+        "which files exist by name",
+        'the `glob` tool, e.g. glob {"pattern": "**/*mcp*"}',
+    ),
+)
+# Mentioning a directory the extractor filters out. These are exactly the paths
+# the graph cannot answer about (see ARTIFACT_DIRS), which is what makes them
+# the paths grep has to cover.
+_ARTIFACT_MENTION = re.compile(
+    r"\bnode_modules\b|\bsite-packages\b|\bdist/|\bbuild/|\bvendor\b"
+    r"|\b(dependency|dependencies|third[- ]party|installed package)\b"
+)
+
+
+def _out_of_scope(question: str) -> str | None:
+    """A redirect naming the right tool, or None if the graph should try."""
+    q = question.lower()
+    for pattern, subject, tool in _OUT_OF_SCOPE:
+        if pattern.search(q):
+            return (
+                f"The knowledge graph does not index {subject} — it maps code "
+                f"structure (symbols, files, and the edges between them). This "
+                f"question is answered by {tool}. Asking it here would return "
+                f"unrelated nodes, not a wrong-looking error, so it is being "
+                f"refused instead."
+            )
+    if _ARTIFACT_MENTION.search(q):
+        return (
+            "The knowledge graph deliberately does not index generated or "
+            "installed directories (node_modules, dist, build, site-packages) — "
+            "their contents are minified or vendored and would swamp the graph. "
+            "Search them directly instead: `grep` with a path inside the "
+            "directory, or `glob` to find the files first. kg_query still "
+            "answers questions about this repository's own source."
+        )
+    return None
 SEMANTIC_TEXT_CATEGORIES = ("document", "paper")
 KG_ALIAS = "kg"  # models.json role that names the semantic-extraction model
 # bird provider → the graphify backend that speaks its wire protocol. Every bird
@@ -254,6 +317,15 @@ class KGQueryResult:
     hit_count: int
     expanded_tokens: list[str] = field(default_factory=list)
     mode: str = "bfs"
+    # "exact"  at least one query term is a symbol/path token in the graph
+    # "weak"   seeds came only from substring/fuzzy expansion — the traversal
+    #          ran, but nothing in the question actually names anything indexed
+    # "none"   no seeds at all; "out_of_scope" the graph is the wrong tool
+    # Retrieval that always fills MAX_RESULT_NODES makes hit_count useless as a
+    # quality signal (it was 60 for all 26 queries of one logged session,
+    # including "check git status"). This is the field that can say "I don't
+    # know", so it is what the session log should be judged on.
+    confidence: str = "exact"
 
 
 @dataclass
@@ -701,6 +773,12 @@ class KG:
     def query(self, question: str, budget: int = 2000) -> KGQueryResult:
         if not self.is_ready():
             raise KGError("knowledge graph is not ready")
+        redirect = _out_of_scope(question)
+        if redirect:
+            return KGQueryResult(
+                text=redirect, hit_count=0, expanded_tokens=[],
+                mode="out_of_scope", confidence="out_of_scope",
+            )
         G = self._load_graph()
 
         df, node_tokens, path_tokens = self._vocabulary(G)
@@ -721,7 +799,16 @@ class KG:
                 hit_count=0,
                 expanded_tokens=[],
                 mode="none",
+                confidence="none",
             )
+
+        # Did the question actually NAME anything in the graph? Expansion also
+        # matches by substring and fuzzy edit distance, which is what keeps
+        # recall usable — and also what lets an unrelated question find a seed
+        # and come back with a full cap of nodes. The distinction has to reach
+        # the caller, because from the outside the two look identical.
+        exact = self._exact_matches(question, vocab)
+        confidence = "exact" if exact else "weak"
 
         relevance = self._scorer(expanded, df, node_tokens, path_tokens, n_nodes)
 
@@ -738,6 +825,7 @@ class KG:
                 hit_count=0,
                 expanded_tokens=expanded,
                 mode="none",
+                confidence="none",
             )
 
         mode = "dfs" if _DFS_RE.search(question.lower()) else "bfs"
@@ -763,15 +851,31 @@ class KG:
                 )
         if len(sub_nodes) >= MAX_RESULT_NODES:
             lines.append(
-                f"[capped at {MAX_RESULT_NODES} highest-scoring nodes — ask a narrower "
-                "question if the answer is not here]"
+                f"[traversal filled its {MAX_RESULT_NODES}-node cap, so this is the "
+                "neighbourhood of the seeds above, not a ranked answer — narrow the "
+                "question if what you need is not here]"
             )
+
+        if confidence == "weak":
+            nearest = self._nearest_vocab(question, vocab)
+            lines.insert(0, (
+                "[LOW CONFIDENCE — no term in your question names anything in the "
+                "graph; these seeds came from partial/fuzzy matches, so the nodes "
+                "below may be unrelated. Closest indexed terms: "
+                + ", ".join(nearest) + ". Either re-ask using those terms, or — if "
+                "you are looking for literal text, a filename, or something outside "
+                "this repo's own source — use grep/glob instead. Do not re-ask this "
+                "same question reworded a third time.]"
+            ))
 
         text = "\n".join(lines)
         char_budget = budget * 4
         if len(text) > char_budget:
             text = text[:char_budget] + f"\n... [truncated at ~{budget} tokens; pass a larger budget]"
-        return KGQueryResult(text=text, hit_count=len(sub_nodes), expanded_tokens=expanded, mode=mode)
+        return KGQueryResult(
+            text=text, hit_count=len(sub_nodes), expanded_tokens=expanded,
+            mode=mode, confidence=confidence,
+        )
 
     def digest(self, max_files: int = 15, max_symbols: int = 6) -> str:
         """Compact orientation block for a system prompt: the files with the
@@ -852,6 +956,25 @@ class KG:
                 break
             if not any(_same_file(f, kept) for kept in out):
                 out.append(f)
+        return out
+
+    @staticmethod
+    def _exact_matches(question: str, vocab: set[str]) -> list[str]:
+        """Query terms that are verbatim graph vocabulary (modulo plurals).
+
+        The strong tier of `_expand`, isolated: `_expand` folds exact,
+        substring and fuzzy hits into one ranked list, and by the time it
+        returns, a question that named a real symbol is indistinguishable from
+        one that merely shares four letters with one.
+        """
+        out: list[str] = []
+        for q in tokenize(question):
+            if q in STOPWORDS:
+                continue
+            for form in (q, singularize(q)):
+                if form in vocab:
+                    out.append(form)
+                    break
         return out
 
     @staticmethod

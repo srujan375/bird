@@ -47,4 +47,54 @@ export function FeedbackEdge({
   );
 }
 
-export const edgeTypes = { feedback: FeedbackEdge };
+/**
+ * The skip edge: a forward hop that has to clear the cards it flies over.
+ *
+ * A stock bezier between two ends on the same row is very nearly a straight
+ * line, so a connection that skips a layer — `api → db` when a queue and a
+ * worker sit between them — is ruled straight through both of their cards.
+ * That reads as three connections where there is one, and it hides whatever
+ * text it crosses.
+ *
+ * Same answer as the feedback edge, mirrored: arc *over* rather than dip under,
+ * by however much it takes to clear the tallest card in the way. `data.top` is
+ * the y the curve must stay above, measured by the canvas; the control points
+ * go higher than that, because a cubic peaks well short of its handles.
+ */
+export function SkipEdge({
+  sourceX, sourceY, targetX, targetY,
+  markerEnd, style, label, data,
+  labelStyle, labelShowBg, labelBgStyle, labelBgPadding, labelBgBorderRadius,
+  interactionWidth,
+}: EdgeProps) {
+  const top = (data?.top as number | undefined) ?? Math.min(sourceY, targetY);
+  // Solve the cubic at t=0.5 for the handle height that puts the *curve* at
+  // `top`: B(.5) = (p0 + 3c1 + 3c2 + p3) / 8, with both handles at `handle`.
+  const handle = (8 * top - sourceY - targetY) / 6;
+  const lift = Math.min(sourceY, targetY) - top;
+  // Pull the handles inward as the arc gets tall, so a big clearance bulges
+  // upward rather than ballooning sideways across its neighbours.
+  const dx = Math.max(24, Math.min(140, Math.abs(targetX - sourceX) * 0.28 - lift * 0.12));
+  const path =
+    `M${sourceX},${sourceY} ` +
+    `C${sourceX + dx},${handle} ${targetX - dx},${handle} ${targetX},${targetY}`;
+
+  return (
+    <BaseEdge
+      path={path}
+      markerEnd={markerEnd}
+      style={style}
+      label={label}
+      labelX={(sourceX + targetX) / 2}
+      labelY={(sourceY + targetY + 6 * handle) / 8}
+      labelStyle={labelStyle}
+      labelShowBg={labelShowBg}
+      labelBgStyle={labelBgStyle}
+      labelBgPadding={labelBgPadding}
+      labelBgBorderRadius={labelBgBorderRadius}
+      interactionWidth={interactionWidth}
+    />
+  );
+}
+
+export const edgeTypes = { feedback: FeedbackEdge, skip: SkipEdge };

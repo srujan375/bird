@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Canvas, useTidyUp } from "./canvas/Canvas";
 import { ComponentDialog } from "./dialog/ComponentDialog";
+import { Gate } from "./rail/Gate";
 import { Rail } from "./rail/Rail";
 import { useCanvas } from "./store/canvas";
 import { promoteVariant, useSession } from "./store/session";
@@ -55,10 +56,19 @@ function useLayer(): { layer: Layer; variant: Variant | null; variants: Variant[
   }, [arch, chosenLayer, chosenVariant]);
 }
 
+/**
+ * The top bar, handover §2.
+ *
+ * Five things, and the three that left are as deliberate as the five that
+ * stayed. The repo path never changed during a session and the phase chip named
+ * a state the tracker already narrates. The connection pill went because it was
+ * a light reporting on something you only care about when you try to act on it
+ * — the composer now disables itself when the session ends, which is the same
+ * information delivered at the moment it matters.
+ */
 function TopBar({ layer, variants }: { layer: Layer; variants: Variant[] }) {
   const arch = useSession((s) => s.arch);
   const ready = useSession((s) => s.ready);
-  const conn = useSession((s) => s.conn);
   const finalized = useSession((s) => s.finalized);
   const transcript = useSession((s) => s.transcript);
   const setLayer = useCanvas((s) => s.setLayer);
@@ -71,13 +81,8 @@ function TopBar({ layer, variants }: { layer: Layer; variants: Variant[] }) {
     arch?.brief.goal ||
     transcript.find((t) => t.t === "user")?.text ||
     "Architecture session";
-  const repo = ready?.repo ? ready.repo.split("/").slice(-2).join("/") : "—";
   const hasDesign = Object.keys(arch?.components ?? {}).length > 0;
   const hasSketch = variants.some((v) => Object.keys(v.nodes).length > 0);
-  const connLabel =
-    conn === "complete" ? "Session complete" :
-    conn === "connected" ? "Live" :
-    conn === "connecting" ? "Connecting…" : "Disconnected";
 
   return (
     <header className="topbar">
@@ -95,7 +100,6 @@ function TopBar({ layer, variants }: { layer: Layer; variants: Variant[] }) {
       )}
 
       <div className="meta">
-        {arch && <span className="chip">{arch.phase}</span>}
         <button
           className="ghost theme-toggle"
           onClick={toggleTheme}
@@ -107,8 +111,6 @@ function TopBar({ layer, variants }: { layer: Layer; variants: Variant[] }) {
         {!finalized && <button className="ghost" onClick={tidy}>Tidy up</button>}
         {finalized && <span className="chip">read-only</span>}
         <span className="mono">{ready?.model ?? "—"}</span>
-        <span className="mono" title={ready?.repo}>{repo}</span>
-        <span><span className={`dot ${conn}`} /> {connLabel}</span>
       </div>
     </header>
   );
@@ -203,7 +205,12 @@ export default function App() {
   const runId = useSession((s) => s.ready?.run_id);
   const restore = useCanvas((s) => s.restore);
   const railWidth = useCanvas((s) => s.railWidth);
+  const permission = useSession((s) => s.permission);
   const { layer, variant, variants } = useLayer();
+  /** Lives here because two children spend it: the composer in the rail writes
+   *  it, and the finalize sheet — which is over the canvas, not in the rail —
+   *  records it as the reason attached to a ruling. */
+  const [draft, setDraft] = useState("");
   useOpenShortcut();
 
   // the overlay is per run id, so a refresh lands back on the same viewport
@@ -236,7 +243,7 @@ export default function App() {
 
         <div className="canvas-overlay bl">
           <span className="hint-strip">
-            drag to place · a placed node stays put · <b>E</b> or ⤢ opens a component · Tidy up to re-flow
+            drag to place · <b>E</b> opens a component · a sticky note is an objection on the record
           </span>
         </div>
 
@@ -266,9 +273,16 @@ export default function App() {
         {/* over the canvas, never in it: opening a component must not reflow
             the system graph behind it */}
         <ComponentDialog />
+
+        {/* §9: finalize is a sheet over the dimmed canvas, not a note pinned to
+            the composer — it is now the only place decisions and questions
+            appear, and it outgrew the rail. */}
+        {permission && permission.kind !== "offer" && (
+          <Gate req={permission} reason={draft.trim()} onRespond={() => setDraft("")} />
+        )}
       </main>
 
-      <Rail />
+      <Rail draft={draft} setDraft={setDraft} />
     </div>
   );
 }

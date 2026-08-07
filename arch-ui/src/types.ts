@@ -106,11 +106,19 @@ export interface Option { name: string; pros: string[]; cons: string[] }
 export interface Decision {
   id: string; topic: string; category: string; options: Option[];
   choice: string; rationale: string; status: "decided" | "deferred";
+  /** Who put the choice on the table. `"user"` is the one that matters to a
+   *  reader: it means the design took their word for something, and the gate
+   *  says so rather than presenting it as the architect's own conclusion. */
+  source?: "model" | "user" | "judge";
 }
 
 export interface OpenQuestion {
   id: string; question: string; blocking: boolean; source: string;
   answer: string | null; resolution: string | null;
+  /** What the question is about: a component/decision id, a brief field, or
+   *  null for a question about the design generally. A targeted question is
+   *  badged on its node. */
+  target?: string | null;
 }
 
 /** An objection on the record — the harness's memory of disagreement. */
@@ -174,6 +182,13 @@ export interface Renders {
 export interface ReadyEvent {
   type: "ready";
   model: string; kg: boolean; kg_ready: boolean;
+  /** Denominator for the turn divider's context reading. Optional: a server
+   *  older than this field still connects, and the divider simply omits the
+   *  fraction rather than inventing a window. */
+  context_window?: number;
+  /** The critic's model, when the session has one. Optional: no critic
+   *  (`--no-critic`) means the label carries no model rather than a wrong one. */
+  judge_model?: string | null;
   run_id: string; repo: string;
   skills: { name: string; description: string; source: string }[];
 }
@@ -197,6 +212,10 @@ export type HarnessEvent = {
   data: {
     task?: string; text?: string; content?: string;
     tool_calls?: ToolCall[]; name?: string; is_error?: boolean; reason?: string;
+    /** `assistant` only — what the turn cost and which turn it was. */
+    turn?: number; input_tokens?: number; output_tokens?: number;
+    /** `tool_result` only — whatever the tool chose to report about itself. */
+    details?: Record<string, unknown> | null;
   };
 };
 
@@ -205,8 +224,12 @@ export type HarnessEvent = {
 export interface PermissionEvent {
   type: "permission_request";
   id: number;
-  kind: "toplevel_approval" | "finalize";
+  kind: "toplevel_approval" | "finalize" | "offer";
   summary: string;
+  /** offer only: the question and the answers the user can tap. */
+  question?: string;
+  options?: string[];
+  target?: string;
   artifacts?: string[];
   thin?: string[];
   gaps?: string[];
@@ -234,11 +257,38 @@ export type WireEvent =
 
 export type ConnState = "connecting" | "connected" | "disconnected" | "complete";
 
+/** Who is talking. The critic is a *different model* reviewing in the
+ *  background, and a background objection that reads as the architect changing
+ *  its mind is worse than no attribution at all — hence its own actor and its
+ *  own colour (§3). */
+export type Speaker = "architect" | "critic";
+
+export type ToolStatus = "running" | "ok" | "error";
+
 export type TranscriptItem =
-  | { t: "user"; text: string }
-  | { t: "agent"; text: string }
-  | { t: "notice"; text: string; err?: boolean }
-  | { t: "turn"; status: string; message: string | null };
+  | { t: "user"; text: string; at: number }
+  | { t: "agent"; text: string; at: number; who: Speaker }
+  | {
+      t: "tool";
+      name: string;
+      arg: string;
+      at: number;
+      status: ToolStatus;
+      /** Result lines, from the tool's own `details` (§2). */
+      lines?: string[];
+    }
+  | { t: "notice"; text: string; err?: boolean; at: number }
+  | {
+      t: "turn";
+      status: string;
+      message: string | null;
+      at: number;
+      /** Turn number, and what it cost — §3 puts both on the divider. */
+      n: number;
+      model: string;
+      inTokens: number;
+      tools: number;
+    };
 
 /** Which surface the canvas is drawing. */
 export type Layer = "sketch" | "design";

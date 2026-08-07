@@ -22,10 +22,10 @@ STILL_BUILDING = (
 class KgQueryTool(Tool):
     name = "kg_query"
     description = (
-        "Ask the repo knowledge graph about code structure: where something is defined, "
-        "what calls/imports it, how modules relate. Faster and more precise than bash "
-        "search. Results end with [path:line] — read that path, don't guess it. A file "
-        "path works as a question too."
+        "Ask the repo knowledge graph where something is defined, what calls/imports it, "
+        "how modules relate. Results end with [path:line] — read that path, don't guess. "
+        "Does NOT index filenames (use glob), literal text (use grep), git state, or "
+        "node_modules/dist. Heed a LOW CONFIDENCE label instead of rewording the question."
     )
     parameters = {
         "type": "object",
@@ -44,15 +44,25 @@ class KgQueryTool(Tool):
             ctx.emit("kg_query_unavailable", {"question": question})
             return ToolResult(output=STILL_BUILDING, details={"ready": False})
         result = ctx.kg.query(question, budget=budget)
+        # `confidence` is logged, not just `hits`: retrieval fills its node cap
+        # on almost any question, so hit_count alone cannot distinguish an
+        # answer from a shrug — which is what made a bad KG session look fine
+        # in the logs.
         ctx.emit(
             "kg_query",
-            {"question": question, "hits": result.hit_count, "expanded": result.expanded_tokens},
+            {
+                "question": question,
+                "hits": result.hit_count,
+                "confidence": result.confidence,
+                "expanded": result.expanded_tokens,
+            },
         )
         return ToolResult(
             output=result.text,
             details={
                 "ready": True,
                 "hits": result.hit_count,
+                "confidence": result.confidence,
                 "expanded_tokens": result.expanded_tokens,
                 "mode": result.mode,
             },

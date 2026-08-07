@@ -192,6 +192,22 @@ def _is_check_segment(head: str, tokens: list[str]) -> bool:
     return False
 
 
+def is_pure_search(command: str) -> bool:
+    """True when every segment is a read-only search command.
+
+    This is the same allowlist check the tool already runs, narrowed to the
+    `search` category alone — so it inherits, for free, every escape hatch
+    that check already closes: output redirection, `sed -i`, `find -exec`,
+    and xargs delegating into a non-search command. A command that passes
+    cannot write, so approving it is a question with one answer.
+
+    Deliberately narrower than "allowed": tests, linters and git reads stay
+    gated. A test run rewrites fixtures and a git read can be widened into a
+    fetch, and neither is worth losing a prompt over.
+    """
+    return check_command(command, ("search",)) is None
+
+
 def is_verification_command(command: str) -> bool:
     """True when the command line checks the work — a test run, type check or
     linter in any of its segments. `done` uses this to tell a session that
@@ -273,6 +289,18 @@ class BashTool(Tool):
         "required": ["command"],
         "additionalProperties": False,
     }
+
+    def needs_permission(self, args: dict[str, Any], ctx: ToolContext) -> bool:
+        """Search-only commands run unasked; everything else still prompts.
+
+        Sessions were spending ~50 prompts apiece on `grep`/`cat`/`find` that
+        the allowlist had already proven read-only, and the fatigue showed:
+        users started denying them. `search` must be an enabled category for
+        this to apply — a harness that turned search off has said no already.
+        """
+        if "search" not in ctx.bash_categories:
+            return True
+        return not is_pure_search(args.get("command", ""))
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         command = args["command"]

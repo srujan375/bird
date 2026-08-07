@@ -19,7 +19,7 @@ STATIC_DIR = Path(__file__).with_name("static")
 MUTATING_TOOLS = frozenset({
     "variant", "node", "link", "splice", "depth", "promote",
     "brief", "component", "connect", "flow", "expand", "decide",
-    "concern", "ask", "answer", "amend_toplevel",
+    "concern", "offer", "ask", "answer", "amend_toplevel",
 })
 
 EXPLORE_NUDGE = (

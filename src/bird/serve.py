@@ -177,10 +177,27 @@ class Server:
     def _emit(self, event_type: str, **data: Any) -> None:
         self.transport.emit({"type": event_type, **data})
 
+    @staticmethod
+    def _alias_spec(repl: Any, alias: str) -> str | None:
+        """The model behind a registry alias, or None if it does not resolve —
+        a session with no critic must not claim one."""
+        try:
+            return repl.runner.registry.resolve(alias).spec
+        except Exception:
+            return None
+
     def ready_payload(self) -> dict[str, Any]:
         repl = self.repl
         return {
             "model": repl.runner.spec.spec,
+            # the page prints "12.4k / 40k" on every turn divider: compaction
+            # fires at 90% of this, so the denominator has to be on screen
+            # before it does rather than explained after the fact
+            "context_window": repl.runner.spec.context_window,
+            # the critic is a *different* model, and the transcript names it:
+            # "the architect changed its mind" and "a second model disagrees"
+            # are different events and must not look the same
+            "judge_model": self._alias_spec(repl, "judge"),
             "kg": repl.kg is not None,
             "kg_ready": bool(repl.kg and repl.kg.is_ready()),
             "run_id": repl.run_id,

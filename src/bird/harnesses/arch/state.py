@@ -49,6 +49,14 @@ SCOPES: tuple[str, ...] = ("prototype", "internal", "production", "high_scale")
 DECISION_CATEGORIES: tuple[str, ...] = (
     "storage", "communication", "consistency", "deployment", "integration", "llm", "other"
 )
+DECISION_SOURCES: tuple[str, ...] = ("model", "user", "judge")
+
+# What an unstated scope means. Absent, it used to read as "unconstrained",
+# which a model resolves as "be safe" — and being safe about a number nobody
+# gave you is how a 1k-user app gets a 100k-user bill. The smallest thing that
+# could work is the honest default, and the harness says out loud that it is
+# assuming it.
+ASSUMED_SCOPE = "prototype"
 QUESTION_SOURCES: tuple[str, ...] = ("model", "harness_audit", "judge", "user")
 CONCERN_SEVERITIES: tuple[str, ...] = ("blocker", "risk", "smell")
 CONCERN_SOURCES: tuple[str, ...] = ("model", "judge", "harness_audit")
@@ -99,6 +107,36 @@ class Brief:
     deploy_target: str | None = None
     constraints: list[str] = field(default_factory=list)
     non_goals: list[str] = field(default_factory=list)
+
+    def scope_assumed(self) -> bool:
+        """True when nobody has stated a scope and ASSUMED_SCOPE is standing in."""
+        return self.scope not in SCOPES
+
+    def effective_scope(self) -> str:
+        """The scope actually being designed for. Never empty: an unset scope
+        is ASSUMED_SCOPE, not "no constraint"."""
+        return ASSUMED_SCOPE if self.scope_assumed() else self.scope
+
+    def stated_numbers(self) -> list[str]:
+        """The load-bearing figures, for pinning into the tracker. The critique
+        posture is "where does this fall over at their numbers", so the numbers
+        themselves have to be in front of the model — not a boolean saying they
+        exist."""
+        out: list[str] = []
+        for label, val in (
+            ("users", self.scale.users),
+            ("reads/s", self.scale.reads_per_sec),
+            ("writes/s", self.scale.writes_per_sec),
+            ("data", self.scale.data_volume),
+            ("growth", self.scale.growth),
+            ("latency", self.latency),
+            ("consistency", self.consistency),
+            ("availability", self.availability),
+            ("deploy", self.deploy_target),
+        ):
+            if (val or "").strip():
+                out.append(f"{label}={val}")
+        return out
 
     def missing(self) -> list[str]:
         """Load-bearing fields still absent — the `component` unlock gate."""
@@ -299,6 +337,13 @@ class Decision:
     choice: str
     rationale: str
     status: str = "decided"  # decided | deferred (deferred still records the default taken)
+    source: str = "model"    # model | user | judge — who put this choice on the table
+    #
+    # `source="user"` is the trigger for the harness's one non-negotiable
+    # courtesy: a choice the user handed us gets a verdict, not silent
+    # absorption. Recording it with a single option is the detectable bad
+    # state — it means nothing was weighed against it. See
+    # `ArchState.unweighed_user_choices`.
 
 
 @dataclass
@@ -309,6 +354,7 @@ class OpenQuestion:
     source: str
     answer: str | None = None
     resolution: str | None = None  # answered | deferred | dropped
+    target: str | None = None      # component/decision id, "brief.<field>", or None
 
     @property
     def open(self) -> bool:
@@ -389,6 +435,21 @@ class ArchState:
         """Surfaced at the finalize gate so the user overrules deliberately —
         they never stop the session from continuing."""
         return [c for c in self.concerns if c.open and c.severity == "blocker"]
+
+    def unweighed_user_choices(self) -> list[Decision]:
+        """User-originated choices that were recorded without an alternative
+        beside them.
+
+        This is the SQS case. The user says "let's use SQS here"; if that lands
+        as a one-option decision, nothing was weighed and the user never got an
+        answer to the question they did not know they were asking. The harness
+        cannot know whether SQS is right — but it can know that nobody checked,
+        and keep saying so until someone does."""
+        return [d for d in self.decisions if d.source == "user" and len(d.options) < 2]
+
+    def questions_targeting(self, subject: str) -> list[OpenQuestion]:
+        """Open questions hanging on a specific component/decision/brief field."""
+        return [q for q in self.questions if q.open and q.target == subject]
 
     def pending_obligations(self) -> list[Obligation]:
         return [o for o in self.obligations if o.status == "pending"]
@@ -635,6 +696,7 @@ class ArchState:
                 options=[Option(**o) for o in x.get("options", [])],
                 choice=x.get("choice", ""), rationale=x.get("rationale", ""),
                 status=x.get("status", "decided"),
+                source=x.get("source", "model"),
             )
             for x in d.get("decisions", [])
         ]

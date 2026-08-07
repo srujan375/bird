@@ -1,36 +1,68 @@
 /**
- * The approval gate.
+ * The ruling, handover §9 — a 720px sheet over a dimmed canvas.
  *
- * Not a modal: the canvas stays live and the composer stays typeable, because
- * replying during a gate *is* "request changes" — the conversational behaviour
- * the vanilla page settled on. Not a banner either: it used to sit in the
- * rail's own flow, between the transcript and the composer, where a long
- * summary ate half the column and pushed the conversation it was asking you to
- * weigh out of sight. It hangs off the chat instead, and tucks away to a pill.
+ * It used to be a note pinned to the composer, and it used to say almost
+ * nothing: the summary was prose the agent had just written in the transcript,
+ * and every concern in it had a tab of its own a few inches to the right, so
+ * restating both was how it grew tall enough to need scrolling.
  *
- * It also says almost nothing. The summary the server sends is the same prose
- * the agent has just written in the transcript, and every concern in it has a
- * tab of its own a few inches to the right — restating both inside the note is
- * how it grew tall enough to need scrolling. What is left is what only this
- * moment can tell you: what the two buttons will do, and what is still
- * unsettled when you press one.
+ * Those tabs are gone (§1). Decisions and questions no longer live anywhere
+ * else in the page, and this is one of exactly two moments they change what you
+ * press — so the gate now carries them in full, and it outgrew the rail doing
+ * it. It is a sheet, not a modal-with-a-veil-you-cannot-dismiss: the canvas
+ * behind it stays readable, and replying in the chat still counts as requesting
+ * changes.
  */
-import { useEffect, useState } from "react";
-import { respondToGate } from "../store/session";
-import { useCanvas } from "../store/canvas";
+import { useEffect, useMemo, useState } from "react";
+import { respondToGate, useSession } from "../store/session";
 import { Markdown } from "./Markdown";
-import type { Concern, PermissionEvent } from "../types";
+import type { ArchState, Concern, PermissionEvent } from "../types";
+
+const plural = (n: number, one: string, many = one + "s") => `${n} ${n === 1 ? one : many}`;
 
 function ConcernLine({ c }: { c: Concern }) {
   return (
     <li>
       <span className={`severity-dot ${c.severity}`} /> <b>{c.target}</b> —{" "}
       <Markdown text={c.claim} className="md inline" />
+      {c.resolution && <span className="faint"> → {c.resolution}</span>}
     </li>
   );
 }
 
-const plural = (n: number, one: string, many = one + "s") => `${n} ${n === 1 ? one : many}`;
+/**
+ * What the bundle will put into the knowledge graph, counted.
+ *
+ * Derived here rather than reported by the server, because the server only
+ * knows once it has written it — and by then the button is pressed. It is the
+ * same walk `kg_seed.py` does: a node per component and per thing inside a
+ * component's facet.
+ */
+function seedCount(arch: ArchState): number {
+  let n = Object.keys(arch.components).length;
+  for (const c of Object.values(arch.components)) {
+    const f = c.facet;
+    if (!f) continue;
+    switch (f.facet_kind) {
+      case "api": n += f.endpoints.length; break;
+      case "store": n += f.entities.length; break;
+      case "queue": n += f.messages.length; break;
+      case "service": n += f.modules?.length ?? 0; break;
+      case "llm": n += f.tasks.length; break;
+      case "infra": n += f.units.length; break;
+    }
+  }
+  return n;
+}
+
+function Section({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="section-label">{label}</div>
+      {children}
+    </div>
+  );
+}
 
 export function Gate({ req, reason, onRespond }: {
   req: PermissionEvent;
@@ -39,19 +71,14 @@ export function Gate({ req, reason, onRespond }: {
   reason: string;
   onRespond: () => void;
 }) {
-  const setTab = useCanvas((s) => s.setRailTab);
+  const arch = useSession((s) => s.arch);
   const finalize = req.kind === "finalize";
   const blockers = req.blockers ?? [];
-  const concerns = req.concerns ?? [];
   const thin = [...(req.thin ?? []), ...(req.gaps ?? [])];
-  const questions = req.questions ?? [];
-  const obligations = req.obligations ?? [];
   const title = finalize ? "Finalize this architecture?" : "Approve the top level?";
 
-  // a fresh request always arrives open, however the last one was left
   const [open, setOpen] = useState(true);
   useEffect(() => { setOpen(true); }, [req]);
-
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
@@ -59,13 +86,14 @@ export function Gate({ req, reason, onRespond }: {
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
 
-  /** Counts, not contents — each one is a tab away, and the tab is the better
-   *  place to read it because that is where you can settle it. */
-  const unsettled: { key: string; label: string; tab: string }[] = [];
-  if (concerns.length) unsettled.push({ key: "c", label: plural(concerns.length, "open concern"), tab: "concerns" });
-  if (questions.length) unsettled.push({ key: "q", label: plural(questions.length, "unanswered question"), tab: "questions" });
-  if (obligations.length) unsettled.push({ key: "o", label: `${obligations.length} with no depth yet`, tab: "concerns" });
-  if (thin.length) unsettled.push({ key: "t", label: plural(thin.length, "thin spot"), tab: "concerns" });
+  const decisions = arch?.decisions ?? [];
+  const questions = useMemo(() => {
+    // unanswered above answered (§9): the ones that can still change the design
+    // come first, and a blocking one is flagged rather than reordered again
+    const qs = arch?.questions ?? [];
+    return [...qs].sort((a, b) => Number(!!a.resolution) - Number(!!b.resolution));
+  }, [arch?.questions]);
+  const settled = (arch?.concerns ?? []).filter((c) => c.status !== "open");
 
   if (!open) {
     return (
@@ -76,65 +104,116 @@ export function Gate({ req, reason, onRespond }: {
   }
 
   return (
-    <div className="gate" data-kind={req.kind}>
-      <div className="gate-head">
-        <h4>{title}</h4>
-        <span className="spacer" />
-        <button
-          className="ghost tuck"
-          title="tuck away — the request stays open (esc)"
-          aria-label="tuck away"
-          onClick={() => setOpen(false)}
-        >
-          ⌄
-        </button>
-      </div>
-
-      {/* Blockers are the exception to saying nothing: pressing the button
-          overrules them, and a consequence is not a recap. */}
-      {blockers.length > 0 && (
-        <div className="gate-body">
-          <div className="blocker-warn">
-            <b>{plural(blockers.length, "open blocker")}.</b>{" "}
-            {finalize ? "Finalizing" : "Approving"} records {blockers.length === 1 ? "it" : "them"} as
-            overruled, with whatever is in the composer as the reason.
-            <ul>{blockers.map((c) => <ConcernLine key={c.id} c={c} />)}</ul>
-          </div>
+    <>
+      <div className="sheet-veil" onClick={() => setOpen(false)} />
+      <div className="sheet" data-kind={req.kind} role="dialog" aria-label={title}>
+        <div className="sheet-head">
+          <h3>{title}</h3>
+          <span className="spacer" style={{ flex: 1 }} />
+          <button className="ghost tuck" title="tuck away — the request stays open (esc)"
+                  aria-label="tuck away" onClick={() => setOpen(false)}>⌄</button>
         </div>
-      )}
 
-      {unsettled.length > 0 && (
-        <p className="unsettled">
-          still open:{" "}
-          {unsettled.map((u, i) => (
-            <span key={u.key}>
-              {i > 0 ? " · " : null}
-              <button className="linkish" onClick={() => setTab(u.tab)}>{u.label}</button>
-            </span>
-          ))}
-        </p>
-      )}
+        <div className="sheet-body">
+          {/* Blockers first, and stated as a consequence rather than a recap:
+              pressing the button is what overrules them. */}
+          {blockers.length > 0 && (
+            <div className="blocker-warn">
+              <b>{plural(blockers.length, "open blocker")}.</b>{" "}
+              {finalize ? "Finalizing" : "Approving"} records{" "}
+              {blockers.length === 1 ? "it" : "them"} as overruled, with whatever is in the
+              composer as the reason.
+              <ul>{blockers.map((c) => <ConcernLine key={c.id} c={c} />)}</ul>
+            </div>
+          )}
 
-      {finalize && (req.artifacts?.length ?? 0) > 0 && (
-        <p className="mono faint tiny">writes: {req.artifacts!.join(", ")}</p>
-      )}
+          {decisions.length > 0 && (
+            <Section label={`decisions — ${decisions.length}`}>
+              {decisions.map((d) => (
+                <div key={d.id} className="srow">
+                  <span className="k">{d.category}</span>
+                  <span className="v">
+                    <b>{d.topic} → {d.choice}</b>
+                    {d.status === "deferred" && <span className="tag" style={{ marginLeft: 6 }}>deferred</span>}
+                    {d.source === "user" && <span className="tag" style={{ marginLeft: 6 }}>your call</span>}
+                    <div className="faint">{d.rationale}</div>
+                    <div className="faint mono" style={{ fontSize: 10 }}>
+                      weighed: {d.options.map((o) => o.name).join(" · ") || "—"}
+                      {d.options.length < 2 ? "  (no alternative)" : ""}
+                    </div>
+                  </span>
+                </div>
+              ))}
+            </Section>
+          )}
 
-      <div className="buttons">
-        <button
-          className="primary"
-          onClick={() => { respondToGate(true, reason); onRespond(); }}
-        >
-          {finalize ? "Finalize" : "Approve"}
-        </button>
-        <button onClick={() => { respondToGate(false, reason); onRespond(); }}>
-          Request changes
-        </button>
+          {questions.length > 0 && (
+            <Section label={`questions — ${questions.filter((q) => !q.resolution).length} unanswered`}>
+              {questions.map((q) => (
+                <div key={q.id} className="srow">
+                  <span className="k">{q.resolution ?? "open"}</span>
+                  <span className="v">
+                    {q.question}
+                    {q.blocking && !q.resolution && (
+                      <span className="tag" style={{ marginLeft: 6 }}>blocking</span>
+                    )}
+                    {q.answer && <div className="faint">→ {q.answer}</div>}
+                  </span>
+                </div>
+              ))}
+            </Section>
+          )}
+
+          {thin.length > 0 && (
+            <Section label={`thin — ${thin.length}, none required`}>
+              <ul className="weigh" style={{ margin: 0, paddingLeft: 16 }}>
+                {thin.map((t) => <li key={t}>{t}</li>)}
+              </ul>
+            </Section>
+          )}
+
+          {settled.length > 0 && (
+            <Section label={`settled objections — ${settled.length}`}>
+              <ul className="weigh" style={{ margin: 0, paddingLeft: 16 }}>
+                {settled.map((c) => <ConcernLine key={c.id} c={c} />)}
+              </ul>
+            </Section>
+          )}
+
+          {finalize && arch && (
+            <Section label="what the handoff writes">
+              <div className="srow">
+                <span className="k">bundle</span>
+                <span className="v mono" style={{ fontSize: 10.5 }}>
+                  {(req.artifacts ?? []).join("  ") || "architecture.json · architecture.md"}
+                </span>
+              </div>
+              <div className="srow">
+                <span className="k">graph</span>
+                <span className="v">
+                  about {seedCount(arch)} nodes seeded into the knowledge graph, so the build
+                  session can query this design on its first turn.
+                </span>
+              </div>
+            </Section>
+          )}
+        </div>
+
+        <div className="sheet-foot">
+          <button className="primary" onClick={() => { respondToGate(true, reason); onRespond(); }}>
+            {finalize ? "Finalize" : "Approve"}
+          </button>
+          <button onClick={() => { respondToGate(false, reason); onRespond(); }}>
+            Request changes
+          </button>
+          <span className="spacer" style={{ flex: 1 }} />
+          <span className="faint" style={{ fontSize: 11 }}>
+            {blockers.length > 0
+              ? "What you type in the composer is recorded as why you overruled."
+              : "Or just reply in the chat — that counts as requesting changes."}
+          </span>
+        </div>
       </div>
-      <p className="faint" style={{ marginTop: 6, marginBottom: 0 }}>
-        {blockers.length > 0
-          ? "What you type in the composer is recorded as why you overruled."
-          : "Or just reply in the chat — that counts as requesting changes."}
-      </p>
-    </div>
+    </>
   );
 }

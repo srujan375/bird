@@ -46,6 +46,7 @@ from .state import (
     KINDS,
     CONNECTION_KINDS,
     DECISION_CATEGORIES,
+    DECISION_SOURCES,
     FACET_FOR_KIND,
     FLOW_KINDS,
     SCOPES,
@@ -1097,6 +1098,17 @@ class ExpandTool(Tool):
                 f"note: {head.component_id} is the riskier one still open ({head.reason}) "
                 "— worth doing next unless you have a reason to leave it."
             )
+        # depth on something you asked about and never got an answer to: the
+        # facet is built on a guess, and this is the moment that is cheapest to
+        # notice. Advisory — it never refuses; see the module docstring.
+        pending = state.questions_targeting(cid)
+        if pending:
+            asked = "; ".join(f"{q.id}: {q.question}" for q in pending[:3])
+            note = (note + "\n" if note else "") + (
+                f"[!] you asked about {cid} and have no answer yet ({asked}). This facet is "
+                "built on whatever you assumed instead — get the answer, or say in the "
+                "design what you assumed and what changes if it is wrong."
+            )
         session.touched("component", cid)
         return _confirm(f"Expanded {cid} ({facet_kind} facet).", session, note=note)
 
@@ -1108,7 +1120,13 @@ class DecideTool(Tool):
         "choice (must match one of the option names), and the rationale. Upserts by id. "
         "Recording a one-option decision is allowed and noted — but if there was never "
         "an alternative, that is usually worth saying out loud rather than dressing up "
-        "as a decision."
+        "as a decision.\n"
+        "**Set `source: \"user\"` when the user named the technology or approach.** That "
+        "is not bookkeeping: it is what tells the harness a verdict is owed. A "
+        "user-sourced choice recorded with one option is reported back to you every turn "
+        "until you weigh something against it — either endorse it with the reason it is "
+        "right at their scale, or raise a `concern` targeting 'user' with what it costs "
+        "and the cheaper option."
     )
     parameters = {
         "type": "object",
@@ -1133,6 +1151,9 @@ class DecideTool(Tool):
             "rationale": {"type": "string"},
             "status": {"type": "string", "enum": ["decided", "deferred"],
                        "description": "deferred still records the default taken"},
+            "source": {"type": "string", "enum": list(DECISION_SOURCES),
+                       "description": "who put this choice on the table; 'user' when they "
+                                      "named it — that is what triggers the owed verdict"},
         },
         "required": ["topic", "category", "choice", "rationale"],
         "additionalProperties": False,
@@ -1152,6 +1173,7 @@ class DecideTool(Tool):
             choice=args["choice"],
             rationale=args["rationale"],
             status=args.get("status", "decided"),
+            source=args.get("source", "model"),
         )
         _check(state.validate_decision, dec)
         existing = next((d for d in state.decisions if d.id == did), None)
@@ -1162,7 +1184,153 @@ class DecideTool(Tool):
             state.decisions.append(dec)
             action = f"Recorded decision {did}: {dec.topic} -> {dec.choice}."
         session.touched("decision", did)
-        return _confirm(action, session, gaps=state.decision_gaps(dec))
+        note = ""
+        if dec.source == "user" and len(dec.options) < 2:
+            note = (
+                f"[!] {did} is the user's own choice and nothing was weighed against it. "
+                "Name what you would have picked instead and why you are not picking it — "
+                "then either endorse this with that reason, or raise a `concern` targeting "
+                "'user'. Absorbing a choice silently is the one move this harness does not "
+                "make."
+            )
+        return _confirm(action, session, gaps=state.decision_gaps(dec), note=note)
+
+
+# ============================ asking the user ============================
+# `ask` records a question. `offer` *puts it in front of them* with the answers
+# already written, because the load-bearing facts — how many users, how much
+# consistency — are exactly the ones a user will not volunteer and will not stop
+# to compose a paragraph about. A tap is a much lower bar than a sentence, and
+# the whole over-provisioning failure mode is a question nobody asked.
+
+MAX_OFFER_OPTIONS = 4
+
+# brief fields an offer can write straight into, so answering actually moves the
+# design's standard rather than leaving prose in a question log
+BRIEF_TARGETS: dict[str, tuple[str, ...]] = {
+    "brief.scope": ("scope",),
+    "brief.latency": ("latency",),
+    "brief.consistency": ("consistency",),
+    "brief.availability": ("availability",),
+    "brief.deploy_target": ("deploy_target",),
+    "brief.scale.users": ("scale", "users"),
+    "brief.scale.reads_per_sec": ("scale", "reads_per_sec"),
+    "brief.scale.writes_per_sec": ("scale", "writes_per_sec"),
+    "brief.scale.data_volume": ("scale", "data_volume"),
+    "brief.scale.growth": ("scale", "growth"),
+}
+
+
+def _apply_brief_answer(session: ArchSession, target: str, answer: str) -> str:
+    """Write an offer's answer into the brief. Returns the field written, or ""
+    if the target is not a brief field (or the answer is not a legal scope)."""
+    path = BRIEF_TARGETS.get(target)
+    if path is None:
+        return ""
+    brief = session.state.brief
+    if path == ("scope",):
+        if answer not in SCOPES:
+            return ""  # free text that is not one of the four scopes
+        brief.scope = answer
+        return target
+    obj: Any = brief
+    for part in path[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, path[-1], answer)
+    return target
+
+
+class OfferTool(Tool):
+    name = "offer"
+    description = (
+        "Ask the user something they can answer in one tap: 2-4 concrete options "
+        "instead of a paragraph they have to compose. Blocks until they pick or "
+        "dismiss.\n"
+        "Use it for the facts that decide cost — expected load, consistency, "
+        "availability, deploy target — and for choosing between shapes you have "
+        "drawn. `target` writes the answer straight into the brief when it names a "
+        "brief field (e.g. 'brief.scale.users'), so answering moves the standard the "
+        "design is judged against.\n"
+        "Dismissing is allowed and records the question as deferred: the user is not "
+        "obliged to know. Say what you will assume instead."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "e.g. 'Roughly how many users?'"},
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "2-4 concrete answers, e.g. ['~1k users', '~100k', '~1M+']",
+            },
+            "target": {
+                "type": "string",
+                "description": "Optional. A brief field ('brief.scope', "
+                               "'brief.scale.users', 'brief.consistency', ...) to write the "
+                               "answer into, or a component/decision id the question hangs on.",
+            },
+        },
+        "required": ["question", "options"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_not_finalized(session)
+        question = (args.get("question") or "").strip()
+        options = [str(o).strip() for o in args.get("options") or [] if str(o).strip()]
+        target = (args.get("target") or "").strip() or None
+        if not question:
+            raise ToolError("an offer needs a question.")
+        if len(options) < 2:
+            raise ToolError(
+                "an offer needs at least 2 options — with one option you are not asking, "
+                "you are telling. Use `ask` for an open question."
+            )
+        if len(options) > MAX_OFFER_OPTIONS:
+            raise ToolError(
+                f"at most {MAX_OFFER_OPTIONS} options — past that it is a form, not a choice."
+            )
+
+        qid = session.next_qid()
+        q = OpenQuestion(id=qid, question=question, blocking=False, source="model", target=target)
+        session.state.questions.append(q)
+        session.touched("question", qid)
+
+        approved, answer = session.request_gate({
+            "kind": "offer",
+            "question": question,
+            "options": options,
+            "target": target or "",
+        })
+        answer = (answer or "").strip()
+
+        # Dismissed, or nobody there to answer (headless / auto-approving broker
+        # returns approved with no text). Both mean the same thing to the design:
+        # the fact is still unknown, and the model has to say what it assumes.
+        if not approved or not answer:
+            q.resolution = "deferred"
+            session.touched("question", qid)
+            why = "The user dismissed the question" if approved is False else \
+                  "No one answered (no UI attached)"
+            return _confirm(
+                f"{why} — {qid} recorded as deferred. Say what you are assuming instead of "
+                "this fact, and why that assumption is the safe way to be wrong.",
+                session,
+            )
+
+        q.answer = answer
+        q.resolution = "answered"
+        written = _apply_brief_answer(session, target, answer) if target else ""
+        session.touched("question", qid)
+        if written:
+            return _confirm(
+                f"The user chose: {answer}. Written to {written}. "
+                "Design to that number — and if the design already assumed a bigger one, "
+                "say what you are removing now that you know.",
+                session,
+            )
+        return _confirm(f"The user chose: {answer}. Recorded against {qid}.", session)
 
 
 class AskTool(Tool):
@@ -1170,13 +1338,20 @@ class AskTool(Tool):
     description = (
         "Flag an open question for the user. blocking=true prevents finalize until "
         "it is resolved. Then actually ask it in your reply text — this tool only "
-        "records it."
+        "records it.\n"
+        "`target` hangs the question on what it is about (a component or decision id, "
+        "or a brief field). A targeted question is shown on that node and warns you if "
+        "you go deep on it before it is answered.\n"
+        "If the answer is one of a few known possibilities, use `offer` instead — the "
+        "user answers with a tap rather than a paragraph."
     )
     parameters = {
         "type": "object",
         "properties": {
             "question": {"type": "string"},
             "blocking": {"type": "boolean", "description": "Blocks finalize until resolved"},
+            "target": {"type": "string", "description": "Optional component/decision id "
+                       "or brief field this question is about"},
         },
         "required": ["question", "blocking"],
         "additionalProperties": False,
@@ -1188,7 +1363,7 @@ class AskTool(Tool):
         qid = f"q{len(session.state.questions) + 1}"
         session.state.questions.append(
             OpenQuestion(id=qid, question=args["question"], blocking=bool(args["blocking"]),
-                         source="model")
+                         source="model", target=(args.get("target") or "").strip() or None)
         )
         session.touched("question", qid)
         return _confirm(f"Recorded open question {qid}. Ask the user in your reply.", session)
@@ -1626,7 +1801,8 @@ def arch_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool
         ImportStateTool(),
         VariantTool(), NodeTool(), LinkTool(), SpliceTool(), DepthTool(), PromoteTool(),
         BriefTool(), ComponentTool(), ConnectTool(), FlowTool(), ExpandTool(),
-        DecideTool(), ConcernTool(), AskTool(), AnswerTool(), AmendTool(), SkillTool(),
+        DecideTool(), ConcernTool(), OfferTool(), AskTool(), AnswerTool(), AmendTool(),
+        SkillTool(),
         ArchDoneTool(),
     ])
     return tools

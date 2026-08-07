@@ -6,12 +6,20 @@ import base64
 import fnmatch
 import mimetypes
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from ..llm.registry import RegistryError
 from ..llm.types import ContentPart, Message
-from .base import Tool, ToolContext, ToolError, ToolResult, gate_outside_repo_read
+from .base import (
+    Tool,
+    ToolContext,
+    ToolError,
+    ToolResult,
+    gate_outside_repo_read,
+    normalize_path_arg,
+)
 
 MAX_READ_CHARS = 24_000
 
@@ -557,4 +565,273 @@ class WriteTool(Tool):
         return ToolResult(
             output=f"Wrote {args['path']} ({len(args['content'])} chars).",
             details={"path": args["path"], "bytes": len(args["content"].encode())},
+        )
+
+
+# ---------------------------------------------------------------- search
+
+# Directories that are enormous and machine-generated. Walking into one from a
+# repo-wide search buries the answer, so they are skipped by DEFAULT — but only
+# by default. This list deliberately mirrors the knowledge graph's exclusions
+# (context.kg.ARTIFACT_DIRS): those are the paths the KG cannot answer about,
+# which makes them exactly the paths grep must be able to reach. A path that
+# names one explicitly ("node_modules/@scope/pkg") is searched.
+_HEAVY_DIRS = frozenset({
+    "node_modules", "dist", "build", "out", "target", "coverage", "htmlcov",
+    ".venv", "venv", "__pycache__", "site-packages", ".mypy_cache", ".pytest_cache",
+    ".bird", "graphify-out", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache",
+    ".git",
+})
+
+MAX_GREP_MATCHES = 200
+MAX_GLOB_RESULTS = 300
+# Per-line clip: one minified bundle line is the whole file, and printing it
+# costs the transcript more than the match is worth.
+MAX_MATCH_LINE_CHARS = 400
+GREP_SNIFF_BYTES = 1024
+
+
+def _is_probably_binary(p: Path) -> bool:
+    try:
+        with p.open("rb") as f:
+            return b"\x00" in f.read(GREP_SNIFF_BYTES)
+    except OSError:
+        return True
+
+
+def _walk_files(root: Path, include_heavy: bool):
+    """Yield files under `root`, pruning heavy dirs unless asked otherwise.
+
+    Pruning happens at directory level (os.walk's dirnames splice) rather than
+    by filtering results, so a skipped node_modules is never descended into —
+    the difference between a fast search and a 30-second one.
+    """
+    if root.is_file():
+        yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        if not include_heavy:
+            dirnames[:] = [d for d in dirnames if d not in _HEAVY_DIRS]
+        else:
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+        dirnames.sort()
+        here = Path(dirpath)
+        for name in sorted(filenames):
+            yield here / name
+
+
+def _names_a_heavy_dir(path_str: str) -> bool:
+    """True when the requested path itself points into a skipped directory —
+    the signal that the caller means it and pruning should be off."""
+    return any(part in _HEAVY_DIRS for part in Path(normalize_path_arg(path_str)).parts)
+
+
+def _rel(p: Path, root: Path) -> str:
+    try:
+        return str(p.relative_to(root))
+    except ValueError:
+        return str(p)
+
+
+class GrepTool(Tool):
+    """Regex search over file contents.
+
+    Exists because the harness had no way to answer "which files contain this
+    string" except by shelling out. Every such question became a bash call,
+    a permission prompt, and a turn — and for content the knowledge graph does
+    not index (dependency sources, build output, literal strings that are not
+    code symbols) it was the *only* route, taken one blind `grep | head` at a
+    time.
+    """
+
+    name = "grep"
+    description = (
+        "Regex search over file contents. Use for literal text and for what kg_query "
+        "does not index: node_modules, dist, build. Returns path:line: text."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Python regex"},
+            "path": {"type": "string", "description": "File or dir to search (default: repo root)"},
+            "glob": {"type": "string", "description": "Only files whose name matches, e.g. '*.js'"},
+            "literal": {"type": "boolean", "description": "Match pattern as plain text"},
+            "ignore_case": {"type": "boolean", "description": "Case-insensitive"},
+            "files_only": {"type": "boolean", "description": "Return paths, not lines"},
+            "context": {"type": "integer", "description": "Context lines per match"},
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        pattern = args["pattern"]
+        path_str = args.get("path") or "."
+        root = ctx.resolve_path(path_str)
+        gate_outside_repo_read(ctx, path_str, root, self.name)
+        if not root.exists():
+            raise _not_found(path_str, root)
+
+        flags = re.IGNORECASE if args.get("ignore_case") else 0
+        try:
+            rx = re.compile(re.escape(pattern) if args.get("literal") else pattern, flags)
+        except re.error as e:
+            raise ToolError(
+                f"invalid regular expression {pattern!r}: {e}. Pass literal=true to "
+                f"search for it as plain text."
+            ) from e
+
+        glob = args.get("glob")
+        context = max(int(args.get("context") or 0), 0)
+        files_only = bool(args.get("files_only"))
+        include_heavy = _names_a_heavy_dir(path_str)
+
+        lines: list[str] = []
+        matched_files = 0
+        total = 0
+        truncated = False
+        scanned = 0
+
+        for f in _walk_files(root, include_heavy):
+            if glob and not fnmatch.fnmatch(f.name, glob):
+                continue
+            if _is_probably_binary(f):
+                continue
+            scanned += 1
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            file_lines = text.splitlines()
+            hits = [i for i, line in enumerate(file_lines) if rx.search(line)]
+            if not hits:
+                continue
+            matched_files += 1
+            rel = _rel(f, ctx.repo_root)
+            if files_only:
+                lines.append(rel)
+                total += len(hits)
+                if matched_files >= MAX_GLOB_RESULTS:
+                    truncated = True
+                    break
+                continue
+            for i in hits:
+                total += 1
+                if total > MAX_GREP_MATCHES:
+                    truncated = True
+                    break
+                lo = max(i - context, 0)
+                hi = min(i + context + 1, len(file_lines))
+                for j in range(lo, hi):
+                    body = file_lines[j]
+                    if len(body) > MAX_MATCH_LINE_CHARS:
+                        body = body[:MAX_MATCH_LINE_CHARS] + " …[line clipped]"
+                    sep = ":" if j == i else "-"
+                    lines.append(f"{rel}:{j + 1}{sep} {body}")
+                if context:
+                    lines.append("--")
+            if truncated:
+                break
+
+        if not lines:
+            hint = ""
+            if not include_heavy:
+                hint = (
+                    " Generated directories (node_modules, dist, build) were skipped — "
+                    "pass that path explicitly to search inside one."
+                )
+            return ToolResult(
+                output=f"No matches for {pattern!r} in {path_str} ({scanned} files searched).{hint}",
+                details={"pattern": pattern, "matches": 0, "files": 0, "scanned": scanned},
+            )
+
+        header = (
+            f"[{total} match{'es' if total != 1 else ''} in {matched_files} file"
+            f"{'s' if matched_files != 1 else ''}"
+            + (", truncated" if truncated else "")
+            + "]"
+        )
+        out = header + "\n" + "\n".join(lines)
+        if truncated:
+            out += "\n[result cap reached — narrow with path, glob, or a tighter pattern]"
+        return ToolResult(
+            output=out,
+            details={
+                "pattern": pattern,
+                "matches": total,
+                "files": matched_files,
+                "scanned": scanned,
+                "truncated": truncated,
+            },
+        )
+
+
+class GlobTool(Tool):
+    """Find files by path pattern.
+
+    "Which files have 'mcp' in the name" is not a question about code
+    structure, so the knowledge graph answers it with sixty unrelated nodes.
+    It is a question about the filesystem, and this is the tool that reads
+    the filesystem.
+    """
+
+    name = "glob"
+    description = (
+        "Find files by path pattern, e.g. '**/*mcp*'. Use for 'which files are named X' "
+        "— kg_query does not index filenames."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Glob on the relative path, e.g. '**/*mcp*'"},
+            "path": {"type": "string", "description": "Directory to search under (default: repo root)"},
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        pattern = args["pattern"]
+        path_str = args.get("path") or "."
+        root = ctx.resolve_path(path_str)
+        gate_outside_repo_read(ctx, path_str, root, self.name)
+        if not root.is_dir():
+            raise ToolError(f"{path_str} is not a directory")
+
+        include_heavy = _names_a_heavy_dir(path_str) or _names_a_heavy_dir(pattern)
+        # A bare name ('*mcp*') is meant to match anywhere, not only at the
+        # root — models write that far more often than the '**/' spelling.
+        candidates = [pattern]
+        if not pattern.startswith("**"):
+            candidates.append(f"**/{pattern.lstrip('/')}")
+
+        found: list[str] = []
+        seen: set[str] = set()
+        for f in _walk_files(root, include_heavy):
+            rel_root = _rel(f, root)
+            if not any(fnmatch.fnmatch(rel_root, c) or fnmatch.fnmatch(f.name, c)
+                       for c in candidates):
+                continue
+            rel = _rel(f, ctx.repo_root)
+            if rel in seen:
+                continue
+            seen.add(rel)
+            found.append(rel)
+            if len(found) >= MAX_GLOB_RESULTS:
+                break
+
+        if not found:
+            hint = ""
+            if not include_heavy:
+                hint = " Generated directories were skipped — name one explicitly to search it."
+            return ToolResult(
+                output=f"No files match {pattern!r} under {path_str}.{hint}",
+                details={"pattern": pattern, "count": 0},
+            )
+        capped = len(found) >= MAX_GLOB_RESULTS
+        out = f"[{len(found)} file{'s' if len(found) != 1 else ''}"
+        out += ", capped]" if capped else "]"
+        out += "\n" + "\n".join(found)
+        return ToolResult(
+            output=out, details={"pattern": pattern, "count": len(found), "truncated": capped}
         )

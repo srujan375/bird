@@ -234,7 +234,41 @@ def tracker(state: ArchState) -> str:
         )
     else:
         lines.append("design: nothing promoted yet")
-    lines.append(f"brief: scope={state.brief.scope or '?'} · goal={'set' if state.brief.goal else '?'}")
+    b = state.brief
+    if b.scope_assumed():
+        lines.append(
+            f"brief: scope={b.effective_scope()} (ASSUMED — nobody stated one; you are "
+            f"designing for the smallest thing that could work) · "
+            f"goal={'set' if b.goal else '?'}"
+        )
+    else:
+        lines.append(f"brief: scope={b.scope} (stated) · goal={'set' if b.goal else '?'}")
+    # the numbers themselves, not a boolean saying they exist: every objection
+    # worth making is measured against these
+    numbers = b.stated_numbers()
+    lines.append("numbers: " + (" · ".join(numbers) if numbers else "NONE STATED"))
+
+    # brief debt — a design growing on top of facts nobody has supplied. Loud,
+    # advisory, and it does not block anything: the point is that it stays in
+    # front of the model instead of being noticed once at a gate.
+    missing = b.missing()
+    if state.components and missing:
+        lines.append(
+            f"[!] {len(state.components)} components on the canvas and the brief is still "
+            f"missing: {', '.join(missing)}. Ask — `offer` gets you an answer in one tap — "
+            "or say out loud what you are assuming and why."
+        )
+
+    # a user's choice that nothing was weighed against. The harness cannot know
+    # whether it is right; it can know nobody checked.
+    unweighed = state.unweighed_user_choices()
+    if unweighed:
+        lines.append("[!] user choices with no alternative weighed:")
+        lines += [
+            f"  - {d.id} {d.topic} -> {d.choice}: record what you'd have picked instead and "
+            "why, then endorse it or raise a `concern` against it"
+            for d in unweighed[:CONCERNS_SHOWN]
+        ]
 
     concerns = state.open_concerns()
     if concerns:
@@ -252,10 +286,11 @@ def tracker(state: ArchState) -> str:
     if queue:
         lines.append("worth depth (risk order): " + ", ".join(
             f"{o.component_id}({o.facet})" for o in queue))
-    blocking = state.blocking_questions()
-    if blocking:
+    unanswered = [q for q in state.questions if q.open]
+    if unanswered:
         lines.append("unanswered questions you asked: " + "; ".join(
-            f"{q.id}: {q.question[:60]}" for q in blocking))
+            f"{q.id}{f' [{q.target}]' if q.target else ''}: {q.question[:60]}"
+            for q in unanswered[:CONCERNS_SHOWN]))
 
     lines.append(f"next: {_next_hint(state)}")
     return "\n".join(lines)

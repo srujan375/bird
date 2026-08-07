@@ -8,7 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  editComponent, mutate, noticeFor, promoteVariant, resolveConcern, useSession,
+  editComponent, mutate, promoteVariant, resolveConcern, sendInput, toolArg, useSession,
 } from "./session";
 import type { ArchState, Component, WireEvent } from "../types";
 
@@ -81,14 +81,17 @@ describe("apply", () => {
     const s = useSession.getState();
     expect(s.stream).toBeNull();
     expect(s.running).toBe(false);
-    expect(s.transcript).toEqual([
-      { t: "user", text: "design it" },
-      { t: "agent", text: "hello" },
-      { t: "turn", status: "reply", message: null },
+    expect(s.transcript.map((i) => [i.t, "text" in i ? i.text : i.status])).toEqual([
+      ["user", "design it"],
+      ["agent", "hello"],
+      ["turn", "reply"],
     ]);
+    // §3: the transcript names who is speaking, and the critic is not the
+    // architect — see the critic test below
+    expect(s.transcript.filter((i) => i.t === "agent").map((i: any) => i.who)).toEqual(["architect"]);
   });
 
-  it("turns tool calls into one activity line each", () => {
+  it("turns tool calls into one row each, named and still running", () => {
     apply({
       type: "harness_event", event: "assistant",
       data: {
@@ -99,9 +102,72 @@ describe("apply", () => {
         ],
       },
     });
-    expect(useSession.getState().transcript.map((t) => "text" in t && t.text)).toEqual([
-      "here you go", "+ component api", "→ connect api → db",
-    ]);
+    const items = useSession.getState().transcript;
+    expect(items.map((i) => i.t)).toEqual(["agent", "tool", "tool"]);
+    expect(items.filter((i) => i.t === "tool").map((i: any) => [i.name, i.arg, i.status]))
+      .toEqual([
+        ["component", "api", "running"],
+        ["connect", "api → db", "running"],
+      ]);
+  });
+
+  it("a tool result settles its own row, not the other one", () => {
+    apply({
+      type: "harness_event", event: "assistant",
+      data: {
+        tool_calls: [
+          { name: "component", arguments_json: '{"id":"api"}' },
+          { name: "connect", arguments_json: '{"src":"api","dst":"db"}' },
+        ],
+      },
+    });
+    apply({ type: "harness_event", event: "tool_result", data: { name: "connect", is_error: true } });
+    expect(useSession.getState().transcript.filter((i) => i.t === "tool")
+      .map((i: any) => [i.name, i.status]))
+      .toEqual([["component", "running"], ["connect", "error"]]);
+  });
+
+  it("a row still running when the turn closes is not left spinning forever", () => {
+    // an interrupt, or a turn that died: the result never arrives, and a
+    // permanent "···" would be the page lying about what the harness is doing
+    apply({
+      type: "harness_event", event: "assistant",
+      data: { tool_calls: [{ name: "component", arguments_json: '{"id":"api"}' }] },
+    });
+    apply({ type: "turn_end", status: "interrupted" });
+    expect(useSession.getState().transcript.filter((i) => i.t === "tool")
+      .map((i: any) => i.status)).toEqual(["ok"]);
+  });
+
+  it("the critic gets its own voice, once, from the concern it filed", () => {
+    // The critic never sends a message — it files a Concern on its own thread
+    // and the state push is the only trace. Without this the objection appears
+    // with no record of who raised it.
+    const judged = archState({
+      concerns: [{
+        id: "c1", severity: "risk", target: "api", claim: "unbounded growth",
+        alternative: "add a ttl", source: "judge", status: "open", resolution: null,
+      } as any],
+    });
+    apply({ ...stateEvent(judged), changed: { kind: "concern", id: "c1" } } as any);
+    apply({ ...stateEvent(judged), changed: { kind: "concern", id: "c1" } } as any);
+
+    const critic = useSession.getState().transcript.filter(
+      (i) => i.t === "agent" && (i as any).who === "critic",
+    );
+    expect(critic).toHaveLength(1);
+    expect((critic[0] as any).text).toContain("unbounded growth");
+  });
+
+  it("an architect-filed concern is not credited to the critic", () => {
+    const own = archState({
+      concerns: [{
+        id: "c1", severity: "risk", target: "api", claim: "I was wrong earlier",
+        alternative: "", source: "model", status: "open", resolution: null,
+      } as any],
+    });
+    apply({ ...stateEvent(own), changed: { kind: "concern", id: "c1" } } as any);
+    expect(useSession.getState().transcript.filter((i) => i.t === "agent")).toHaveLength(0);
   });
 
   it("finalizing closes the session and clears any open gate", () => {
@@ -122,6 +188,39 @@ describe("apply", () => {
     expect(useSession.getState().conn).toBe("complete");
   });
 
+  it("typing while an offer is open is the answer, not a rejection", async () => {
+    // The options are a shortcut, not the whole answer space. "about 5k" is a
+    // better fact than whichever bucket the user would have rounded it into —
+    // and sending it as approved:false would throw the number away and record
+    // the question as deferred.
+    const posts: { path: string; body: any }[] = [];
+    vi.stubGlobal("fetch", async (path: string, init: { body: string }) => {
+      posts.push({ path, body: JSON.parse(init.body) });
+      return { ok: true, json: async () => ({ ok: true }) };
+    });
+    apply({
+      type: "permission_request", id: 7, kind: "offer", summary: "",
+      question: "How many users?", options: ["~1k", "~1M"],
+    });
+    sendInput("about 5k");
+    await Promise.resolve();
+    expect(posts[0].path).toBe("/permission");
+    expect(posts[0].body).toMatchObject({ id: 7, approved: true, feedback: "about 5k" });
+  });
+
+  it("typing while an approval gate is open still requests changes", async () => {
+    const posts: { path: string; body: any }[] = [];
+    vi.stubGlobal("fetch", async (path: string, init: { body: string }) => {
+      posts.push({ path, body: JSON.parse(init.body) });
+      return { ok: true, json: async () => ({ ok: true }) };
+    });
+    apply({ type: "permission_request", id: 8, kind: "toplevel_approval", summary: "?" });
+    sendInput("use postgres instead");
+    await Promise.resolve();
+    expect(posts[0].body).toMatchObject({ id: 8, approved: false,
+                                          feedback: "use postgres instead" });
+  });
+
   it("a dropped connection before finalize is", () => {
     apply(stateEvent(archState()));
     useSession.getState().disconnect();
@@ -129,14 +228,21 @@ describe("apply", () => {
   });
 });
 
-describe("noticeFor", () => {
-  it("picks the argument that identifies the call", () => {
-    expect(noticeFor({ name: "expand", arguments_json: '{"component_id":"db"}' }))
-      .toBe("▸ expand db");
-    expect(noticeFor({ name: "concern", arguments_json: '{"claim":"this will not scale"}' }))
-      .toBe("⚑ concern this will not scale");
-    expect(noticeFor({ name: "mystery", arguments_json: "not json" })).toBe("· mystery");
+describe("toolArg", () => {
+  it("picks whichever field names the thing the call acted on", () => {
+    expect(toolArg({ name: "expand", arguments_json: '{"component_id":"db"}' })).toBe("db");
+    expect(toolArg({ name: "connect", arguments_json: '{"src":"api","dst":"db"}' }))
+      .toBe("api → db");
+    expect(toolArg({ name: "concern", arguments_json: '{"claim":"this will not scale"}' }))
+      .toBe("this will not scale");
   });
+
+  it("survives arguments that are not JSON at all", () => {
+    // a malformed tool call is the model's problem; a page that throws while
+    // rendering the transcript makes it everyone's
+    expect(toolArg({ name: "mystery", arguments_json: "not json" })).toBe("");
+  });
+
 });
 
 // ------------------------------------------------------------- mutations
@@ -183,7 +289,7 @@ describe("mutate", () => {
     const ok = await editComponent("api", { name: "" });
     expect(ok).toBe(false);
     expect(useSession.getState().arch!.components.api.name).toBe("api");
-    expect(useSession.getState().transcript.at(-1)).toEqual({
+    expect(useSession.getState().transcript.at(-1)).toMatchObject({
       t: "notice", err: true, text: "✗ a component needs a name.",
     });
   });

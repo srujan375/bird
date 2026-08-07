@@ -12,6 +12,8 @@ from ...tools import (
     BashTool,
     DoneTool,
     EditTool,
+    GlobTool,
+    GrepTool,
     KgQueryTool,
     LsTool,
     PlanTool,
@@ -36,7 +38,10 @@ def code_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool
     - with_web=False → also strip web tools, used by offline eval runs where
                        network egress must be a hard NO.
     """
-    tools: list[Tool] = [ReadTool(), ReadImageTool(), LsTool(), EditTool(), WriteTool(), BashTool()]
+    tools: list[Tool] = [
+        ReadTool(), ReadImageTool(), LsTool(), GrepTool(), GlobTool(),
+        EditTool(), WriteTool(), BashTool(),
+    ]
     if with_kg:
         tools.append(KgQueryTool())
     if with_web:

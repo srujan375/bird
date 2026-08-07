@@ -64,17 +64,20 @@ PLAN_EXPLORE_NUDGE = (
 # line PlanState.render() produces
 PLAN_TRACKER_PREFIX = "[plan tracker"
 KG_DRIFT_NOTICE = (
-    "[system notice] You are searching with bash while the knowledge graph is "
-    "available. kg_query is the primary search tool — a single miss does not "
-    "mean it stopped working. Ask kg_query first for each new question about "
-    "definitions, callers, or module relationships (retrying with its "
-    "suggested nearest terms on a miss); use bash only for literal string "
-    "content."
+    "[system notice] You are shelling out to search. There are dedicated tools "
+    "for this and they are better at it: `kg_query` for where something is "
+    "defined and what calls it, `grep` for literal text (including inside "
+    "node_modules/dist, which kg_query does not index), `glob` for finding "
+    "files by name. Match the tool to the question instead of scripting the "
+    "search by hand."
 )
 
 
 def _is_drift_search(command: str) -> bool:
-    """A bash call that competes with kg_query: rg/grep/find or `git grep`."""
+    """A bash call that competes with the dedicated search tools: rg/grep/find
+    or `git grep`. Note this counts *shelling out* only — the grep and glob
+    tools are the intended route, not drift, so reaching for bash now means
+    both of them were passed over."""
     tokens = command.strip().split()
     if not tokens:
         return False

@@ -228,6 +228,23 @@ class Tool:
     # point someone writes it.
     requires_permission: bool = False
 
+    def needs_permission(self, args: dict[str, Any], ctx: ToolContext) -> bool:
+        """Whether THIS call needs approval, asked only of an already-gated tool.
+
+        Two separate decisions, and conflating them is a way to lose the gate:
+        `requires_permission` decides whether the tool gets WRAPPED at all
+        (gate_tools' job); this decides whether a wrapped tool's individual
+        call still has to ask. So the default here is True, not the class
+        flag — anything that has been handed to GatedTool asks unless it
+        actively waives, and a tool wrapped directly (tests, and any future
+        caller that skips gate_tools) cannot be silently un-gated by having
+        forgotten to set the flag.
+
+        `bash` overrides this to waive search-only commands, whose safety the
+        category allowlist has already established.
+        """
+        return True
+
     def spec(self) -> ToolSpec:
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)
 

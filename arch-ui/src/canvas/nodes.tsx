@@ -2,6 +2,7 @@
  * Node cards. A node *is* the contract sheet — that is the whole reason for
  * rendering from structured state rather than a diagram image.
  */
+import { useEffect, useState } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useCanvas } from "../store/canvas";
 import type { Component, Concern, SketchNode } from "../types";
@@ -24,6 +25,31 @@ function Anchors() {
   );
 }
 
+/**
+ * The `data-in` flip, §3.
+ *
+ * Starts false so the element is painted once in its "from" state, then flips
+ * true on the next frame and the CSS transition covers the gap. Two rAFs, not
+ * one: a single frame is not reliably enough for the browser to have committed
+ * the first paint, and if it has not, the flip coalesces into the initial
+ * render and no transition runs at all.
+ *
+ * `born` short-circuits it — something already on screen when the page loaded
+ * never had an arrival to animate.
+ */
+function useEntrance(born: boolean): boolean {
+  const [inn, setInn] = useState(born);
+  useEffect(() => {
+    if (born) return;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => setInn(true));
+    });
+    return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
+  }, [born]);
+  return inn;
+}
+
 function facetSummary(c: Component): string | null {
   const f = c.facet;
   if (!f) return null;
@@ -42,43 +68,79 @@ export interface ComponentNodeData extends Record<string, unknown> {
   component: Component;
   gaps: string[];
   concerns: Concern[];
+  /** Open questions targeting this component — asked and still unanswered. */
+  questions: string[];
   owes: boolean;
   changed: boolean;
+  /** True while another flow is hovered or playing and this card is not on it. */
+  dim: boolean;
+  /** True while this card is on the flow being hovered or played (§7). */
+  lit: boolean;
+  /** Already on screen when the page loaded — no arrival to animate (§3). */
+  born: boolean;
 }
 
+/**
+ * The card, handover §6.
+ *
+ * Three strips: a coloured band carrying the kind and the open affordance, a
+ * body carrying the name and what the thing is for, and a footer carrying
+ * everything that is *about* the card rather than in it — tech, facet size,
+ * thinness, unanswered questions, objections.
+ *
+ * The split matters more than it looks. Before this, all of that sat in one
+ * undifferentiated column and the kind — the first thing anyone reads a
+ * diagram by — was the quietest line on it.
+ */
 export function ComponentNode({ data, selected }: NodeProps) {
-  const { component: c, gaps, concerns, owes, changed } = data as ComponentNodeData;
+  const { component: c, gaps, concerns, questions, owes, changed, dim, lit, born } =
+    data as ComponentNodeData;
+  const inn = useEntrance(born);
   const open = useCanvas((s) => s.openComponentDialog);
   const facet = facetSummary(c);
   const worst = concerns.find((x) => x.severity === "blocker") ?? concerns[0];
   const title = [
     gaps.length ? `Thin:\n· ${gaps.join("\n· ")}` : "",
     concerns.length ? `Concerns:\n· ${concerns.map((x) => `[${x.severity}] ${x.claim}`).join("\n· ")}` : "",
+    questions.length ? `Asked, unanswered:\n· ${questions.join("\n· ")}` : "",
   ].filter(Boolean).join("\n\n");
 
   return (
     <div
       className="node"
+      data-kind={c.kind}
       data-selected={selected}
       data-changed={changed}
       data-existing={c.existing}
+      data-dim={dim}
+      data-lit={lit}
+      data-in={inn}
       title={title || undefined}
     >
       <Anchors />
-      {owes && <span className="owe-dot" title="owes a facet" />}
-      {/* internals open in their own dialog — never by growing the card, which
-          would shove neighbours the user placed by hand */}
-      <button
-        className="open-btn"
-        title="open its internals (E)"
-        onClick={(e) => { e.stopPropagation(); open(c.id); }}
-      >
-        ⤢
-      </button>
-      <div className="kind">{c.kind}{c.existing ? " · existing" : ""}</div>
-      <div className="name">{c.name}</div>
-      {c.responsibility && <div className="resp">{c.responsibility}</div>}
-      <div className="row">
+      <div className="hb">
+        <span>{c.kind}{c.existing ? " · existing" : ""}</span>
+        <span className="spacer" />
+        {owes && <span className="owe-dot" title="owes a facet" />}
+        {/* internals open in their own dialog — never by growing the card,
+            which would shove neighbours the user placed by hand */}
+        {!c.existing && (
+          <button
+            className="open-btn"
+            title="open its internals (E)"
+            onClick={(e) => { e.stopPropagation(); open(c.id); }}
+          >
+            ⤢
+          </button>
+        )}
+      </div>
+
+      <div className="bd">
+        <div className="name">{c.name}</div>
+        {c.responsibility && <div className="resp">{c.responsibility}</div>}
+      </div>
+
+      <div className="ft">
         {c.tech && <span className="pill">{c.tech}</span>}
         {facet && (
           <button className="pill facet" onClick={(e) => { e.stopPropagation(); open(c.id); }}>
@@ -86,6 +148,9 @@ export function ComponentNode({ data, selected }: NodeProps) {
           </button>
         )}
         {gaps.length > 0 && <span className="pill thin">thin · {gaps.length}</span>}
+        {questions.length > 0 && (
+          <span className="pill asked" title={questions.join("\n")}>asked · {questions.length}</span>
+        )}
         {worst && (
           <span className="pill" title={worst.claim}>
             <span className={`severity-dot ${worst.severity}`} /> {concerns.length}
@@ -100,16 +165,19 @@ export interface SketchNodeData extends Record<string, unknown> {
   node: SketchNode;
   changed: boolean;
   concerns: Concern[];
+  born?: boolean;
 }
 
 export function SketchNodeCard({ data, selected }: NodeProps) {
-  const { node, changed, concerns } = data as SketchNodeData;
+  const { node, changed, concerns, born } = data as SketchNodeData;
+  const inn = useEntrance(born ?? true);
   const worst = concerns.find((x) => x.severity === "blocker") ?? concerns[0];
   return (
     <div
       className="node sketch"
       data-selected={selected}
       data-changed={changed}
+      data-in={inn}
       title={node.detail || node.note || undefined}
     >
       <Anchors />
