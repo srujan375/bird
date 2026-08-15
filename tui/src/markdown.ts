@@ -134,12 +134,24 @@ export function renderMarkdown(text: string, width: number): string[] {
 	const out: string[] = [];
 	let i = 0;
 
-	// paragraph accumulator
+	// Blank-line separator between blocks: exactly one blank line between
+	// any two distinct blocks, none at the very start of the output, and
+	// never two blanks in a row. Consecutive items of the same list kind
+	// stay contiguous, so callers pass a list kind to keep a group tight.
 	let para: string[] = [];
+	let lastListKind: "ul" | "ol" | null = null;
+	const beginBlock = (listKind: "ul" | "ol" | null = null) => {
+		if (listKind !== null && listKind === lastListKind) {
+			return; // same list continues — keep it tight
+		}
+		if (out.length > 0 && out[out.length - 1] !== "") out.push("");
+		lastListKind = listKind;
+	};
 	const flushPara = () => {
 		if (para.length === 0) return;
 		const joined = para.join(" ");
 		para = [];
+		beginBlock();
 		const wrapped = wrapTextWithAnsi(renderInline(joined), width);
 		for (const l of wrapped) out.push(l);
 	};
@@ -152,6 +164,7 @@ export function renderMarkdown(text: string, width: number): string[] {
 		const fence = line.match(/^```(.*)$/);
 		if (fence) {
 			flushPara();
+			beginBlock();
 			const code: string[] = [];
 			i++;
 			while (i < lines.length && !/^```/.test(lines[i])) {
@@ -166,6 +179,7 @@ export function renderMarkdown(text: string, width: number): string[] {
 		// horizontal rule
 		if (/^(\s*(-{3,}|\*{3,}|_{3,})\s*)$/.test(line)) {
 			flushPara();
+			beginBlock();
 			out.push(t.dim("─".repeat(width)));
 			i++;
 			continue;
@@ -175,6 +189,7 @@ export function renderMarkdown(text: string, width: number): string[] {
 		const h = line.match(/^(#{1,6})\s+(.*)$/);
 		if (h) {
 			flushPara();
+			beginBlock();
 			const level = h[1].length;
 			const paint = level <= 2 ? t.accentBold : t.fg.bold;
 			const text2 = renderInline(h[2]);
@@ -186,6 +201,7 @@ export function renderMarkdown(text: string, width: number): string[] {
 		// table: a line starting with `|`, and the next line is a separator
 		if (/^\s*\|/.test(line) && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes("-")) {
 			flushPara();
+			beginBlock();
 			const tableRows: string[][] = [];
 			// header
 			tableRows.push(splitTableRow(line));
@@ -204,6 +220,7 @@ export function renderMarkdown(text: string, width: number): string[] {
 		const bq = line.match(/^>\s?(.*)$/);
 		if (bq) {
 			flushPara();
+			beginBlock();
 			const quoted: string[] = [];
 			while (i < lines.length) {
 				const m = lines[i].match(/^>\s?(.*)$/);
@@ -220,6 +237,7 @@ export function renderMarkdown(text: string, width: number): string[] {
 		const ul = line.match(/^\s*[-*+]\s+(.*)$/);
 		if (ul) {
 			flushPara();
+			beginBlock("ul");
 			const marker = t.accent("•");
 			const indent = 2; // "• " visible width
 			out.push(...renderListItem(marker, ul[1], width, indent));
@@ -243,6 +261,7 @@ export function renderMarkdown(text: string, width: number): string[] {
 		const ol = line.match(/^\s*(\d+)\.\s+(.*)$/);
 		if (ol) {
 			flushPara();
+			beginBlock("ol");
 			const num = ol[1] + ".";
 			const marker = t.accent(num);
 			const indent = num.length + 1;
@@ -275,6 +294,9 @@ export function renderMarkdown(text: string, width: number): string[] {
 	}
 
 	flushPara();
+	// a block that pushed a separator but rendered to nothing (e.g. a `>`
+	// line with no content) must not leave a trailing blank line
+	while (out.length > 0 && out[out.length - 1] === "") out.pop();
 	return out;
 }
 

@@ -439,11 +439,11 @@ def test_persistence_and_resume(tmp_path):
 
 def test_toolset_composition(tmp_path):
     names = [t.name for t in arch_harness_tools()]
-    assert names == ["read", "read_image", "kg_query", "WebSearch", "WebFetch",
+    assert names == ["read", "read_image", "ls", "kg_query", "WebSearch", "WebFetch",
                      "import_state",
                      "variant", "node", "link", "splice", "depth", "promote",
                      "brief", "component", "connect", "flow", "expand", "decide",
-                     "concern", "ask", "answer", "amend_toplevel", "skill", "done"]
+                     "concern", "offer", "ask", "answer", "amend_toplevel", "skill", "done"]
     for absent in ("edit", "write", "bash", "plan"):
         assert absent not in names
     names = [t.name for t in arch_harness_tools(with_kg=False, with_web=False)]

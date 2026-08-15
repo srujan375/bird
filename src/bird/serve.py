@@ -15,7 +15,9 @@ is the JSON-lines protocol the TUI speaks (one JSON object per line):
              {"type": "harness_event", "event": "assistant"|"tool_result"|..., "data": {...}}
              {"type": "harness_event", "event": "assistant_delta", "data": {"text": "..."}}
              {"type": "permission_request", "id": 3, "kind": "edit"|"write"|..., ...}
-             {"type": "turn_end", "status": ..., "summary": ..., "turns": ...}
+             {"type": "turn_end", "status": ..., "summary": ..., "turns": ...,
+              "input_tokens": ..., "output_tokens": ...}
+             {"type": "total_usage", "input_tokens": ..., "output_tokens": ...}
              {"type": "model_list", "current": ..., "default": ..., "models": [...], "notes": [...]}
              {"type": "command_output", "text": "..."}
              {"type": "bye"}
@@ -47,6 +49,7 @@ from .attachments import ingest_images
 from .engine.runner import repair_interrupted
 from .engine.session import save_messages
 from .llm.discovery import discover_models
+from .llm.types import Usage
 from .permissions import (  # re-exported: importers still say bird.serve.GatedTool
     DIFF_CONTEXT_LINES,
     MAX_DIFF_LINES,
@@ -152,10 +155,36 @@ class Server:
         for name, tool in list(runner.tools.items()):
             runner.tools[name] = gate_tools([tool], self.broker)[0]
 
+        # Session-cumulative token spend across every harness this session
+        # runs. A Server's own runner contributes nothing here — its per-turn
+        # usage lands in every turn_end carried by `_start_turn` — but the
+        # harnesses it spawns mid-turn report themselves: the lead's `code`
+        # fork pushes its RunResult deltas, and the arch judge pushes each
+        # critique, via a `usage_notify` record event (they know about this
+        # total because the fork carries it — see harnesses/lead/tools.py).
+        self.usage = Usage()
+
         # tee harness events to the UI; honor interrupts between events
         recorder_event = repl.recorder.event
 
         def record(event_type: str, data: dict[str, Any]) -> None:
+            if event_type == "usage_notify":
+                # A session-local notification, not transcript material: fold
+                # the deltas in and publish the running total, but never tee
+                # to the recorder or the UI as a harness_event (double-count
+                # risk aside, no transcript wants fake tokens on the record).
+                self.usage += Usage(
+                    int(data.get("input_tokens", 0) or 0),
+                    int(data.get("output_tokens", 0) or 0),
+                )
+                self._emit(
+                    "total_usage",
+                    input_tokens=self.usage.input_tokens,
+                    output_tokens=self.usage.output_tokens,
+                )
+                if self.cancel.is_set():
+                    raise _Interrupted()
+                return
             recorder_event(event_type, data)
             self._emit("harness_event", event=event_type, data=data)
             if self.cancel.is_set():
@@ -170,9 +199,26 @@ class Server:
             if self.cancel.is_set():
                 raise _Interrupted()
             if chunk:  # "" is a wire-level cancel heartbeat, not display text
+                # Repl._turn re-prints the reply unless it knows the text
+                # already reached the user. Taking over on_delta without
+                # setting this is what made a `/<skill>` turn print its answer
+                # a second time; keep the flag honest for any caller that
+                # still routes a turn through the Repl.
+                self.repl._streamed = True
                 self._emit("harness_event", event="assistant_delta", data={"text": chunk})
 
+        # stream the reasoning trace (Ollama thinking models) to the UI the
+        # same way: display-only, skipping the recorder (the recorder-bound
+        # "thinking" event carries the full text), honoring interrupts on
+        # every token so a long thought can be cancelled mid-stream
+        def on_thinking(chunk: str | None) -> None:
+            if self.cancel.is_set():
+                raise _Interrupted()
+            if chunk:  # "" heartbeat / None sentinel are wire-level, not display
+                self._emit("harness_event", event="thinking_delta", data={"text": chunk})
+
         runner.on_delta = on_delta
+        runner.on_thinking = on_thinking
 
     def _emit(self, event_type: str, **data: Any) -> None:
         self.transport.emit({"type": event_type, **data})
@@ -188,7 +234,7 @@ class Server:
 
     def ready_payload(self) -> dict[str, Any]:
         repl = self.repl
-        return {
+        payload: dict[str, Any] = {
             "model": repl.runner.spec.spec,
             # the page prints "12.4k / 40k" on every turn divider: compaction
             # fires at 90% of this, so the denominator has to be on screen
@@ -202,11 +248,24 @@ class Server:
             "kg_ready": bool(repl.kg and repl.kg.is_ready()),
             "run_id": repl.run_id,
             "repo": str(repl.runner.ctx.repo_root),
+            # the friendly thinking-mode label (off/low/medium/high/max) or
+            # None when no mode is set (Ollama's auto/default behavior). The
+            # TUI shows it next to the model name; the plain REPL doesn't.
+            "think_mode": repl._think_label(),
             "skills": [
                 {"name": s.name, "description": s.description, "source": s.source}
                 for s in (repl.runner.ctx.skills or [])
             ],
         }
+        # A respawn (--resume) re-opens the same session; the spend so far
+        # was reported by the previous pump's last turn_end, so seed it back
+        # into this one instead of the UI showing 0 / 0 until the next turn.
+        # Absent when zero: a fresh ready from a server that never knew this
+        # field looks identical to one that spent nothing.
+        if self.usage.input_tokens or self.usage.output_tokens:
+            payload["input_tokens"] = self.usage.input_tokens
+            payload["output_tokens"] = self.usage.output_tokens
+        return payload
 
     def run(self) -> int:
         self._emit("ready", **self.ready_payload())
@@ -294,11 +353,18 @@ class Server:
                     [m.to_dict() for m in self.repl.messages],
                     self.repl.recorder.run_dir,
                 )
+                # What this turn actually spent, session-cumulative. Mid-turn
+                # sessions (the lead's dispatches, the arch judge) already
+                # pushed their deltas onto server.usage while the loop was
+                # running — the remainder, if any, is this runner's own loop.
+                self.usage = self.usage + result.usage
                 self._emit(
                     "turn_end",
                     status=result.status,
                     summary=result.summary,
                     turns=result.turns,
+                    input_tokens=self.usage.input_tokens,
+                    output_tokens=self.usage.output_tokens,
                 )
 
         self.worker = threading.Thread(target=work, daemon=True)
@@ -307,6 +373,26 @@ class Server:
     def _command(self, line: str) -> bool | None:
         if self.worker and self.worker.is_alive():
             self._emit("command_output", text="busy: wait for the turn to finish")
+            return None
+        # `/<skill>` is a model turn wearing a slash, so it runs through
+        # _start_turn like typed input — NOT through the redirect_stdout path
+        # at the bottom of this method. Two reasons, both load-bearing:
+        # the turn's reply is already streamed to the UI as assistant_delta,
+        # so capturing Repl._turn's print of the same text and echoing it as
+        # command_output showed the whole answer twice (once rendered, once
+        # raw); and running it inline blocks the transport's reader loop, so
+        # a permission prompt or an interrupt mid-skill could never arrive.
+        # Built-ins keep priority — a skill named "model" must not shadow
+        # /model, same rule the Repl's own dispatch chain enforces.
+        parts = line.split(maxsplit=1)
+        cmd = parts[0].lower()
+        if cmd not in self.repl.BUILTIN_COMMANDS and self.repl._is_skill_command(cmd):
+            arg = self._ingest(parts[1].strip()) if len(parts) > 1 else ""
+            prompt = self.repl.skill_prompt(cmd[1:], arg)
+            if prompt is None:  # raced a skill reload; say so instead of hanging
+                self._emit("command_output", text=f"no skill named {cmd[1:]!r}")
+            else:
+                self._start_turn(prompt)
             return None
         if line.strip() in ("/reload", "/reload-skills"):
             # The serve process can't reload its own code in place — the TUI
@@ -328,6 +414,18 @@ class Server:
                     for m in models
                 ],
                 notes=notes,
+            )
+            return None
+        if line.strip() == "/think":
+            # bare /think is the picker — the UI renders the selectable list
+            # and answers with "/think <mode>". Mirrors /model: the REPL has
+            # the modes, but a JSON bridge can't prompt; the TUI does the
+            # interactive picking. /think <mode> falls through to the generic
+            # _command path (which calls _cmd_think -> _set_think_mode).
+            self._emit(
+                "think_list",
+                current=self.repl._think_label(),
+                modes=list(self.repl.THINK_MODES),
             )
             return None
         if line.strip() == "/sessions":
@@ -371,13 +469,13 @@ class Server:
             # resume by id — delegate to Repl which loads messages and carries
             # the recorded model.
             self.repl._resume_session(arg)
-            self._emit("state", model=self.repl.runner.spec.spec)
+            self._emit("state", model=self.repl.runner.spec.spec, think_mode=self.repl._think_label())
             return None
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             result = self.repl._command(line)
         self._emit("command_output", text=buf.getvalue().rstrip())
-        self._emit("state", model=self.repl.runner.spec.spec)
+        self._emit("state", model=self.repl.runner.spec.spec, think_mode=self.repl._think_label())
         return result
 
 

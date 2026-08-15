@@ -24,7 +24,7 @@ class FakeClient:
         self.script = list(script)
         self.calls = 0
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         self.calls += 1
         if on_delta is not None and self.script[0].content:
             on_delta(self.script[0].content)
@@ -142,7 +142,7 @@ def test_max_turns(make_runner, repo):
 
 def test_unknown_tool_is_validation_error(make_runner):
     r = make_runner([
-        assistant(calls=[tc("grep", {"pattern": "x"})]),
+        assistant(calls=[tc("frobnicate", {"pattern": "x"})]),
         assistant(calls=[tc("done", {"summary": "ok"})]),
     ])
     result = r.run("go")
@@ -277,7 +277,7 @@ def test_kg_drift_nudge_after_repeated_bash_searches(make_kg_runner):
     assert result.status == "done"
     assert any(t == "kg_drift_nudge" for t, _ in r.events)
     assert any(
-        m.role == "user" and m.content and "kg_query is the primary search tool" in m.content
+        m.role == "user" and m.content and "shelling out to search" in m.content
         for m in result.messages
     )
 

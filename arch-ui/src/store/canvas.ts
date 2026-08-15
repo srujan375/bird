@@ -35,6 +35,10 @@ export interface Overlay {
   viewport: { x: number; y: number; zoom: number } | null;
   layer: Layer | null; // null = follow the session (design once something is promoted)
   variant: string | null; // which sketch variant is on the canvas
+  /** Which slice of the design layer is drawn — see views.ts. Persisted like
+   *  the viewport: coming back to a session should land on the diagram you
+   *  were reading, not on the biggest one. */
+  view: string | null;
   railWidth: number;
   chatHeight: number;
   /** Which component's internals are open. Persisted like everything else here:
@@ -52,6 +56,7 @@ function emptyOverlay(): Overlay {
     viewport: null,
     layer: null,
     variant: null,
+    view: null,
     railWidth: clampRail(Number(localStorage.getItem(RAIL_KEY)) || DEFAULT_RAIL),
     chatHeight: Number(localStorage.getItem(CHAT_KEY)) || 320,
     openComponent: null,
@@ -86,10 +91,11 @@ interface CanvasState extends Overlay {
   setPosition: (key: string, xy: XY, pin?: boolean) => void;
   setPositions: (batch: Record<string, XY>) => void;
   unpin: (key: string) => void;
-  clearPins: () => void;
+  clearPins: (prefix?: string) => void;
   setViewport: (v: { x: number; y: number; zoom: number }) => void;
   setLayer: (l: Layer | null) => void;
   setVariant: (v: string | null) => void;
+  setView: (v: string | null) => void;
   /** A frame of a rail drag: width only, not written to storage. */
   dragRail: (w: number) => void;
   setRailWidth: (w: number) => void;
@@ -182,9 +188,25 @@ export const useCanvas = create<CanvasState>((set, get) => ({
       return next;
     }),
 
-  clearPins: () =>
+  /**
+   * Tidy up, for one diagram.
+   *
+   * Scoped by key prefix, because every view lays out in its own namespace and
+   * tidying the token flow must not throw away where you put the cards on the
+   * whole design. No prefix clears everything, which is what the sketch and
+   * design layers shared before views existed.
+   */
+  clearPins: (prefix) =>
     set((s) => {
-      const next: Overlay = { ...current(s), pinned: [], positions: {} };
+      const mine = (k: string) => (prefix === undefined ? true : k.startsWith(prefix));
+      const positions = Object.fromEntries(
+        Object.entries(s.positions).filter(([k]) => !mine(k)),
+      );
+      const next: Overlay = {
+        ...current(s),
+        pinned: s.pinned.filter((k) => !mine(k)),
+        positions,
+      };
       save(s.runId, next);
       return next;
     }),
@@ -198,6 +220,8 @@ export const useCanvas = create<CanvasState>((set, get) => ({
 
   setLayer: (layer) => set((s) => persist(s, { layer })),
   setVariant: (variant) => set((s) => persist(s, { variant })),
+  // switching view deselects: the selection is a key in the view you left
+  setView: (view) => set((s) => ({ ...persist(s, { view }), selected: null })),
 
   // same split as a node drag: every frame is state, only the drop is storage
   dragRail: (railWidth) => set({ railWidth: clampRail(railWidth) }),
@@ -222,6 +246,7 @@ function current(s: CanvasState): Overlay {
     viewport: s.viewport,
     layer: s.layer,
     variant: s.variant,
+    view: s.view,
     railWidth: s.railWidth,
     chatHeight: s.chatHeight,
     openComponent: s.openComponent,
@@ -239,3 +264,14 @@ function persist(s: CanvasState, patch: Partial<Overlay>): Partial<Overlay> {
 
 export const designKey = (id: string) => `design:${id}`;
 export const sketchKey = (variant: string, id: string) => `sketch:${variant}:${id}`;
+/**
+ * A node key inside a view.
+ *
+ * Every view lays out separately, so the same component keeps one position per
+ * diagram it appears in — place `oauthTokenService` where you want it on the
+ * token flow and the whole-design view does not move. `design` is spelled the
+ * old way on purpose: overlays saved before views existed still restore.
+ */
+export const viewKey = (view: string, id: string) => `${view}:${id}`;
+/** The component id back out of a view key. */
+export const keyId = (view: string, key: string) => key.slice(view.length + 1);

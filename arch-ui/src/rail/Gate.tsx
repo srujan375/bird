@@ -1,5 +1,5 @@
 /**
- * The ruling, handover §9 — a 720px sheet over a dimmed canvas.
+ * The ruling, handover §9 — a sheet over a dimmed canvas.
  *
  * It used to be a note pinned to the composer, and it used to say almost
  * nothing: the summary was prose the agent had just written in the transcript,
@@ -8,15 +8,26 @@
  *
  * Those tabs are gone (§1). Decisions and questions no longer live anywhere
  * else in the page, and this is one of exactly two moments they change what you
- * press — so the gate now carries them in full, and it outgrew the rail doing
- * it. It is a sheet, not a modal-with-a-veil-you-cannot-dismiss: the canvas
- * behind it stays readable, and replying in the chat still counts as requesting
- * changes.
+ * press — so the gate carries them in full, and it outgrew the rail doing it.
+ *
+ * Carrying them in full turned out not to be the same as showing them all at
+ * once, which is what it did next: six decisions, each with its rationale and
+ * its rejected options, is a page of reading standing between you and a button,
+ * and that reading is reference — you want it for the two decisions you doubt,
+ * not for all six. So a decision is now a line you can scan (what was decided,
+ * what was chosen) that opens onto why. What is never folded away is what
+ * should change your press: open blockers, and questions still unanswered.
+ *
+ * Hiding is rebuilt for the same reason. It was a bare chevron that dropped the
+ * sheet into a small pill over the minimap — a request that vanishes to
+ * somewhere you are not looking reads as a request you dismissed. The control
+ * now says what it does, and what it leaves behind says what it is, why it is
+ * still there, and how to get back.
  */
 import { useEffect, useMemo, useState } from "react";
 import { respondToGate, useSession } from "../store/session";
 import { Markdown } from "./Markdown";
-import type { ArchState, Concern, PermissionEvent } from "../types";
+import type { ArchState, Concern, Decision, OpenQuestion, PermissionEvent } from "../types";
 
 const plural = (n: number, one: string, many = one + "s") => `${n} ${n === 1 ? one : many}`;
 
@@ -55,11 +66,106 @@ function seedCount(arch: ArchState): number {
   return n;
 }
 
-function Section({ label, children }: { label: string; children: React.ReactNode }) {
+/**
+ * A titled block of the sheet.
+ *
+ * `foldable` is for the sections that are record rather than ruling — what is
+ * thin, what was already settled, what you already answered. They are worth
+ * having in the sheet and are not worth the vertical space they were taking
+ * above the button.
+ */
+function Section({ label, count, note, foldable = false, children }: {
+  label: string;
+  count?: number;
+  note?: string;
+  foldable?: boolean;
+  children: React.ReactNode;
+}) {
+  const head = (
+    <>
+      <span className="section-name">{label}</span>
+      {count !== undefined && <span className="section-count">{count}</span>}
+      {note && <span className="section-note">{note}</span>}
+    </>
+  );
+  if (!foldable) {
+    return (
+      <section className="gsec">
+        <div className="section-label">{head}</div>
+        {children}
+      </section>
+    );
+  }
   return (
-    <div>
-      <div className="section-label">{label}</div>
+    <details className="gsec foldable">
+      <summary className="section-label">
+        {head}
+        <span className="spacer" />
+        <span className="chev" aria-hidden>⌄</span>
+      </summary>
       {children}
+    </details>
+  );
+}
+
+/**
+ * One decision, scannable closed and complete open.
+ *
+ * The category leads as an eyebrow rather than sitting in a left-hand column:
+ * at this type size the column was spending 110px of a 780px sheet on one word
+ * and pushing every title onto a second line. Closed, the row answers "what was
+ * decided and which way did it go"; that is the whole question at a gate. The
+ * rationale and the roads not taken are one click down.
+ */
+function DecisionRow({ d }: { d: Decision }) {
+  // the chosen option is already the headline — what is worth reading here is
+  // what it beat, and a decision that beat nothing is worth seeing as such
+  const alternatives = d.options.filter((o) => o.name !== d.choice);
+  return (
+    <details className="drow">
+      <summary>
+        <span className="drow-eyebrow">
+          <span className="topic">{d.category}</span>
+          {d.status === "deferred" && <span className="tag">deferred</span>}
+          {d.source === "user" && <span className="tag your-call">your call</span>}
+          <span className="spacer" />
+          <span className="chev" aria-hidden>⌄</span>
+        </span>
+        <span className="drow-topic">{d.topic}</span>
+        <span className="drow-choice"><span className="arrow" aria-hidden>→</span> {d.choice}</span>
+      </summary>
+      <div className="drow-body">
+        <div className="field">
+          <div className="field-label">Why</div>
+          <p>{d.rationale || "No rationale was recorded."}</p>
+        </div>
+        <div className="field">
+          <div className="field-label">Weighed against</div>
+          {alternatives.length > 0 ? (
+            <ul className="opts">
+              {alternatives.map((o) => <li key={o.name}>{o.name}</li>)}
+            </ul>
+          ) : (
+            <p className="faint">Nothing else was put on the table.</p>
+          )}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function QuestionRow({ q }: { q: OpenQuestion }) {
+  const unanswered = !q.resolution;
+  return (
+    <div className="qrow" data-unanswered={unanswered}>
+      <div className="drow-eyebrow">
+        <span className="topic">{q.resolution ?? "unanswered"}</span>
+        {q.blocking && unanswered && <span className="tag blocking">blocking</span>}
+      </div>
+      <div className="qrow-text">{q.question}</div>
+      {q.answer && (
+        <div className="qrow-answer"><span className="arrow" aria-hidden>→</span> {q.answer}</div>
+      )}
     </div>
   );
 }
@@ -87,18 +193,26 @@ export function Gate({ req, reason, onRespond }: {
   }, [open]);
 
   const decisions = arch?.decisions ?? [];
-  const questions = useMemo(() => {
-    // unanswered above answered (§9): the ones that can still change the design
-    // come first, and a blocking one is flagged rather than reordered again
-    const qs = arch?.questions ?? [];
-    return [...qs].sort((a, b) => Number(!!a.resolution) - Number(!!b.resolution));
-  }, [arch?.questions]);
+  const questions = arch?.questions ?? [];
+  // §9 splits these rather than sorting them: one is a call to action and the
+  // other is a record, and a sorted single list made them look like one thing.
+  const unanswered = useMemo(() => questions.filter((q) => !q.resolution), [questions]);
+  const answered = useMemo(() => questions.filter((q) => q.resolution), [questions]);
   const settled = (arch?.concerns ?? []).filter((c) => c.status !== "open");
 
   if (!open) {
     return (
-      <button className="gate-pill" data-kind={req.kind} onClick={() => setOpen(true)}>
-        <span className="severity-dot blocker" /> {title} <span className="faint">— open</span>
+      <button
+        className="gate-tuck"
+        data-kind={req.kind}
+        onClick={() => setOpen(true)}
+        title="reopen the request"
+      >
+        <span className="gate-tuck-text">
+          <b>Waiting on you</b>
+          <span>{title}</span>
+        </span>
+        <span className="gate-tuck-cta">Reopen</span>
       </button>
     );
   }
@@ -108,10 +222,23 @@ export function Gate({ req, reason, onRespond }: {
       <div className="sheet-veil" onClick={() => setOpen(false)} />
       <div className="sheet" data-kind={req.kind} role="dialog" aria-label={title}>
         <div className="sheet-head">
-          <h3>{title}</h3>
+          <div className="sheet-title">
+            <h3>{title}</h3>
+            <p>
+              {finalize
+                ? "This is what the handoff bundle will carry into the build."
+                : "This is the shape the build will follow."}{" "}
+              Read what you doubt, then rule on it.
+            </p>
+          </div>
           <span className="spacer" style={{ flex: 1 }} />
-          <button className="ghost tuck" title="tuck away — the request stays open (esc)"
-                  aria-label="tuck away" onClick={() => setOpen(false)}>⌄</button>
+          <button
+            className="ghost tuck"
+            title="the request stays open and waits at the bottom of the canvas (esc)"
+            onClick={() => setOpen(false)}
+          >
+            Hide
+          </button>
         </div>
 
         <div className="sheet-body">
@@ -127,73 +254,60 @@ export function Gate({ req, reason, onRespond }: {
             </div>
           )}
 
-          {decisions.length > 0 && (
-            <Section label={`decisions — ${decisions.length}`}>
-              {decisions.map((d) => (
-                <div key={d.id} className="srow">
-                  <span className="k">{d.category}</span>
-                  <span className="v">
-                    <b>{d.topic} → {d.choice}</b>
-                    {d.status === "deferred" && <span className="tag" style={{ marginLeft: 6 }}>deferred</span>}
-                    {d.source === "user" && <span className="tag" style={{ marginLeft: 6 }}>your call</span>}
-                    <div className="faint">{d.rationale}</div>
-                    <div className="faint mono" style={{ fontSize: 10 }}>
-                      weighed: {d.options.map((o) => o.name).join(" · ") || "—"}
-                      {d.options.length < 2 ? "  (no alternative)" : ""}
-                    </div>
-                  </span>
-                </div>
-              ))}
+          {unanswered.length > 0 && (
+            <Section
+              label="Still unanswered"
+              count={unanswered.length}
+              note="answering one in the chat is better than ruling around it"
+            >
+              {unanswered.map((q) => <QuestionRow key={q.id} q={q} />)}
             </Section>
           )}
 
-          {questions.length > 0 && (
-            <Section label={`questions — ${questions.filter((q) => !q.resolution).length} unanswered`}>
-              {questions.map((q) => (
-                <div key={q.id} className="srow">
-                  <span className="k">{q.resolution ?? "open"}</span>
-                  <span className="v">
-                    {q.question}
-                    {q.blocking && !q.resolution && (
-                      <span className="tag" style={{ marginLeft: 6 }}>blocking</span>
-                    )}
-                    {q.answer && <div className="faint">→ {q.answer}</div>}
-                  </span>
-                </div>
-              ))}
+          {decisions.length > 0 && (
+            <Section label="Decisions" count={decisions.length} note="open one to read why">
+              {decisions.map((d) => <DecisionRow key={d.id} d={d} />)}
+            </Section>
+          )}
+
+          {answered.length > 0 && (
+            <Section label="Answered" count={answered.length} foldable>
+              {answered.map((q) => <QuestionRow key={q.id} q={q} />)}
             </Section>
           )}
 
           {thin.length > 0 && (
-            <Section label={`thin — ${thin.length}, none required`}>
-              <ul className="weigh" style={{ margin: 0, paddingLeft: 16 }}>
+            <Section label="Thin" count={thin.length} note="none of it is required" foldable>
+              <ul className="weigh">
                 {thin.map((t) => <li key={t}>{t}</li>)}
               </ul>
             </Section>
           )}
 
           {settled.length > 0 && (
-            <Section label={`settled objections — ${settled.length}`}>
-              <ul className="weigh" style={{ margin: 0, paddingLeft: 16 }}>
+            <Section label="Settled objections" count={settled.length} foldable>
+              <ul className="weigh">
                 {settled.map((c) => <ConcernLine key={c.id} c={c} />)}
               </ul>
             </Section>
           )}
 
           {finalize && arch && (
-            <Section label="what the handoff writes">
-              <div className="srow">
-                <span className="k">bundle</span>
-                <span className="v mono" style={{ fontSize: 10.5 }}>
-                  {(req.artifacts ?? []).join("  ") || "architecture.json · architecture.md"}
-                </span>
-              </div>
-              <div className="srow">
-                <span className="k">graph</span>
-                <span className="v">
-                  about {seedCount(arch)} nodes seeded into the knowledge graph, so the build
-                  session can query this design on its first turn.
-                </span>
+            <Section label="What the handoff writes">
+              <div className="handoff">
+                <div className="field">
+                  <div className="field-label">Bundle</div>
+                  <p className="mono">
+                    {(req.artifacts ?? []).join("  ") || "architecture.json · architecture.md"}
+                  </p>
+                </div>
+                <div className="field">
+                  <div className="field-label">Graph</div>
+                  <p>
+                    About {seedCount(arch)} nodes seeded into the knowledge graph, so the build
+                    session can query this design on its first turn.
+                  </p>
+                </div>
               </div>
             </Section>
           )}
@@ -207,7 +321,7 @@ export function Gate({ req, reason, onRespond }: {
             Request changes
           </button>
           <span className="spacer" style={{ flex: 1 }} />
-          <span className="faint" style={{ fontSize: 11 }}>
+          <span className="foot-note">
             {blockers.length > 0
               ? "What you type in the composer is recorded as why you overruled."
               : "Or just reply in the chat — that counts as requesting changes."}

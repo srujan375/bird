@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
-from ...llm.types import Message
+from ...llm.types import Message, Usage
 from .state import CONCERN_SEVERITIES, ArchState
 
 MAX_FINDINGS = 5
@@ -44,8 +44,36 @@ CRITIQUE_SYSTEM = (
 )
 
 
-def make_judge(registry: Any, client: Any) -> Callable[[ArchState], list[dict[str, str]]]:
-    """Returns a critic callable ArchState -> findings, using the `judge` alias."""
+class _AccountedClient:
+    """Wraps the judge's client so each critique reports its own spend before
+    findings are parsed. The arch loop reports itself in turn_end — wrapping
+    only the judge's client keeps the two numbers separate and prevents any
+    double count."""
+
+    def __init__(self, inner: Any, on_usage: Callable[[Usage], None]) -> None:
+        self._inner = inner
+        self._on_usage = on_usage
+
+    def complete(self, *args: Any, **kwargs: Any) -> Any:
+        resp = self._inner.complete(*args, **kwargs)
+        self._on_usage(resp.usage)
+        return resp
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def make_judge(
+    registry: Any, client: Any, on_usage: Callable[[Usage], None] | None = None
+) -> Callable[[ArchState], list[dict[str, str]]]:
+    """Returns a critic callable ArchState -> findings, using the `judge` alias.
+
+    `on_usage`, when given, hears every critique's token spend — the critic is
+    a second model the session pays for, and the session total must not pretend
+    otherwise. Off-turn, daemon-thread: the notification itself has to tolerate
+    out-turn emission (the Server record queue takes it from any thread)."""
+    if on_usage is not None:
+        client = _AccountedClient(client, on_usage)
 
     def judge(state: ArchState) -> list[dict[str, str]]:
         spec = registry.resolve("judge")

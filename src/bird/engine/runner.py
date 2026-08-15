@@ -170,6 +170,7 @@ class Runner:
         max_turns: int = MAX_TURNS,
         temperature: float = 0.0,
         on_delta: OnDelta | None = None,
+        on_thinking: OnDelta | None = None,
         instructions_path: Path | None = None,
         mutating_tools: set[str] | frozenset[str] | None = None,
         tracker: Callable[[ToolContext], str | None] | None = None,
@@ -187,6 +188,9 @@ class Runner:
         self.temperature = temperature
         # streams assistant text as it generates; None keeps requests non-streaming
         self.on_delta = on_delta
+        # streams the reasoning trace (Ollama thinking models) as it generates;
+        # None keeps it off the wire (reasoning then takes the heartbeat path)
+        self.on_thinking = on_thinking
         # harness tuning — defaults are the Code harness's, so existing callers
         # are untouched; other harnesses (arch) pass their own
         self.instructions_path = instructions_path or INSTRUCTIONS_PATH
@@ -291,10 +295,17 @@ class Runner:
                 tools=list(self.specs.values()),
                 temperature=self.temperature,
                 on_delta=self.on_delta,
+                on_thinking=self.on_thinking,
             )
             usage += resp.usage
             assistant = resp.message
             messages.append(assistant)
+            # the completed reasoning trace reaches the recorder + all
+            # transports as its own event (byte-compatible with the existing
+            # `assistant` event, which stays unchanged). Only emitted when
+            # non-empty — a non-thinking turn produces nothing here.
+            if assistant.thinking:
+                self.ctx.emit("thinking", {"turn": turn, "text": assistant.thinking})
             self.ctx.emit(
                 "assistant",
                 {

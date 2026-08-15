@@ -34,12 +34,33 @@ DELEGATING_PREFIXES = {
     ("npx",), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "dlx"),
 }
 # Script runners: what follows is a package.json/pyproject script name, not a
-# command, so there is nothing to delegate to — the name is matched by prefix.
+# command, so there is nothing to delegate to — the name is the user's own
+# package.json script, not arbitrary code from the model, so any name is
+# allowed (npm run dev, npm run start, npm run deploy, ...). The runner pair
+# is still matched so `npm run` is gated but `npm <anything-else>` is not.
 SCRIPT_RUNNERS = {
     ("npm", "run"), ("pnpm", "run"), ("yarn", "run"),
     ("hatch", "run"), ("pdm", "run"), ("rye", "run"),
 }
-SCRIPT_PREFIXES = ("test", "lint", "check", "typecheck", "types", "build", "compile", "e2e", "unit", "integration", "ci", "verify")
+# Package-manager install subcommands: mutate node_modules/lockfile but are
+# contained to the repo and needed to set up before running tests.
+INSTALL_SUBCOMMANDS = {"install", "ci", "add", "i"}
+# pip install mutates the environment but is needed to set up deps to run
+# tests. `pip install -r requirements.txt`, `pip install requests`, ...
+PIP_INSTALL_HEADS = {"pip", "pip3"}
+# `source .venv/bin/activate` — the virtualenv a project's tests need, activated
+# for the one command line that runs them. `source` executes whatever is in the
+# file it is handed, so what is allowed here is a path *shape*, not the builtin:
+# the last two components must read <anything>/bin/activate. `source setup.sh`
+# and `. ~/.bashrc` stay rejected, and this is never part of the `search`
+# category — see _is_venv_activate.
+SOURCE_COMMANDS = {"source", "."}
+ACTIVATE_DIRS = {"bin", "Scripts"}  # Scripts/ is the Windows venv layout
+ACTIVATE_NAMES = {"activate", "activate.fish", "activate.csh", "activate.ps1"}
+# Script names that count as verification for `done`. Any package.json script
+# is allowed to RUN (SCRIPT_RUNNERS), but only these prefixes prove the work —
+# `npm run dev`/`npm run start` run but are not a check.
+SCRIPT_VERIFY_PREFIXES = ("test", "lint", "check", "typecheck", "types", "build", "compile", "e2e", "unit", "integration", "ci", "verify")
 
 # Linters that *check* (vs. black/isort, which rewrite): only these count as
 # verification for `done`. A formatter run is not evidence the change works.
@@ -57,7 +78,12 @@ CATEGORY_HELP = (
     "wc, tree, cd, pwd), test runners (pytest, python -m pytest, npm test/npm run test, "
     "go test, cargo test, make test, prefixed with uv run / poetry run / npx if needed), "
     "linters and type checks (ruff, mypy, flake8, eslint, tsc), and git reads (status, "
-    "log, diff, show, branch, blame). Use the edit/write tools to change files."
+    "log, diff, show, branch, blame). Also allowed: package-manager installs (npm/pnpm/yarn "
+    "install, npm ci) and any package.json script (npm/pnpm/yarn run <script>), bare python "
+    "on a script file (python script.py, python3 manage.py migrate), pip install, and "
+    "activating a virtualenv (source .venv/bin/activate && pytest). "
+    "Rejected: python -c (inline code), python -m outside the module allowlist. "
+    "Use the edit/write tools to change files."
 )
 
 
@@ -168,6 +194,39 @@ def _is_check_linter(head: str, tokens: list[str]) -> bool:
     return head in CHECK_LINTERS and not (len(tokens) >= 2 and tokens[1] in FORMAT_SUBCOMMANDS)
 
 
+def _is_bare_python_script(tokens: list[str]) -> bool:
+    """`python script.py` / `python3 manage.py migrate` — bare python on a
+    file path. Arbitrary code execution, but the harness already has
+    edit/write tools that can write arbitrary code, so this removes friction
+    without adding a new attack surface. `python -c "..."` (inline code with
+    no file to audit) is rejected; `python -m <module>` is handled separately
+    and stays restricted to PYTHON_MODULE_ALLOW."""
+    if len(tokens) < 2:
+        return False
+    arg = tokens[1]
+    if arg.startswith("-"):
+        return False  # -c, -m, -I, ... are not a bare script path
+    return arg.endswith(".py") or "/" in arg
+
+
+def _is_venv_activate(tokens: list[str]) -> bool:
+    """`source .venv/bin/activate` / `. /abs/path/venv/bin/activate`.
+
+    Matched by path shape rather than a fixed path, so every layout works
+    (.venv, venv, env, an absolute path outside the repo). Sourcing anything
+    else is arbitrary code execution wearing a builtin's name, so exactly one
+    argument is accepted and it has to end <dir>/bin/activate.
+
+    Deliberately reachable only through the `test` category, never `search`:
+    search-only commands run without a permission prompt, and a file the model
+    could have written is not something to execute unasked.
+    """
+    if len(tokens) != 2:
+        return False
+    parts = tokens[1].split("/")
+    return len(parts) >= 2 and parts[-1] in ACTIVATE_NAMES and parts[-2] in ACTIVATE_DIRS
+
+
 def _is_check_segment(head: str, tokens: list[str]) -> bool:
     """True when this segment runs the project's tests (the "test" category).
 
@@ -181,7 +240,10 @@ def _is_check_segment(head: str, tokens: list[str]) -> bool:
         return True
     if head in NPM_LIKE and len(tokens) >= 2 and tokens[1] == "test":
         return True
-    if len(tokens) >= 3 and (head, tokens[1]) in SCRIPT_RUNNERS and tokens[2].startswith(SCRIPT_PREFIXES):
+    # any package.json script name counts as a test/check — the script is the
+    # user's own, not arbitrary code from the model. Only the prefix-matched
+    # test/lint/build/etc. scripts count as verification, though (see below).
+    if len(tokens) >= 3 and (head, tokens[1]) in SCRIPT_RUNNERS and tokens[2].startswith(SCRIPT_VERIFY_PREFIXES):
         return True
     if head == "go" and len(tokens) >= 2 and tokens[1] in {"test", "vet", "build"}:
         return True
@@ -262,6 +324,23 @@ def _check_segment(head: str, tokens: list[str], categories: tuple[str, ...]) ->
         return None
     if "test" in categories and _is_check_segment(head, tokens):
         return None
+    if "test" in categories and head in NPM_LIKE and len(tokens) >= 2 and tokens[1] in INSTALL_SUBCOMMANDS:
+        return None
+    if "test" in categories and head in PIP_INSTALL_HEADS and len(tokens) >= 2 and tokens[1] == "install":
+        return None
+    if "test" in categories and head in {"python", "python3"} and _is_bare_python_script(tokens):
+        return None
+    if "test" in categories and len(tokens) >= 3 and (head, tokens[1]) in SCRIPT_RUNNERS:
+        # any package.json script name is allowed — the script is the user's
+        # own, not arbitrary code from the model
+        return None
+    if head in SOURCE_COMMANDS:
+        if "test" in categories and _is_venv_activate(tokens):
+            return None
+        return (
+            "source runs whatever is in the file it is given; only a virtualenv "
+            f"activate script is allowed (source .venv/bin/activate). {CATEGORY_HELP}"
+        )
     if "git_read" in categories and head == "git":
         sub = next((t for t in tokens[1:] if not t.startswith("-")), "")
         if sub in GIT_READ_SUBCOMMANDS:

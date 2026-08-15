@@ -4,7 +4,14 @@ import type { Container, TUI } from "@mariozechner/pi-tui";
 import { AssistantMessage, PermissionCard, type PermissionSpec } from "./components.ts";
 
 const REPLY_TEXT =
-	"Retried both calls. One succeeded, the other needs a longer timeout. I'll patch the config and confirm before running anything.";
+	"## Retried both calls\n\n" +
+	"One succeeded; the other timed out at 4s, so I bumped the network timeout in the config and will confirm before running anything.\n\n" +
+	"- `fetch_config` — succeeded\n" +
+	"- `web_fetch` — timed out, now retries 3×\n\n" +
+	"```json\n" +
+	'{ "timeout_ms": 12000 }\n' +
+	"```\n\n" +
+	"Approve the patch below and I'll rerun both checks.";
 
 const PERMIT_EDIT: PermissionSpec = {
 	kind: "edit",

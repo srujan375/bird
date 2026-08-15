@@ -25,6 +25,45 @@ function Anchors() {
   );
 }
 
+/** How long a card may stay in its invisible "from" state before it is shown
+ *  whether or not the frame loop ever ran. Long enough that the transition wins
+ *  the race on any live tab. */
+const ENTRANCE_FLOOR_MS = 250;
+
+/**
+ * The stagger, and why an entrance needs one.
+ *
+ * A turn's tool calls run back-to-back and each pushes state as it lands, so a
+ * ten-component promote arrives inside about fifteen milliseconds. Every card
+ * then started its 460ms entrance on the same frame — which animates correctly
+ * and reads as nothing at all, because ten cards fading up in unison is
+ * indistinguishable from ten cards that were already there. The choreography
+ * only ever looked right against `scripts/arch_devserver.py`, which spaces its
+ * pushes 1.5s apart.
+ *
+ * So arrivals queue: cards that mount together take consecutive slots and go
+ * one after another. The cap is what keeps a seventeen-component promote from
+ * taking seven seconds to draw — past the cap they land together, which is the
+ * old behaviour and the right thing at that count anyway.
+ */
+const ENTER_STAGGER_MS = 45;
+const ENTER_STAGGER_MAX_MS = 400;
+/** Nothing new for this long ends the burst; the next arrival starts at slot 0.
+ *  Comfortably longer than the few milliseconds a single turn's pushes span. */
+const BURST_GAP_MS = 250;
+
+let burstSlot = 0;
+let burstAt = 0;
+
+/** The place in the queue this arrival takes. Module state on purpose: a burst
+ *  spans every card mounting in it, and no component owns that. */
+function takeBurstSlot(): number {
+  const now = Date.now();
+  if (now - burstAt > BURST_GAP_MS) burstSlot = 0;
+  burstAt = now;
+  return burstSlot++;
+}
+
 /**
  * The `data-in` flip, §3.
  *
@@ -37,15 +76,32 @@ function Anchors() {
  * `born` short-circuits it — something already on screen when the page loaded
  * never had an arrival to animate.
  */
-function useEntrance(born: boolean): boolean {
+export function useEntrance(born: boolean): boolean {
   const [inn, setInn] = useState(born);
   useEffect(() => {
     if (born) return;
+    const wait = Math.min(takeBurstSlot() * ENTER_STAGGER_MS, ENTER_STAGGER_MAX_MS);
+    let raf1 = 0;
     let raf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      raf2 = requestAnimationFrame(() => setInn(true));
-    });
-    return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
+    const queued = setTimeout(() => {
+      raf1 = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(() => setInn(true));
+      });
+    }, wait);
+    // The card's "from" state is opacity 0, so a frame loop that never runs
+    // leaves it invisible — and its edges keep drawing, because an edge has no
+    // entrance to wait on. That is a card missing from under its own arrows.
+    // rAF stops in a backgrounded or occluded window, which is exactly when a
+    // turn is landing components you are not watching, so this is not a corner
+    // case. The timer flips it regardless; losing the animation is the correct
+    // trade against losing the card.
+    const floor = setTimeout(() => setInn(true), wait + ENTRANCE_FLOOR_MS);
+    return () => {
+      clearTimeout(queued);
+      clearTimeout(floor);
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
   }, [born]);
   return inn;
 }
@@ -78,6 +134,10 @@ export interface ComponentNodeData extends Record<string, unknown> {
   lit: boolean;
   /** Already on screen when the page loaded — no arrival to animate (§3). */
   born: boolean;
+  /** Drawn by a view rather than recorded by the harness — a context view's
+   *  rolled-up box. It stands for components; it is not one, so it has no
+   *  internals to open and no facet to owe. */
+  synthetic?: boolean;
 }
 
 /**
@@ -93,7 +153,7 @@ export interface ComponentNodeData extends Record<string, unknown> {
  * diagram by — was the quietest line on it.
  */
 export function ComponentNode({ data, selected }: NodeProps) {
-  const { component: c, gaps, concerns, questions, owes, changed, dim, lit, born } =
+  const { component: c, gaps, concerns, questions, owes, changed, dim, lit, born, synthetic } =
     data as ComponentNodeData;
   const inn = useEntrance(born);
   const open = useCanvas((s) => s.openComponentDialog);
@@ -124,7 +184,7 @@ export function ComponentNode({ data, selected }: NodeProps) {
         {owes && <span className="owe-dot" title="owes a facet" />}
         {/* internals open in their own dialog — never by growing the card,
             which would shove neighbours the user placed by hand */}
-        {!c.existing && (
+        {!c.existing && !synthetic && (
           <button
             className="open-btn"
             title="open its internals (E)"

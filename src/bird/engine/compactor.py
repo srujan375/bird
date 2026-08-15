@@ -18,6 +18,7 @@ from ..llm.wire.openai_compat import OpenAICompatClient, WireError
 
 TRIGGER_FRACTION = 0.90
 KEEP_RECENT_TOOL_RESULTS = 5
+KEEP_RECENT_THINKING = 1
 STUB_THRESHOLD_CHARS = 400
 
 
@@ -27,6 +28,9 @@ def estimate_tokens(messages: list[Message]) -> int:
         total += len(m.content or "") + sum(
             len(tc.arguments_json) + len(tc.name) for tc in m.tool_calls
         )
+        # thinking is bulky on max-effort sessions — count it so compaction
+        # actually fires before a think-heavy transcript hits the context wall
+        total += len(m.thinking or "")
     return total // 4 + 4 * len(messages)
 
 
@@ -48,6 +52,33 @@ def stub_tool_results(messages: list[Message]) -> tuple[list[Message], int]:
                     role="tool",
                     content=f"[result elided ({len(m.content)} chars): {first_line}...]",
                     tool_call_id=m.tool_call_id,
+                )
+            )
+            stubbed += 1
+        else:
+            out.append(m)
+    return out, stubbed
+
+
+def stub_thinking(messages: list[Message]) -> tuple[list[Message], int]:
+    """Stage-1 hygiene for the bulky display-only reasoning trace: stub
+    `thinking` on all but the most recent assistant turns to a one-line
+    placeholder (mirrors stub_tool_results / KEEP_RECENT_TOOL_RESULTS). The
+    most recent turn keeps its full trace; older ones are elided."""
+    assistant_indices = [i for i, m in enumerate(messages) if m.role == "assistant" and m.thinking]
+    # keep the last N thinking-bearing turns intact
+    stub_candidates = set(assistant_indices[:-KEEP_RECENT_THINKING])
+    out: list[Message] = []
+    stubbed = 0
+    for i, m in enumerate(messages):
+        if i in stub_candidates and m.thinking:
+            out.append(
+                Message(
+                    role=m.role,
+                    content=m.content,
+                    tool_calls=m.tool_calls,
+                    tool_call_id=m.tool_call_id,
+                    thinking=f"[thinking elided ({len(m.thinking)} chars)]",
                 )
             )
             stubbed += 1
@@ -115,6 +146,7 @@ def compact(
     a last resort. Logs one `compaction` event describing what happened."""
     before = estimate_tokens(messages)
     messages, stubbed = stub_tool_results(messages)
+    messages, stubbed_thinking = stub_thinking(messages)
     stage = "stub"
     if needs_compaction(messages, context_window):
         try:
@@ -132,6 +164,12 @@ def compact(
     if record:
         record(
             "compaction",
-            {"stage": stage, "stubbed": stubbed, "tokens_before": before, "tokens_after": after},
+            {
+                "stage": stage,
+                "stubbed": stubbed,
+                "stubbed_thinking": stubbed_thinking,
+                "tokens_before": before,
+                "tokens_after": after,
+            },
         )
     return messages

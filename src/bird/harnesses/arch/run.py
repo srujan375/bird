@@ -18,10 +18,26 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...llm.registry import Registry
+from ...llm.types import Usage
 from ...tools import ToolContext
 from ..registry import build_runner
 from .judge import make_judge
 from .session import ArchSession
+
+
+def _usage_notifier(ctx: ToolContext) -> Callable[[Usage], None]:
+    """The critique's spend, pushed the way a dispatch pushes it: cumulative
+    here (one judge call per notification), and routed through the same
+    record tee every harness event rides — whichever Server is pumping this
+    session folds it into its total; the UI gets a total_usage push."""
+
+    def notify(usage: Usage) -> None:
+        ctx.emit(
+            "usage_notify",
+            {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
+        )
+
+    return notify
 
 
 def run_arch_interactive(
@@ -73,7 +89,9 @@ def run_arch_interactive(
 
         arch = ArchSession(run_dir=run_dir)  # opens on the sketch layer
         arch.broker = server.broker
-        arch.judge = make_judge(registry, client)
+        # the critic bills the session too; the notifier rides the same
+        # record tee, so the Server's total hears every critique as it lands
+        arch.judge = make_judge(registry, client, _usage_notifier(ctx))
 
         def on_state(payload: dict) -> None:
             recorder.event("arch_state", {"phase": payload["phase"], "changed": payload.get("changed")})

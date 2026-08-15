@@ -9,14 +9,14 @@ export interface DiffLine {
 }
 
 export type ServerMessage =
-	| { type: "ready"; model: string; kg: boolean; kg_ready: boolean; run_id: string; repo: string; skills: { name: string; description: string; source: string }[] }
+	| { type: "ready"; model: string; kg: boolean; kg_ready: boolean; run_id: string; repo: string; skills: { name: string; description: string; source: string }[]; input_tokens?: number; output_tokens?: number; think_mode?: string | null }
 	| { type: "harness_event"; event: string; data: Record<string, unknown> }
 	| ({ type: "permission_request"; id: number } & (
 			| { kind: "bash"; cmd: string }
 			| { kind: "edit" | "write"; file: string; lines: DiffLine[] }
 			| { kind: "read_outside_repo"; tool: string; path: string }
 	  ))
-	| { type: "state"; model: string }
+	| { type: "state"; model: string; think_mode?: string | null }
 	| {
 			type: "model_list";
 			current: string;
@@ -29,7 +29,8 @@ export type ServerMessage =
 			current: string;
 			sessions: { id: string; name: string; last_event: string }[];
 	  }
-	| { type: "turn_end"; status: string; summary: string; turns: number }
+	| { type: "think_list"; current: string | null; modes: string[] }
+	| { type: "turn_end"; status: string; summary: string; turns: number; input_tokens?: number; output_tokens?: number }
 	| { type: "command_output"; text: string }
 	| { type: "reload"; run_id: string }
 	| { type: "error"; message: string }

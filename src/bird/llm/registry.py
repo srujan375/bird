@@ -105,6 +105,35 @@ class Registry:
             return False
         return True
 
+    def set_think_mode(self, spec: str, reasoning_effort: str | None) -> bool:
+        """Persist `reasoning_effort` into the model's models.json entry so it
+        survives across sessions and /reload respawns. None clears it (removes
+        the key). Returns False when there is no file to write or it isn't
+        writable — the in-memory update applies either way."""
+        entry = self.models.setdefault(spec, {})
+        if reasoning_effort is None:
+            entry.pop("reasoning_effort", None)
+        else:
+            entry["reasoning_effort"] = reasoning_effort
+        if self.path is None:
+            return False
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            models = data.setdefault("models", {})
+            if reasoning_effort is None:
+                models.get(spec, {}).pop("reasoning_effort", None)
+            else:
+                models.setdefault(spec, {})["reasoning_effort"] = reasoning_effort
+            self.path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError as e:
+            print(
+                f"warning: could not persist thinking mode to {self.path} ({e}); "
+                f"pass --models-json to use a writable config",
+                file=sys.stderr,
+            )
+            return False
+        return True
+
     def resolve(self, name: str) -> ModelSpec:
         """Resolve an alias or provider:model spec to a ModelSpec."""
         spec = self.aliases.get(name, name)

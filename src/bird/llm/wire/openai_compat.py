@@ -48,6 +48,7 @@ class OpenAICompatClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         on_delta: OnDelta | None = None,
+        on_thinking: OnDelta | None = None,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": spec.model,
@@ -59,6 +60,12 @@ class OpenAICompatClient:
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        # Ollama's OpenAI-compatible endpoint controls thinking via
+        # `reasoning_effort` (the native `think` flag is ignored there).
+        # OpenRouter uses the same field with different values, so gate this
+        # to the ollama provider only — never forward it elsewhere.
+        if spec.provider.name == "ollama" and "reasoning_effort" in spec.extra:
+            payload["reasoning_effort"] = spec.extra["reasoning_effort"]
 
         headers = {"Content-Type": "application/json"}
         api_key = spec.provider.api_key
@@ -69,7 +76,7 @@ class OpenAICompatClient:
         if on_delta is not None:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
-            data = self._stream_with_retries(url, payload, headers, on_delta)
+            data = self._stream_with_retries(url, payload, headers, on_delta, on_thinking)
         else:
             data = self._post_with_retries(url, payload, headers)
         return self._parse(data, spec)
@@ -106,18 +113,20 @@ class OpenAICompatClient:
         )
 
     def _stream_with_retries(
-        self, url: str, payload: dict[str, Any], headers: dict[str, str], on_delta: OnDelta
+        self, url: str, payload: dict[str, Any], headers: dict[str, str], on_delta: OnDelta,
+        on_thinking: OnDelta | None = None,
     ) -> dict[str, Any]:
         """SSE streaming POST. Retries only while nothing has been delivered to
-        on_delta — a stream that drops mid-response cannot be restarted without
-        duplicating already-shown text, so that becomes a hard WireError."""
+        on_delta/on_thinking — a stream that drops mid-response cannot be
+        restarted without duplicating already-shown text, so that becomes a
+        hard WireError."""
         last_error = ""
         for attempt in range(MAX_TRANSPORT_ATTEMPTS):
             emitted = [False]
             try:
                 with self._http.stream("POST", url, json=payload, headers=headers) as resp:
                     if resp.status_code == 200:
-                        return self._consume_sse(resp, on_delta, emitted)
+                        return self._consume_sse(resp, on_delta, emitted, on_thinking)
                     resp.read()
                     last_error = f"HTTP {resp.status_code}: {resp.text[:500]}"
                     if resp.status_code not in RETRYABLE_STATUS:
@@ -134,11 +143,13 @@ class OpenAICompatClient:
 
     @staticmethod
     def _consume_sse(
-        resp: httpx.Response, on_delta: OnDelta, emitted: list[bool]
+        resp: httpx.Response, on_delta: OnDelta, emitted: list[bool],
+        on_thinking: OnDelta | None = None,
     ) -> dict[str, Any]:
         """Fold an SSE chunk stream back into the non-streaming response shape
         so _parse stays the single parser."""
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_slots: dict[int, dict[str, str | None]] = {}
         finish_reason: str | None = None
         usage: dict[str, Any] = {}
@@ -163,12 +174,25 @@ class OpenAICompatClient:
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
+            # reasoning trace (Ollama thinking models): streamed live when an
+            # on_thinking callback is wired; otherwise it takes the existing
+            # heartbeat path (on_delta(""), nothing accumulated) so an
+            # unadapted caller's pre-delivery retry policy is byte-identical
+            # to today — emitted[0] is untouched and reasoning is dropped.
+            reasoning = delta.get("reasoning")
+            if reasoning:
+                if on_thinking is not None:
+                    reasoning_parts.append(reasoning)
+                    emitted[0] = True
+                    on_thinking(reasoning)
+                else:
+                    on_delta("")
             text = delta.get("content")
             if text:
                 content_parts.append(text)
                 emitted[0] = True
                 on_delta(text)
-            else:
+            elif not reasoning:
                 # heartbeat: thinking/tool-call chunks carry no content, but the
                 # caller still needs a hook to cancel mid-generation
                 on_delta("")
@@ -186,8 +210,15 @@ class OpenAICompatClient:
 
         if emitted[0]:
             on_delta(None)  # text complete
+        if reasoning_parts:
+            # fold the accumulated reasoning into the synthesized message so
+            # _parse stays the single parser and yields Message.thinking
+            if on_thinking is not None:
+                on_thinking(None)  # reasoning complete — sentinel mirrors on_delta
 
         message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts) or None}
+        if reasoning_parts:
+            message["reasoning"] = "".join(reasoning_parts)
         if tool_slots:
             message["tool_calls"] = [
                 {
@@ -222,6 +253,10 @@ class OpenAICompatClient:
             role="assistant",
             content=raw_msg.get("content"),
             tool_calls=tool_calls,
+            # reasoning trace (Ollama thinking models): provider-neutral — read
+            # the field if present, never gate on provider. Display-only: it
+            # never re-enters a model prompt (to_openai excludes it).
+            thinking=raw_msg.get("reasoning") or None,
         )
         usage_raw = data.get("usage") or {}
         usage = Usage(

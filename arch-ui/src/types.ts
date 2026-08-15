@@ -49,7 +49,10 @@ export interface Sketchbook {
 
 export type Kind =
   | "service" | "api" | "gateway" | "store" | "queue" | "cache"
-  | "job" | "ui" | "llm" | "external" | "infra";
+  | "job" | "ui" | "llm" | "external" | "infra"
+  // client-side only: the box a context view rolls the new work up into. The
+  // server has no such kind and never sends one — see views.ts.
+  | "system";
 
 export interface Endpoint {
   route: string; method: string; request: string; response: string;
@@ -189,6 +192,12 @@ export interface ReadyEvent {
   /** The critic's model, when the session has one. Optional: no critic
    *  (`--no-critic`) means the label carries no model rather than a wrong one. */
   judge_model?: string | null;
+  /** Session-cumulative token spend, present only when the server resurrects
+   *  a session that had already spent some (a respawn re-seeds it). Optional:
+   *  absent means "nothing spent yet" or an older server — start from zero
+   *  either way, the first turn_end will carry the real total. */
+  input_tokens?: number;
+  output_tokens?: number;
   run_id: string; repo: string;
   skills: { name: string; description: string; source: string }[];
 }
@@ -242,6 +251,12 @@ export interface PermissionEvent {
 export interface TurnEndEvent {
   type: "turn_end";
   status: "done" | "reply" | "interrupted" | "error" | string;
+  /** Session-cumulative token spend (the server folds in its own runner and
+   *  every sub-session it spawned this session). Optional: a server older
+   *  than these fields still emits turn_end, and the totals hold their last
+   *  known values instead of flashing a misleading zero. */
+  input_tokens?: number;
+  output_tokens?: number;
 }
 
 export type WireEvent =

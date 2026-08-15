@@ -4,6 +4,7 @@ import { ComponentDialog } from "./dialog/ComponentDialog";
 import { Gate } from "./rail/Gate";
 import { Rail } from "./rail/Rail";
 import { useCanvas } from "./store/canvas";
+import { listViews, projectView, resolveView } from "./views";
 import { promoteVariant, useSession } from "./store/session";
 import { useTheme } from "./theme";
 import type { Layer, Variant } from "./types";
@@ -17,8 +18,9 @@ function useOpenShortcut(): void {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const el = e.target as HTMLElement | null;
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
-      const { selected, openComponentDialog } = useCanvas.getState();
-      if (selected?.startsWith("design:")) openComponentDialog(selected.slice("design:".length));
+      const { selected, view, openComponentDialog } = useCanvas.getState();
+      const prefix = `${view ?? "design"}:`;
+      if (selected?.startsWith(prefix)) openComponentDialog(selected.slice(prefix.length));
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -184,6 +186,47 @@ function VariantTabs({ variants, activeId }: { variants: Variant[]; activeId: st
   );
 }
 
+/**
+ * The diagrams this design can be read as, §2.
+ *
+ * A seventeen-box canvas is not one diagram; it is a context diagram, a flow
+ * diagram per flow, and the wiring underneath. All three are already in the
+ * state — the switch is what admits that, and the box count on each button is
+ * what makes choosing between them a real choice rather than a guess.
+ *
+ * It hides itself when there is only one view to be in. A switch that cannot
+ * switch is furniture.
+ */
+function ViewSwitch() {
+  const arch = useSession((s) => s.arch);
+  const chosen = useCanvas((s) => s.view);
+  const setView = useCanvas((s) => s.setView);
+  const views = useMemo(() => listViews(arch), [arch]);
+  const current = resolveView(arch, chosen);
+
+  if (views.length <= 1) {
+    const only = views[0];
+    return only ? <span className="chip">{only.count} component{only.count === 1 ? "" : "s"}</span> : null;
+  }
+
+  return (
+    <div className="view-switch" role="group" aria-label="diagram">
+      {views.map((v) => (
+        <button
+          key={v.id}
+          data-on={v.id === current}
+          data-kind={v.kind}
+          title={v.detail ? `${v.label} — ${v.detail}` : v.label}
+          onClick={() => setView(v.id)}
+        >
+          {v.label}
+          <span className="count faint"> {v.count}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function EmptyState({ layer }: { layer: Layer }) {
   return (
     <div className="empty-state">
@@ -202,6 +245,7 @@ function EmptyState({ layer }: { layer: Layer }) {
 export default function App() {
   const conn = useSession((s) => s.conn);
   const arch = useSession((s) => s.arch);
+  const finalized = useSession((s) => s.finalized);
   const runId = useSession((s) => s.ready?.run_id);
   const restore = useCanvas((s) => s.restore);
   const railWidth = useCanvas((s) => s.railWidth);
@@ -218,10 +262,11 @@ export default function App() {
     if (runId) restore(runId);
   }, [runId, restore]);
 
+  const chosenView = useCanvas((s) => s.view);
   const count =
     layer === "sketch"
       ? Object.keys(variant?.nodes ?? {}).length
-      : Object.keys(arch?.components ?? {}).length;
+      : Object.keys(projectView(arch, resolveView(arch, chosenView)).components).length;
 
   return (
     // the grip writes the width here; the grid column reads it
@@ -235,15 +280,18 @@ export default function App() {
           {layer === "sketch" ? (
             <VariantTabs variants={variants} activeId={variant?.id ?? null} />
           ) : (
-            <span className="chip">
-              {count} component{count === 1 ? "" : "s"}
-            </span>
+            <ViewSwitch />
           )}
         </div>
 
         <div className="canvas-overlay bl">
+          {/* A finalized session refuses every edit, so it must not go on
+              inviting them — "drag to place" under a canvas that will not let
+              you drag reads as a broken page rather than a closed one. */}
           <span className="hint-strip">
-            drag to place · <b>E</b> opens a component · a sticky note is an objection on the record
+            {finalized
+              ? <>read-only · <b>E</b> opens a component · a sticky note is an objection on the record</>
+              : <>drag to place · <b>E</b> opens a component · a sticky note is an objection on the record</>}
           </span>
         </div>
 

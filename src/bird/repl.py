@@ -45,6 +45,9 @@ Type a task in plain language, or a command:
                         catalog), or switch directly by alias/provider:model;
                         the pick becomes the default; history survives the
                         swap, even across providers
+  /think [mode]         pick an Ollama thinking mode (off/low/medium/high/max),
+                        or set it directly; off disables thinking, the others
+                        set reasoning effort; carries across /model switches
   /kg status            graph location, readiness, staleness
   /kg build|update      (re)build or incrementally update the graph
   /kg query <question>  query the graph directly
@@ -115,7 +118,7 @@ class Repl:
     # Kept in sync with HELP and _command(); a skill named "model" would be
     # unreachable via /model, so these are reserved.
     BUILTIN_COMMANDS = (
-        "/help", "/model", "/kg", "/tools", "/skills", "/compact",
+        "/help", "/model", "/think", "/kg", "/tools", "/skills", "/compact",
         "/clear", "/reload", "/session", "/sessions", "/continue", "/rename",
         "/quit", "/exit",
     )
@@ -197,6 +200,8 @@ class Repl:
             print(HELP)
         elif cmd == "/model":
             self._cmd_model(arg)
+        elif cmd == "/think":
+            self._cmd_think(arg)
         elif cmd == "/kg":
             self._cmd_kg(arg)
         elif cmd == "/tools":
@@ -252,22 +257,32 @@ class Repl:
         skills = self.runner.ctx.skills or []
         return any(s.name == name for s in skills)
 
+    def skill_prompt(self, name: str, args: str) -> str | None:
+        """The user-turn text for `/<name> <args>`, or None if no such skill.
+
+        Split out of _invoke_skill because `/<skill>` is a model turn wearing
+        a slash: a server has to run it the same way it runs typed input
+        (worker thread, turn_end, interruptible) rather than inline inside a
+        command handler, so it needs the prompt without the turn."""
+        skills = self.runner.ctx.skills or []
+        sk = next((s for s in skills if s.name == name), None)
+        if sk is None:
+            return None
+        self.recorder.event("skill_invoked", {"name": name, "source": sk.source, "args": args})
+        if args:
+            return f"Use the {name} skill for the following task:\n\n{sk.body}\n\nTask: {args}"
+        return f"Use the {name} skill:\n\n{sk.body}"
+
     def _invoke_skill(self, name: str, args: str) -> None:
         """Load a skill's body into the conversation as a user turn.
 
         The skill instructions are sent as the user message so the agent
         follows them for the current task. Optional `args` after the command
         are appended as the actual task (pi's `/skill:name <args>` pattern)."""
-        skills = self.runner.ctx.skills or []
-        sk = next((s for s in skills if s.name == name), None)
-        if sk is None:
+        prompt = self.skill_prompt(name, args)
+        if prompt is None:
             print(f"no skill named {name!r} — /skills lists available skills")
             return
-        self.recorder.event("skill_invoked", {"name": name, "source": sk.source, "args": args})
-        if args:
-            prompt = f"Use the {name} skill for the following task:\n\n{sk.body}\n\nTask: {args}"
-        else:
-            prompt = f"Use the {name} skill:\n\n{sk.body}"
         self._turn(prompt)
 
     def _cmd_skills(self) -> None:
@@ -317,6 +332,63 @@ class Repl:
         else:
             # not an alias and not provider:model — treat as a picker filter
             self._model_picker(filter_=arg)
+
+    # Ollama thinking modes, in display order. The friendly label is what the
+    # user types and sees; the internal value is what the wire adapter forwards
+    # as `reasoning_effort`. `off` maps to "none" (thinking disabled); the rest
+    # map to themselves. See openai_compat.py for why this is ollama-only.
+    THINK_MODES = ("off", "low", "medium", "high", "max")
+    _THINK_INTERNAL = {"off": "none"}  # everything else maps to itself
+
+    def _think_label(self) -> str | None:
+        """The friendly mode label for the spec's current reasoning_effort, or
+        None when no mode is set (Ollama's auto/default behavior)."""
+        value = self.runner.spec.extra.get("reasoning_effort")
+        if value is None:
+            return None
+        if value == "none":
+            return "off"
+        return value if value in self.THINK_MODES else None
+
+    def _cmd_think(self, arg: str) -> None:
+        if arg:
+            self._set_think_mode(arg)
+            return
+        # bare /think: show the picker on a tty, else just list + current mode
+        self._think_picker()
+
+    def _think_picker(self) -> None:
+        """List the thinking modes with a `*` on the active one; on a tty,
+        prompt for a mode NAME (not a number). Mirrors /model's tty behavior."""
+        current = self._think_label()
+        active = current if current is not None else "(auto)"
+        print(f"thinking: {active}")
+        for mode in self.THINK_MODES:
+            marker = "*" if mode == current else " "
+            print(f" {marker} {mode}")
+        if not getattr(sys.stdin, "isatty", lambda: False)():
+            print("set with /think <mode>")
+            return
+        try:
+            choice = input("mode (empty to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not choice:
+            return
+        self._set_think_mode(choice)
+
+    def _set_think_mode(self, label: str) -> None:
+        """Validate and apply a thinking mode by its friendly label."""
+        if label not in self.THINK_MODES:
+            print(f"unknown mode {label!r} — valid: {', '.join(self.THINK_MODES)}")
+            return
+        internal = self._THINK_INTERNAL.get(label, label)
+        self.runner.spec.extra["reasoning_effort"] = internal
+        saved = self.registry.set_think_mode(self.runner.spec.spec, internal)
+        self.recorder.event("think_mode", {"mode": label})
+        note = "" if saved else " (this session only)"
+        print(f"thinking: {label}{note}")
 
     def _model_picker(self, filter_: str | None) -> None:
         """List discovered models (numbered); on a real terminal, prompt for a
@@ -371,7 +443,11 @@ class Repl:
                 print(f"error: {e}")
                 return
         old = self.runner.spec.spec
+        # carry the thinking mode across the swap so /model doesn't reset it
+        prior_effort = self.runner.spec.extra.get("reasoning_effort")
         self.runner.spec = new_spec
+        if prior_effort is not None:
+            new_spec.extra["reasoning_effort"] = prior_effort
         saved = self.registry.set_default(new_spec.spec, context_window)
         self.recorder.event("model_switch", {"from": old, "to": new_spec.spec})
         where = f"default saved to {self.registry.path}" if saved else "default updated for this session"

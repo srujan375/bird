@@ -20,10 +20,14 @@ import {
 	ModelPicker,
 	Notice,
 	PermissionCard,
+	type PermissionMode,
 	type PermissionSpec,
 	SessionPicker,
 	Thinking,
+	ThinkingTrace,
+	ThinkPicker,
 	UserMessage,
+	autoApproves,
 } from "./components.ts";
 import { runDemoTurn } from "./demo.ts";
 import { t } from "./theme.ts";
@@ -56,6 +60,7 @@ function tildify(p: string): string {
 const SLASH_COMMANDS = [
 	{ name: "help", description: "list commands" },
 	{ name: "model", description: "pick from available models (sets default)" },
+	{ name: "think", description: "pick an Ollama thinking mode (off/low/medium/high/max)" },
 	{ name: "kg", description: "knowledge graph status / build / query" },
 	{ name: "tools", description: "list available tools" },
 	{ name: "skills", description: "list available skills" },
@@ -153,6 +158,11 @@ function setModel(model: string): void {
 	tui.requestRender();
 }
 
+function setThinkMode(mode: string | null): void {
+	hint.setThinkMode(mode);
+	tui.requestRender();
+}
+
 /* ---------- bridge wiring ---------- */
 
 function shortToolLabel(name: string, argsJson: string): string {
@@ -168,12 +178,30 @@ function shortToolLabel(name: string, argsJson: string): string {
 
 let bridge: Bridge | null = null;
 
+/* Skill names from the server's `ready`. A `/<skill>` is not a UI command —
+   the server runs it as a model turn — so the editor has to know which slash
+   words start a turn and go busy for those. */
+let skillNames = new Set<string>();
+
 /* streaming state: assistant text arrives token-by-token via assistant_delta,
    then the "assistant" harness event finalizes it. When the finalized message
    had no tool calls it IS the reply, so turn_end must not re-add it. */
 let streamMsg: AssistantMessage | null = null;
 let streamText = "";
 let streamedReply = false;
+/* True once any assistant content was streamed AND finalized into a visible
+   AssistantMessage this turn — whether or not it was the reply (a `done` turn
+   streams the summary text alongside the done tool call, so turn_end must
+   not re-add it). Reset per turn in editor.onSubmit. */
+let streamedContent = false;
+
+/* reasoning-trace state: thinking models stream reasoning via thinking_delta
+   in one or more contiguous segments (Ollama may interleave reasoning after
+   content). Each open segment is its own ThinkingTrace block above the
+   answer; the first assistant_delta closes the current segment (collapses
+   it, does NOT discard — a later thinking_delta opens a fresh one), and the
+   complete "thinking" harness event / turn_end closes whatever remains. */
+let thinkingTrace: ThinkingTrace | null = null;
 
 function finalizeStream(content: string | null, cursor = false): void {
 	if (!streamMsg) return;
@@ -183,16 +211,61 @@ function finalizeStream(content: string | null, cursor = false): void {
 	tui.requestRender();
 }
 
+/** Close the current reasoning segment (collapse to last-N lines). A later
+ *  thinking_delta opens a fresh one, so interleaved reasoning is never lost. */
+function closeThinkingSegment(): void {
+	if (thinkingTrace) {
+		thinkingTrace.close();
+		thinkingTrace = null;
+		tui.requestRender();
+	}
+}
+
+/** Close any open reasoning segment as interrupted (dim, no fake done badge). */
+function finalizeThinkingInterrupted(): void {
+	if (thinkingTrace) {
+		thinkingTrace.closeInterrupted();
+		thinkingTrace = null;
+		tui.requestRender();
+	}
+}
+
 function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }): void {
 	switch (msg.type) {
 		case "ready": {
 			setModel(msg.model);
+			// the initial thinking mode (friendly label or null) so the hint
+			// line shows it from the first frame, same as the model name
+			setThinkMode(msg.think_mode ?? null);
+			// ready is the session boundary: zero the token readout and re-seed
+			// it from the payload when the server resurrects a session's spend
+			// (a /reload respawn resumes, so the cumulative count is right from
+			// the first frame; a fresh connect carries none → shows nothing).
+			if (msg.input_tokens || msg.output_tokens) {
+				hint.setTokens(msg.input_tokens ?? 0, msg.output_tokens ?? 0);
+			} else {
+				hint.clearTokens();
+			}
+			// /reload respawns bird serve: the fresh process has no memory of the
+			// approval mode, so reset our own to normal. Silently keeping
+			// full-auto across a code-reload respawn would be the one accidental-
+			// persistence path in this design.
+			if (hint.getMode() !== "normal") {
+				hint.resetMode();
+				addToChat(new Notice("approval mode reset — ⇧⇥ to re-enable", "muted"));
+			}
 			const kgNote = msg.kg ? (msg.kg_ready ? "kg ready" : "kg building in background") : "kg off";
 			addToChat(new Notice(`connected · session ${msg.run_id} · ${kgNote}`));
 			// Merge skill names from the server into the autocomplete dropdown
 			// so /<skill-name> appears alongside built-in /commands. The
 			// provider's command list is private, so we rebuild the provider
 			// with built-ins + skills and swap it onto the editor.
+			// Built-ins win on a name clash — the server reserves them the same
+			// way, so a skill named "model" never starts a turn and must never
+			// leave the UI waiting for a turn_end that isn't coming.
+			skillNames = new Set(
+				(msg.skills ?? []).map((s) => s.name).filter((n) => !SLASH_COMMANDS.some((c) => c.name === n)),
+			);
 			if (msg.skills?.length) {
 				const skillCmds = msg.skills.map((s) => ({
 					name: s.name,
@@ -204,10 +277,34 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 		}
 		case "state":
 			setModel((msg as unknown as { model: string }).model);
+			// a /think <mode> (or /continue resume) reports the new mode; keep
+			// the hint line in sync. Absent on older servers → leave it alone.
+			if (typeof msg.think_mode !== "undefined") setThinkMode(msg.think_mode ?? null);
 			break;
 		case "harness_event": {
 			const { event, data } = msg;
-			if (event === "assistant_delta") {
+			if (event === "thinking_delta") {
+				// a reasoning chunk arrived. If no segment is open (content
+				// already streaming, or the first thought of the turn) open a
+				// NEW ThinkingTrace block above the answer; if one is open,
+				// append to it. Segments, so interleaved reasoning after
+				// content is never dropped.
+				if (!thinkingTrace) {
+					thinkingTrace = new ThinkingTrace();
+					addToChat(thinkingTrace);
+				}
+				thinkingTrace.append((data.text as string) ?? "");
+				tui.requestRender();
+			} else if (event === "thinking") {
+				// the complete reasoning trace (recorder-bound, covers the
+				// non-streaming path too): close whatever segment is open.
+				closeThinkingSegment();
+			} else if (event === "assistant_delta") {
+				// the first content delta closes the current reasoning segment
+				// (collapses it, does NOT discard — a later thinking_delta
+				// opens a fresh one). Done before creating the answer block so
+				// the trace stays above it.
+				if (thinkingTrace) closeThinkingSegment();
 				if (!streamMsg) {
 					streamMsg = new AssistantMessage("");
 					streamText = "";
@@ -221,6 +318,10 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 				const content = (data.content as string) ?? "";
 				if (streamMsg) {
 					streamedReply = calls.length === 0;
+					// the streamed text is now finalized into a visible
+					// AssistantMessage; a `done` turn carries the same text as
+					// the done tool's summary, so turn_end must not re-add it
+					if (content.trim()) streamedContent = true;
 					finalizeStream(content);
 				} else if (calls.length && content.trim()) {
 					addToChat(new Notice(content.trim()));
@@ -270,13 +371,20 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 						? { kind: "read_outside_repo", tool: msg.tool, path: msg.path }
 						: { kind: msg.kind, file: msg.file, lines: msg.lines };
 			// auto-approve mode: skip the card and approve immediately, like
-			// Claude Code's "auto-accept edits" (Shift+Tab). Scoped to edit/write
-			// on purpose — bash is gated too now, and it can write anywhere, so
-			// auto-accepting *edits* must not silently auto-accept a shell that
-			// does the same thing unobserved.
-			if (hint.getAutoApprove() && (msg.kind === "edit" || msg.kind === "write")) {
+			// Claude Code's "auto-accept edits" (Shift+Tab). auto_edits covers
+			// edit/write/read_outside_repo; full_auto additionally covers bash.
+			// Unknown payload kinds ALWAYS show a card regardless of mode, so a
+			// newer server's new payload shape can never be mass-approved.
+			const mode = hint.getMode();
+			if (autoApproves(mode, String(msg.kind))) {
 				bridge?.permission(msg.id, true);
-				addToChat(new Notice(`✓ auto-approved ${msg.kind}`, "success"));
+				const label =
+					msg.kind === "bash"
+						? `✓ ⚠ FULL AUTO ran bash: ${msg.cmd}`
+						: msg.kind === "read_outside_repo"
+							? `✓ auto-approved ${msg.kind} ${msg.path ?? ""}`
+							: `✓ auto-approved ${msg.kind}`;
+				addToChat(new Notice(label, mode === "full_auto" ? "danger" : "success"));
 				break;
 			}
 			const card = new PermissionCard(spec);
@@ -291,13 +399,35 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 		}
 		case "turn_end": {
 			const { status, summary } = msg;
+			// Cumulative session spend from the server (which folds in its own
+			// runner plus sub-harness dispatches). Absent only when talking to
+			// a server older than these fields — keep the last known count in
+			// that case rather than flashing a misleading 0.
+			if (typeof msg.input_tokens === "number" || typeof msg.output_tokens === "number") {
+				hint.setTokens(msg.input_tokens ?? 0, msg.output_tokens ?? 0);
+			}
 			finalizeStream(null); // drop the cursor if a stream was cut short
+			// close any reasoning segment still open: an interrupted/error turn
+			// marks it interrupted (dim, no fake done badge); a normal end just
+			// collapses it. The complete "thinking" event usually closed it
+			// already, but this is the backstop for the non-streaming path and
+			// for a turn that ended mid-thought.
+			if (status === "interrupted" || status === "error") {
+				finalizeThinkingInterrupted();
+			} else {
+				closeThinkingSegment();
+			}
 			// a turn can end with a dispatch still open (interrupt, or the sub-session
 			// died before returning a result) — never leave the header claiming a
 			// sub-harness is driving when nothing is
 			endDispatch(status === "done" || status === "reply", `ended (${status})`);
 			if (status === "reply" || status === "done") {
-				if (status !== "reply" || !streamedReply) {
+				// skip the closing AssistantMessage when its text was already
+				// streamed this turn: a `reply` finalized the reply, and a
+				// `done` finalized the summary text the model streamed alongside
+				// the done tool call (the done tool's output is that same text).
+				// streamedReply covers reply; streamedContent covers done.
+				if ((status === "reply" && !streamedReply) || (status === "done" && !streamedContent)) {
 					addToChat(new AssistantMessage((status === "done" ? "✓ " : "") + summary));
 				}
 			} else if (status === "interrupted") {
@@ -338,6 +468,20 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 			const pickerSpacer = new Spacer(1);
 			chat.addChild(picker);
 			chat.addChild(pickerSpacer);
+			tui.setFocus(picker);
+			tui.requestRender();
+			break;
+		}
+		case "think_list": {
+			const picker = new ThinkPicker(msg.modes, msg.current);
+			picker.onDone = (mode) => {
+				chat.removeChild(picker);
+				tui.setFocus(editor);
+				if (mode) bridge?.command(`/think ${mode}`);
+				tui.requestRender();
+			};
+			chat.addChild(picker);
+			chat.addChild(new Spacer(1));
 			tui.setFocus(picker);
 			tui.requestRender();
 			break;
@@ -419,6 +563,17 @@ editor.onSubmit = (text) => {
 			addToChat(new Notice(`/${cmd} needs the live harness — run without --demo.`));
 			return;
 		}
+		// a /<skill> starts a real turn server-side: echo it, go busy and arm
+		// the per-turn stream guards exactly as typed input does, so the
+		// spinner, the interrupt key and the turn_end dedup all work for it
+		if (skillNames.has(cmd)) {
+			addToChat(new UserMessage(trimmed));
+			busy = true;
+			streamedReply = false;
+			streamedContent = false;
+			showThinking();
+			tui.setFocus(thinking);
+		}
 		bridge?.command(trimmed);
 		return;
 	}
@@ -426,6 +581,7 @@ editor.onSubmit = (text) => {
 	addToChat(new UserMessage(trimmed));
 	busy = true;
 	streamedReply = false;
+	streamedContent = false;
 	showThinking();
 	tui.setFocus(thinking);
 	if (DEMO) {
@@ -439,12 +595,19 @@ tui.setFocus(editor);
 
 tui.addInputListener((data) => {
 	if (matchesKey(data, Key.ctrl("c"))) shutdown(0);
-	// Shift+Tab toggles auto-approve mode (Claude Code / pi style). Works in any
-	// focus state because it's a global listener that runs before the focused
-	// component. Returns consume:true so the editor never sees the chord.
+	// Shift+Tab cycles the approval mode (Claude Code / pi style): normal →
+	// auto_edits → full_auto → normal. Works in any focus state because it's a
+	// global listener that runs before the focused component. Returns
+	// consume:true so the editor never sees the chord.
 	if (matchesKey(data, Key.shift("tab"))) {
-		hint.setAutoApprove(!hint.getAutoApprove());
-		addToChat(new Notice(hint.getAutoApprove() ? "⇧⇥ auto-approve ON — edits applied without asking" : "⇧⇥ auto-approve OFF — each edit asks", hint.getAutoApprove() ? "accent" : "muted"));
+		const mode = hint.cycleMode();
+		const notice =
+			mode === "full_auto"
+				? "⇧⇥ ⚠ FULL AUTO — edits AND bash run without asking"
+				: mode === "auto_edits"
+					? "⇧⇥ auto-accept edits ON — edits applied without asking"
+					: "⇧⇥ ask everything — each edit and bash asks";
+		addToChat(new Notice(notice, mode === "full_auto" ? "danger" : mode === "auto_edits" ? "accent" : "muted"));
 		tui.requestRender();
 		return { consume: true };
 	}

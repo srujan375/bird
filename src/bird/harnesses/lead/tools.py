@@ -111,6 +111,7 @@ class CodeTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         _require(ctx)
+        from ...llm.types import Usage
         from ..registry import build_runner
 
         spec = ctx.registry.resolve("default")
@@ -118,6 +119,30 @@ class CodeTool(Tool):
         # fork the ctx: the sub-session gets its own plan/arch/bundle so it can
         # never clobber the lead's pinned state; repo/kg/record/client are shared
         child = replace(ctx, plan=None, arch=None, last_bundle=None)
+        inner_record = child.record  # session log tee (None in headless tests)
+
+        # The sub-session runs inside this turn, so its spend must land in the
+        # parent's session total while the turn is still open — the parent
+        # pump adds it on top of whatever the runner reports around the
+        # dispatch. Each assistant call's usage rides the runner's record
+        # (already on the transcript's wire event), folds cumulatively onto
+        # the fork's ctx, and a "usage_notify" carries it up to the parent.
+        def sub_record(event_type: str, data: dict[str, Any]) -> None:
+            if inner_record is not None:
+                inner_record(event_type, data)
+            if event_type == "assistant":
+                child.usage += Usage(
+                    int(data.get("input_tokens", 0) or 0),
+                    int(data.get("output_tokens", 0) or 0),
+                )
+                ctx.emit(
+                    "usage_notify",
+                    {"input_tokens": child.usage.input_tokens, "output_tokens": child.usage.output_tokens},
+                )
+
+        child.record = sub_record
+        child.usage = Usage()
+
         runner = build_runner(
             "code",
             spec=spec,
@@ -148,5 +173,9 @@ class CodeTool(Tool):
                 "status": result.status,
                 "turns": result.turns,
                 "seeded": seed is not None,
+                # the dispatch's own spend, as the child ctx recorded it —
+                # identical to result.usage unless a record tee dropped calls
+                "input_tokens": child.usage.input_tokens,
+                "output_tokens": child.usage.output_tokens,
             },
         )

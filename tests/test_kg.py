@@ -533,3 +533,68 @@ def test_unknown_provider_falls_back_to_openai_backend(doc_repo, tmp_path, monke
     )
     KG(doc_repo, models_json=models).build()
     assert seen[0]["backend"] == "openai"
+
+
+# --- knowing what it does not know ---
+
+@pytest.mark.parametrize("question", [
+    'List all files in the repository whose path contains "mcp"',
+    'Find any file in the repository with "mcp" in its filename',
+    "Are there any MCP files? Search for files with mcp in the name or path",
+])
+def test_filename_questions_are_redirected_to_glob(kg, question):
+    """One logged session asked this five times, reworded, and got a full cap
+    of nodes every time. The graph indexes symbols, not filenames."""
+    r = kg.query(question)
+    assert r.confidence == "out_of_scope"
+    assert r.hit_count == 0
+    assert "glob" in r.text
+
+
+@pytest.mark.parametrize("question", [
+    "Check git working tree status: list any untracked or modified files",
+    "What files were recently added or modified in the working tree?",
+])
+def test_working_tree_questions_are_redirected_to_git(kg, question):
+    r = kg.query(question)
+    assert r.confidence == "out_of_scope"
+    assert "git status" in r.text
+
+
+def test_dependency_questions_say_the_directory_is_not_indexed(kg):
+    r = kg.query("What does the sdk export in node_modules/@scope/sdk?")
+    assert r.confidence == "out_of_scope"
+    assert "grep" in r.text and "node_modules" in r.text
+
+
+def test_a_structural_question_is_not_redirected(kg):
+    """The redirects must not swallow ordinary questions — several of these
+    mention files and paths without being filename questions."""
+    for q in [
+        "How does authentication work?",
+        "Which router file mounts the controller?",
+        "where is app.py and how are routes mounted",
+        "Where is check_password defined?",
+    ]:
+        assert kg.query(q).confidence != "out_of_scope", q
+
+
+def test_a_named_symbol_scores_exact_confidence(kg):
+    assert kg.query("where is AuthHandler defined").confidence == "exact"
+
+
+def test_seeds_from_fuzzy_matches_only_are_labelled_low_confidence(kg):
+    """Expansion matches by substring and fuzzy distance, which is what keeps
+    recall usable and also what lets an unrelated question fill the node cap.
+    hit_count cannot express the difference; confidence can."""
+    r = kg.query("telemetry ingestion pipeline throughput")
+    if r.hit_count:  # it found seeds by loose matching, as it usually does
+        assert r.confidence == "weak"
+        assert "LOW CONFIDENCE" in r.text
+        assert "grep" in r.text
+
+
+def test_low_confidence_text_forbids_a_third_rewording(kg):
+    r = kg.query("telemetry ingestion pipeline throughput")
+    if r.confidence == "weak":
+        assert "reworded a third time" in r.text

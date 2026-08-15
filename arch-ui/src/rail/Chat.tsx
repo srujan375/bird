@@ -154,6 +154,11 @@ export function Chat({ draft, setDraft }: { draft: string; setDraft: (v: string)
   const judge = useSession((s) => s.ready?.judge_model);
   const window_ = useSession((s) => s.ready?.context_window);
   const used = useSession((s) => s.turnTokens);
+  // Session-cumulative spend (turn_end carries the total; the server owns the
+  // tally). Both zero means nothing has been spent yet — nothing to show.
+  const totalIn = useSession((s) => s.totalIn);
+  const totalOut = useSession((s) => s.totalOut);
+  const acted = useSession((s) => s.acted);
   /** §4: how full the window is. Null when the server did not say how big it
    *  is — a bar with an invented denominator is worse than no bar. */
   const ctx = window_ && used ? used / window_ : null;
@@ -189,15 +194,25 @@ export function Chat({ draft, setDraft }: { draft: string; setDraft: (v: string)
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [transcript, stream, permission]);
 
+  /**
+   * You just acted: follow the stream again no matter where you had scrolled
+   * to. Speaking and not being shown it is never what you wanted — and this
+   * covers the gate and offer buttons too, which are somewhere else on the page
+   * entirely and cannot reach in here to say so.
+   *
+   * Declared after the effect above so it runs second: by then the echo is in
+   * the DOM and scrollHeight includes it.
+   */
+  useEffect(() => {
+    stick.current = true;
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [acted]);
+
   const submit = () => {
     if (!draft.trim()) return;
     sendInput(draft);
     setDraft("");
-    // You just acted: follow the stream again no matter where you had scrolled
-    // to. Sending a message and not being shown it is never what you wanted.
-    stick.current = true;
-    const el = logRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
   };
 
   return (
@@ -265,6 +280,12 @@ export function Chat({ draft, setDraft }: { draft: string; setDraft: (v: string)
                 title={`${Math.round(ctx * 100)}% of the context window — compaction fires at 90%`}
               >
                 <i style={{ width: `${Math.min(100, ctx * 100)}%` }} />
+              </span>
+            )}
+            {(totalIn > 0 || totalOut > 0) && (
+              // Same 12.4k / 40k convention as the turn divider's cost readout
+              <span className="mono tiny faint" title="cumulative tokens this session (in / out)">
+                {tokens(totalIn)}in · {tokens(totalOut)}out
               </span>
             )}
             <span className="spacer" />

@@ -16,15 +16,26 @@ from bird.harnesses import registry
 from bird.harnesses.lead.tools import CodeTool
 from bird.llm.registry import ModelSpec, ProviderConfig, Registry
 from bird.permissions import (
+    AUTO_MODES,
     AutoApproveBroker,
     ConsoleBroker,
     DenyBroker,
     GatedTool,
+    NEXT_MODE,
     PermissionBroker,
+    auto_approves,
     gate_tools,
     permission_payload,
 )
-from bird.tools import BashTool, EditTool, ReadTool, ToolContext, WriteTool
+from bird.tools import (
+    BashTool,
+    EditTool,
+    ReadTool,
+    Tool,
+    ToolContext,
+    ToolResult,
+    WriteTool,
+)
 
 SPEC = ModelSpec(
     spec="fake:model",
@@ -219,6 +230,17 @@ def test_console_broker_reads_the_answer(answer, expected):
     assert b.request({"kind": "edit", "file": "a.py", "lines": []})[0] is expected
 
 
+@pytest.mark.parametrize("answer,expected", [
+    ("Y", True), ("Yes", True), ("YES", True), ("yES", True),
+    ("N", False), ("No", False), ("NO", False), ("nO", False),
+])
+def test_console_broker_accepts_mixed_case_yes_no(answer, expected):
+    """`.lower()` was dropped to distinguish 'a' from 'A', but the accept-sets
+    became exact-match only — "Yes"/"No" used to work and must keep working."""
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: answer)
+    assert b.request({"kind": "edit", "file": "a.py", "lines": []})[0] is expected
+
+
 def test_console_broker_a_turns_on_auto_approve_for_edits():
     answers = iter(["a"])
     b = ConsoleBroker(out=io.StringIO(), ask=lambda _: next(answers))
@@ -252,6 +274,167 @@ def test_console_broker_interrupt_denies():
     assert b.request({"kind": "edit", "file": "a.py", "lines": []})[0] is False
 
 
+# ----------------------------------------------------- three-state mode contract
+
+
+def test_next_mode_cycles_three_states():
+    assert NEXT_MODE["normal"] == "auto_edits"
+    assert NEXT_MODE["auto_edits"] == "full_auto"
+    assert NEXT_MODE["full_auto"] == "normal"
+
+
+def test_auto_modes_covered_kinds():
+    # normal covers nothing; auto_edits covers edits + reads, NOT bash;
+    # full_auto adds bash. offer is never covered in any mode.
+    assert AUTO_MODES["normal"] == frozenset()
+    assert AUTO_MODES["auto_edits"] == frozenset({"edit", "write", "read_outside_repo"})
+    assert AUTO_MODES["full_auto"] == frozenset(
+        {"edit", "write", "read_outside_repo", "bash"}
+    )
+    for kinds in AUTO_MODES.values():
+        assert "offer" not in kinds
+
+
+def test_auto_approves_helper_matches_mode():
+    assert not auto_approves("normal", {"kind": "edit"})
+    assert auto_approves("auto_edits", {"kind": "edit"})
+    assert auto_approves("auto_edits", {"kind": "read_outside_repo"})
+    assert not auto_approves("auto_edits", {"kind": "bash"})
+    assert auto_approves("full_auto", {"kind": "bash"})
+    assert not auto_approves("full_auto", {"kind": "offer"})
+
+
+def test_console_broker_default_mode_is_normal():
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: "n")
+    assert b.mode == "normal"
+    # back-compat boolean view: normal means auto_edits is False
+    assert b.auto_edits is False
+
+
+def test_console_broker_auto_edits_property_back_compat():
+    """The old auto_edits bool attribute still reads/writes through the mode."""
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: "n")
+    b.auto_edits = True
+    assert b.mode == "auto_edits"
+    assert b.auto_edits is True
+    b.auto_edits = False
+    assert b.mode == "normal"
+
+
+def test_console_broker_A_escalates_to_full_auto_and_approves():
+    """'A' approves the current request AND flips the session to full_auto."""
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: "A")
+    approved, _ = b.request({"kind": "bash", "cmd": "git rebase main"})
+    assert approved is True
+    assert b.mode == "full_auto"
+
+
+def test_console_full_auto_auto_approves_bash_without_asking():
+    """In full_auto, bash is auto-approved and the ask callable is not
+    consulted — the audit line is the only trace."""
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: "should-not-be-called")
+    b.mode = "full_auto"
+    asked = []
+
+    def ask(prompt):
+        asked.append(prompt)
+        return "n"
+
+    b.ask = ask
+    approved, _ = b.request({"kind": "bash", "cmd": "pytest -q"})
+    assert approved is True
+    assert not asked, "full_auto should not prompt for bash"
+
+
+def test_console_full_auto_prints_audit_line_for_bash():
+    out = io.StringIO()
+    b = ConsoleBroker(out=out, ask=lambda _: "n")
+    b.mode = "full_auto"
+    b.request({"kind": "bash", "cmd": "pytest -q"})
+    assert "FULL AUTO ran bash: pytest -q" in out.getvalue()
+
+
+def test_console_auto_edits_audit_line_shows_read_path():
+    """read_outside_repo payloads carry `path`, not `file`/`cmd`. The audit
+    line used to print a trailing space with no target — the read must be
+    named so execute-without-review leaves a useful trace."""
+    out = io.StringIO()
+    b = ConsoleBroker(out=out, ask=lambda _: "should-not-be-called")
+    b.mode = "auto_edits"
+    b.request({"kind": "read_outside_repo", "tool": "read", "path": "/etc/hosts"})
+    text = out.getvalue()
+    assert "/etc/hosts" in text
+    assert "read_outside_repo" in text
+
+
+def test_console_full_auto_audit_line_shows_read_path():
+    """Same trace requirement in full_auto for a read_outside_repo payload."""
+    out = io.StringIO()
+    b = ConsoleBroker(out=out, ask=lambda _: "should-not-be-called")
+    b.mode = "full_auto"
+    b.request({"kind": "read_outside_repo", "tool": "read", "path": "/etc/hosts"})
+    text = out.getvalue()
+    assert "/etc/hosts" in text
+    assert "read_outside_repo" in text
+
+
+def test_console_full_auto_auto_approves_edits_too():
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: "should-not-be-called")
+    b.mode = "full_auto"
+    assert b.request({"kind": "edit", "file": "a.py", "lines": []})[0] is True
+    assert b.request({"kind": "write", "file": "b.py", "lines": []})[0] is True
+
+
+def test_console_full_auto_still_prompts_for_offers():
+    """Offers fail closed under auto-answer — the answer IS the feedback, so an
+    auto-approved offer with no feedback is a corrupted answer."""
+    asked = []
+
+    def ask(prompt):
+        asked.append(prompt)
+        return "1"
+
+    b = ConsoleBroker(out=io.StringIO(), ask=ask)
+    b.mode = "full_auto"
+    approved, feedback = b.request(
+        {"kind": "offer", "question": "which?", "options": ["a", "b"]}
+    )
+    assert asked, "full_auto must still prompt for offers"
+    assert approved is True and feedback == "a"
+
+
+def test_console_auto_edits_covers_read_outside_repo():
+    """A read request during auto_edits is auto-approved — the user has no
+    reason to deny a read once they've opted into apply-without-asking."""
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: "should-not-be-called")
+    b.mode = "auto_edits"
+    assert b.request({"kind": "read_outside_repo", "tool": "read", "path": "/etc/hosts"})[
+        0
+    ] is True
+
+
+def test_console_full_auto_warning_printed_on_escalation():
+    out = io.StringIO()
+    b = ConsoleBroker(out=out, ask=lambda _: "A")
+    b.request({"kind": "bash", "cmd": "rm -rf build"})
+    text = out.getvalue()
+    assert "FULL AUTO" in text and "WITHOUT asking" in text
+
+
+def test_console_broker_mode_propagates_to_subharness_via_shared_instance():
+    """The mode lives on the broker object, not per-runner. A sub-harness that
+    forks the ToolContext and re-gates on the same broker inherits the mode."""
+    b = ConsoleBroker(out=io.StringIO(), ask=lambda _: "A")
+    b.request({"kind": "bash", "cmd": "x"})  # escalate
+    assert b.mode == "full_auto"
+    # the same instance — what a forked ctx would re-gate on — stays full_auto
+    # and auto-approves a later bash without consulting ask
+    asked = []
+    b.ask = lambda prompt: asked.append(prompt) or "n"
+    assert b.request({"kind": "bash", "cmd": "y"})[0] is True
+    assert not asked
+
+
 # ----------------------------------------------------- surface -> broker choice
 
 
@@ -275,3 +458,70 @@ def test_headless_broker_prompts_on_a_tty(monkeypatch):
 
     monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
     assert isinstance(_headless_broker(SimpleNamespace(yes=False)), ConsoleBroker)
+
+
+# --- per-call waiver: search-only bash runs unprompted ---
+
+def test_search_only_bash_is_not_prompted(tmp_path):
+    """~50 prompts per session were spent on grep/cat/find that the category
+    allowlist had already proven read-only, and users started denying them out
+    of fatigue. A command that cannot write is a question with one answer."""
+    broker = StubBroker(True)
+    gated = GatedTool(BashTool(), broker)
+    ctx = ToolContext(repo_root=tmp_path, record=lambda t, d: None)
+    result = gated.execute({"command": "grep -rn needle ."}, ctx)
+    assert not broker.seen, "a read-only search should not have asked"
+    assert not result.details.get("denied")
+
+
+def test_waived_calls_are_still_logged(tmp_path):
+    events = []
+    gated = GatedTool(BashTool(), StubBroker(True))
+    ctx = ToolContext(repo_root=tmp_path, record=lambda t, d: events.append((t, d)))
+    gated.execute({"command": "ls src"}, ctx)
+    assert any(t == "auto_approved" for t, _ in events), "unprompted runs must stay auditable"
+
+
+@pytest.mark.parametrize("command", [
+    "pytest -q",                     # a test run can rewrite fixtures
+    "git log --oneline",             # a git read can be widened
+    "ruff check .",
+    "grep -rn x . > out.txt",        # redirection writes
+    "sed -i 's/a/b/' f.py",          # in-place edit
+    "find . -name '*.py' -delete",   # find that deletes
+    "xargs rm < list.txt",           # xargs delegating out of the search set
+])
+def test_non_search_commands_still_prompt(tmp_path, command):
+    broker = StubBroker(True)
+    gated = GatedTool(BashTool(), broker)
+    ctx = ToolContext(repo_root=tmp_path, record=lambda t, d: None)
+    gated.execute({"command": command}, ctx)
+    assert broker.seen, f"{command!r} was waived but is not a read-only search"
+
+
+def test_waiver_is_off_when_search_is_not_an_enabled_category(tmp_path):
+    broker = StubBroker(True)
+    gated = GatedTool(BashTool(), broker)
+    ctx = ToolContext(
+        repo_root=tmp_path, bash_categories=("test",), record=lambda t, d: None
+    )
+    gated.execute({"command": "grep -rn x ."}, ctx)
+    assert broker.seen, "a harness that disabled search has already said no"
+
+
+def test_a_wrapped_tool_that_forgot_the_flag_is_still_gated(tmp_path):
+    """`requires_permission` decides whether a tool gets WRAPPED; once wrapped,
+    the default is to ask. Deriving the per-call answer from the flag would let
+    a directly-wrapped tool silently lose its gate."""
+    class Forgetful(Tool):
+        name = "forgetful"
+        description = "x"
+        parameters = {"type": "object", "properties": {}}
+
+        def run(self, args, ctx):
+            return ToolResult(output="ran")
+
+    broker = StubBroker(False)
+    gated = GatedTool(Forgetful(), broker)
+    result = gated.execute({}, ToolContext(repo_root=tmp_path))
+    assert broker.seen and result.is_error and "DENIED" in result.output

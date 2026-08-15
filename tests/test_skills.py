@@ -102,6 +102,20 @@ def test_builtin_skill_creator_loaded(tmp_path):
     assert "skill" in sk.body.lower()
 
 
+def test_builtin_research_skill_loaded(tmp_path):
+    """The research built-in skill parses (front-matter + non-empty body)
+    and loads as a builtin."""
+    skills = load_skills(tmp_path)
+    sk = next((s for s in skills if s.name == "research"), None)
+    assert sk is not None, "research skill not found among loaded skills"
+    assert sk.source == "builtin"
+    assert sk.description.startswith("Use when")
+    assert sk.body.strip()
+    # the procedure's core gates are present in the body
+    assert "sufficiency criterion" in sk.body
+    assert "Coverage:" in sk.body
+
+
 def test_project_overrides_builtin(tmp_path):
     """A project skill named 'skill-creator' overrides the built-in."""
     _write_skill(tmp_path / ".bird" / "skills", "skill-creator", "custom", "my version")
@@ -199,7 +213,7 @@ def test_all_schemas_under_token_budget():
     from .test_tools import SCHEMA_TOKEN_BUDGET
 
     tools = code_harness_tools(with_kg=True)
-    assert len(tools) == 12
+    assert len(tools) == 15
     wire = json.dumps([t.spec().to_openai() for t in tools])
     approx_tokens = len(wire) / 4
     assert approx_tokens < SCHEMA_TOKEN_BUDGET, (
@@ -219,7 +233,7 @@ def test_repl_completer_builtin_commands(tmp_path):
     from bird.llm.wire.openai_compat import OpenAICompatClient
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
@@ -271,7 +285,7 @@ def test_repl_completer_includes_skills(tmp_path):
     from bird.llm.types import Message, Usage, LLMResponse
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     skills = [
@@ -338,7 +352,7 @@ def test_repl_completer_non_slash_returns_none(tmp_path):
     from bird.llm.types import Message, Usage, LLMResponse
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
@@ -377,7 +391,7 @@ def test_serve_ready_includes_skills(monkeypatch, tmp_path):
     from bird.serve import Server
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     skills = [
