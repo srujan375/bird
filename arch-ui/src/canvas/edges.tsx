@@ -10,6 +10,7 @@
  * has to travel. It always reads as a loop, and it bends rather than jumps.
  */
 import { BaseEdge, type EdgeProps } from "@xyflow/react";
+import type { XY } from "../store/canvas";
 
 /** Deep enough to clear the row it passes under, shallow enough to stay read. */
 function dipFor(span: number): number {
@@ -48,36 +49,63 @@ export function FeedbackEdge({
 }
 
 /**
- * The skip edge: a forward hop that has to clear the cards it flies over.
+ * The routed edge: a hop that crosses a column it does not belong to.
  *
- * A stock bezier between two ends on the same row is very nearly a straight
- * line, so a connection that skips a layer — `api → db` when a queue and a
- * worker sit between them — is ruled straight through both of their cards.
- * That reads as three connections where there is one, and it hides whatever
- * text it crosses.
+ * `api → db` when a queue and a worker sit between them used to be drawn as an
+ * arc *over* both of their cards — measured against live positions, re-measured
+ * on every drag, and growing taller with each card it had to clear until it
+ * read as a bow across the diagram rather than a connection.
  *
- * Same answer as the feedback edge, mirrored: arc *over* rather than dip under,
- * by however much it takes to clear the tallest card in the way. `data.top` is
- * the y the curve must stay above, measured by the canvas; the control points
- * go higher than that, because a cubic peaks well short of its handles.
+ * The layout reserves a lane in every column such an edge crosses, so there is
+ * nothing left to clear: `data.points` are the middles of those lanes, and the
+ * edge simply runs down them. A Catmull-Rom spline through the points keeps it
+ * a single continuous line rather than a chain of segments with corners, and
+ * two short stubs at the ends make it leave and arrive horizontally, so the
+ * arrowhead still meets the card square-on.
  */
-export function SkipEdge({
+const STUB = 20;
+
+function spline(pts: XY[]): string {
+  if (pts.length < 2) return "";
+  let d = `M${pts[0].x},${pts[0].y}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    // the two neighbours a Catmull-Rom segment needs; the ends borrow themselves
+    const p0 = pts[i - 1] ?? pts[i];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[i + 2] ?? p2;
+    d +=
+      ` C${p1.x + (p2.x - p0.x) / 6},${p1.y + (p2.y - p0.y) / 6}` +
+      ` ${p2.x - (p3.x - p1.x) / 6},${p2.y - (p3.y - p1.y) / 6}` +
+      ` ${p2.x},${p2.y}`;
+  }
+  return d;
+}
+
+/** The middle of the lane run — where a label sits clear of both cards. */
+function midpoint(pts: XY[], fallback: XY): XY {
+  if (pts.length === 0) return fallback;
+  if (pts.length % 2) return pts[(pts.length - 1) / 2];
+  const a = pts[pts.length / 2 - 1];
+  const b = pts[pts.length / 2];
+  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+}
+
+export function RoutedEdge({
   sourceX, sourceY, targetX, targetY,
   markerEnd, style, label, data,
   labelStyle, labelShowBg, labelBgStyle, labelBgPadding, labelBgBorderRadius,
   interactionWidth,
 }: EdgeProps) {
-  const top = (data?.top as number | undefined) ?? Math.min(sourceY, targetY);
-  // Solve the cubic at t=0.5 for the handle height that puts the *curve* at
-  // `top`: B(.5) = (p0 + 3c1 + 3c2 + p3) / 8, with both handles at `handle`.
-  const handle = (8 * top - sourceY - targetY) / 6;
-  const lift = Math.min(sourceY, targetY) - top;
-  // Pull the handles inward as the arc gets tall, so a big clearance bulges
-  // upward rather than ballooning sideways across its neighbours.
-  const dx = Math.max(24, Math.min(140, Math.abs(targetX - sourceX) * 0.28 - lift * 0.12));
-  const path =
-    `M${sourceX},${sourceY} ` +
-    `C${sourceX + dx},${handle} ${targetX - dx},${handle} ${targetX},${targetY}`;
+  const lane = (data?.points as XY[] | undefined) ?? [];
+  const mid = midpoint(lane, { x: (sourceX + targetX) / 2, y: (sourceY + targetY) / 2 });
+  const path = spline([
+    { x: sourceX, y: sourceY },
+    { x: sourceX + STUB, y: sourceY },
+    ...lane,
+    { x: targetX - STUB, y: targetY },
+    { x: targetX, y: targetY },
+  ]);
 
   return (
     <BaseEdge
@@ -85,8 +113,8 @@ export function SkipEdge({
       markerEnd={markerEnd}
       style={style}
       label={label}
-      labelX={(sourceX + targetX) / 2}
-      labelY={(sourceY + targetY + 6 * handle) / 8}
+      labelX={mid.x}
+      labelY={mid.y}
       labelStyle={labelStyle}
       labelShowBg={labelShowBg}
       labelBgStyle={labelBgStyle}
@@ -97,4 +125,4 @@ export function SkipEdge({
   );
 }
 
-export const edgeTypes = { feedback: FeedbackEdge, skip: SkipEdge };
+export const edgeTypes = { feedback: FeedbackEdge, routed: RoutedEdge };

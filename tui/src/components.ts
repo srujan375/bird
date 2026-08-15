@@ -201,6 +201,82 @@ export class Thinking implements Component {
 	}
 }
 
+/* ---------- reasoning trace (Ollama thinking models) ---------- */
+
+// How many lines of a closed reasoning segment stay visible before the rest
+// is elided. A thinking trace is a scratchpad, not an artifact — once the
+// segment closes we keep the tail (the part nearest the answer) and fold the
+// rest into a one-line "(+M lines elided)" marker.
+const THINKING_KEEP_LINES = 4;
+
+/** One contiguous reasoning segment streamed live from a thinking model.
+ *  Dimmed throughout to read as distinct from the assistant's answer. While
+ *  open it streams plain text (no markdown — it's a scratchpad) with a cursor;
+ *  on close it collapses to the last N lines + "(+M lines elided)". A turn
+ *  may open several of these if a model interleaves reasoning after content
+ *  (docs-sanctioned); each is its own segment. */
+export class ThinkingTrace implements Component {
+	invalidate(): void {}
+	private text = "";
+	private open = true;
+	private interrupted = false;
+
+	constructor() {}
+
+	/** Append a live reasoning chunk. Only meaningful while the segment is open. */
+	append(chunk: string): void {
+		if (!this.open) return;
+		this.text += chunk;
+	}
+
+	/** Close the segment: stop streaming, collapse to the kept tail. */
+	close(): void {
+		this.open = false;
+	}
+
+	/** Close the segment as interrupted (dim, no fake done badge). */
+	closeInterrupted(): void {
+		this.open = false;
+		this.interrupted = true;
+	}
+
+	isOpen(): boolean {
+		return this.open;
+	}
+
+	render(width: number): string[] {
+		const bodyW = Math.max(20, Math.floor(width * 0.88));
+		const label = this.interrupted
+			? t.dim("✕ reasoning (interrupted)")
+			: this.open
+				? t.dim("reasoning")
+				: t.dim("reasoning");
+		const lines: string[] = [" " + label];
+
+		if (this.open) {
+			// streaming: raw text with a cursor, no markdown
+			const body = this.text + t.dim("▎");
+			for (const l of wrapTextWithAnsi(body, bodyW)) {
+				lines.push(" " + t.muted(l));
+			}
+			return lines;
+		}
+
+		// closed: collapse to the last N lines + an elision marker
+		const wrapped = wrapTextWithAnsi(this.text, bodyW);
+		if (wrapped.length <= THINKING_KEEP_LINES) {
+			for (const l of wrapped) lines.push(" " + t.muted(l));
+		} else {
+			const elided = wrapped.length - THINKING_KEEP_LINES;
+			lines.push(" " + t.dim(`(+${elided} lines elided)`));
+			for (const l of wrapped.slice(-THINKING_KEEP_LINES)) {
+				lines.push(" " + t.muted(l));
+			}
+		}
+		return lines;
+	}
+}
+
 /* ---------- permission cards ---------- */
 
 export interface DiffLine {
@@ -506,11 +582,86 @@ export class SessionPicker implements Component {
 	}
 }
 
+/* ---------- thinking-mode picker ---------- */
+
+/** The Ollama thinking-mode picker — mirrors ModelPicker but simpler: a flat
+ *  list of mode labels (off/low/medium/high/max) with the active one marked.
+ *  Arrow keys to navigate, Enter to select, Esc to cancel. No numbers. */
+export class ThinkPicker implements Component {
+	invalidate(): void {}
+	onDone?: (mode: string | null) => void;
+	private list: SelectList;
+
+	constructor(modes: string[], current: string | null) {
+		const items: SelectItem[] = modes.map((m) => ({
+			value: m,
+			label: (m === current ? "● " : "  ") + m,
+			description: m === "off" ? "thinking disabled" : "",
+		}));
+		this.list = new SelectList(items, 10, {
+			selectedPrefix: (s) => t.accentBold(s),
+			selectedText: (s) => t.accentBold(s),
+			description: (s) => t.muted(s),
+			scrollInfo: (s) => t.dim(s),
+			noMatch: (s) => t.muted(s),
+		});
+		this.list.onSelect = (item) => this.onDone?.(item.value);
+		this.list.onCancel = () => this.onDone?.(null);
+	}
+
+	handleInput(data: string): void {
+		this.list.handleInput(data);
+	}
+
+	render(width: number): string[] {
+		const head =
+			" " +
+			t.accent("●") +
+			" " +
+			t.fg.bold("Select thinking mode") +
+			t.muted("  ⏎ select · esc cancel");
+		return [truncateToWidth(head, width), ...this.list.render(Math.max(20, width - 2)).map((l) => "  " + l)];
+	}
+}
+
 /* ---------- prompt hint line ---------- */
+
+// The three-state approval mode — the TS mirror of src/bird/permissions.py's
+// PermissionMode contract (the only intentional logic duplication, ~6 lines).
+// The TUI and the console broker implement identical semantics against one
+// reading of the truth.
+export type PermissionMode = "normal" | "auto_edits" | "full_auto";
+
+// Shift+Tab cycle order.
+const NEXT_MODE: Record<PermissionMode, PermissionMode> = {
+	normal: "auto_edits",
+	auto_edits: "full_auto",
+	full_auto: "normal",
+};
+
+// The payload kinds each mode auto-answers without showing the card. "offer"
+// is NEVER covered: an offer's answer IS the feedback string, so an
+// auto-approved offer with no feedback is a corrupted answer.
+const AUTO_MODES: Record<PermissionMode, ReadonlySet<string>> = {
+	normal: new Set(),
+	auto_edits: new Set(["edit", "write", "read_outside_repo"]),
+	full_auto: new Set(["edit", "write", "read_outside_repo", "bash"]),
+};
+
+export function autoApproves(mode: PermissionMode, kind: string): boolean {
+	return AUTO_MODES[mode].has(kind);
+}
 
 export class HintLine implements Component {
 	invalidate(): void {}
-	private autoApprove = false;
+	private mode: PermissionMode = "normal";
+	// session-cumulative token spend, as reported by the server in turn_end.
+	// null until the first turn ends (nothing spent → nothing to show).
+	private tokens: { in: number; out: number } | null = null;
+	// the friendly Ollama thinking-mode label (off/low/medium/high/max) or
+	// null when no mode is set (Ollama's auto/default behavior). Shown next to
+	// the model name so the active reasoning effort is visible at a glance.
+	private thinkMode: string | null = null;
 
 	constructor(private model: string) {}
 
@@ -518,20 +669,59 @@ export class HintLine implements Component {
 		this.model = model;
 	}
 
-	setAutoApprove(on: boolean): void {
-		this.autoApprove = on;
+	setThinkMode(mode: string | null): void {
+		this.thinkMode = mode;
 	}
 
-	getAutoApprove(): boolean {
-		return this.autoApprove;
+	setTokens(input: number, output: number): void {
+		this.tokens = { in: input, out: output };
+	}
+
+	clearTokens(): void {
+		this.tokens = null;
+	}
+
+	// Shift+Tab cycles normal → auto_edits → full_auto → normal. Returns the
+	// new mode so the caller can post the right entry notice.
+	cycleMode(): PermissionMode {
+		this.mode = NEXT_MODE[this.mode];
+		return this.mode;
+	}
+
+	getMode(): PermissionMode {
+		return this.mode;
+	}
+
+	// /reload respawns bird serve: the fresh process has no memory of the mode,
+	// so the TUI resets its own mode to normal on "ready" — silently keeping
+	// full-auto across a code-reload respawn would be the one accidental-
+	// persistence path in this design.
+	resetMode(): void {
+		this.mode = "normal";
 	}
 
 	render(width: number): string[] {
-		const left = " " + t.muted("⏎ send · ⇧⏎ newline · / commands · ⇧⇥ auto-approve");
-		const mode = this.autoApprove ? t.accentBold("auto-approve on") : t.muted("auto-approve off");
-		const right = mode + "  " + t.muted(this.model) + " ";
+		const left = " " + t.muted("⏎ send · ⇧⏎ newline · / commands · ⇧⇥ cycle mode");
+		const mode =
+			this.mode === "full_auto"
+				? t.danger.bold("⚠ FULL AUTO")
+				: this.mode === "auto_edits"
+					? t.accentBold("auto-accept edits")
+					: t.muted("ask everything");
+		const tok = this.tokens
+			? t.dim(`↑${abbrevTokens(this.tokens.in)} ↓${abbrevTokens(this.tokens.out)}  `)
+			: "";
+		// the thinking mode sits next to the model name; absent when no mode is
+		// set (Ollama's default/auto behavior) so the line stays uncluttered
+		const think = this.thinkMode ? t.dim("· think:") + t.muted(this.thinkMode) + "  " : "";
+		const right = tok + mode + "  " + think + t.muted(this.model) + " ";
 		const gap = width - visibleWidth(left) - visibleWidth(right);
 		if (gap < 1) return [truncateToWidth(left, width)];
 		return [left + " ".repeat(gap) + right];
 	}
+}
+
+/** Same 12.4k abbreviation the arch UI uses for token counts ("12.4k / 40k"). */
+function abbrevTokens(n: number): string {
+	return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }

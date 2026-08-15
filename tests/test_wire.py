@@ -80,6 +80,52 @@ def test_tools_and_auth_in_request(client, httpx_mock, monkeypatch):
     assert payload["tools"][0]["function"]["name"] == "read"
 
 
+def test_reasoning_effort_forwarded_for_ollama(client, httpx_mock):
+    """When the provider is ollama and spec.extra carries reasoning_effort,
+    the wire adapter must forward it into the /chat/completions payload."""
+    import json
+
+    thinking_spec = ModelSpec(
+        spec="ollama:test-model",
+        provider=ProviderConfig(name="ollama", base_url="http://localhost:11434/v1"),
+        model="test-model",
+        extra={"reasoning_effort": "medium"},
+    )
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    client.complete(thinking_spec, [Message(role="user", content="x")])
+    payload = json.loads(httpx_mock.get_requests()[0].content)
+    assert payload["reasoning_effort"] == "medium"
+
+
+def test_reasoning_effort_not_sent_for_openrouter(client, httpx_mock, monkeypatch):
+    """OpenRouter uses reasoning_effort with different values, so the adapter
+    must NEVER forward it there even if spec.extra has it."""
+    import json
+
+    monkeypatch.setenv("OR_KEY", "sk-or-test")
+    or_spec = ModelSpec(
+        spec="openrouter:foo/bar",
+        provider=ProviderConfig(name="openrouter", base_url="https://openrouter.ai/api/v1", api_key_env="OR_KEY"),
+        model="foo/bar",
+        extra={"reasoning_effort": "medium"},
+    )
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    client.complete(or_spec, [Message(role="user", content="x")])
+    payload = json.loads(httpx_mock.get_requests()[0].content)
+    assert "reasoning_effort" not in payload
+
+
+def test_reasoning_effort_absent_when_not_set(client, spec, httpx_mock):
+    """Current behavior preserved: no reasoning_effort in the payload when
+    spec.extra doesn't carry it (Ollama auto-enables thinking on its own)."""
+    import json
+
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    client.complete(spec, [Message(role="user", content="x")])
+    payload = json.loads(httpx_mock.get_requests()[0].content)
+    assert "reasoning_effort" not in payload
+
+
 def test_retries_on_500_then_succeeds(client, spec, httpx_mock):
     httpx_mock.add_response(status_code=500)
     httpx_mock.add_response(status_code=429)

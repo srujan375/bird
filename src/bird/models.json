@@ -34,7 +34,8 @@
     "ollama:glm-5.2": {
       "context_window": 900000,
       "supports_tools": true,
-      "constrained_decoding": false
+      "constrained_decoding": false,
+      "reasoning_effort": "medium"
     },
     "ollama:minimax-m3": {
       "context_window": 500000,
@@ -66,6 +67,11 @@
       "supports_tools": true,
       "constrained_decoding": false
     },
+    "openrouter:qwen/qwen3.8-2.4t-a95b": {
+      "context_window": 900000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
     "openrouter:anthropic/claude-haiku-4.5": {
       "context_window": 200000,
       "supports_tools": true,
@@ -93,9 +99,9 @@
     }
   },
   "aliases": {
-    "default": "ollama:deepseek-v4-flash:0731",
-    "architect": "ollama:deepseek-v4-flash:0731",
-    "judge": "ollama:glm-5.2",
+    "default": "ollama:glm-5.2",
+    "architect": "openrouter:qwen/qwen3.8-2.4t-a95b",
+    "judge": "ollama:deepseek-v4-flash:0731",
     "compactor": "ollama:gemma4:31b",
     "vision": "ollama:kimi-k2.7-code",
     "kg": "ollama:kimi-k2.7-code"

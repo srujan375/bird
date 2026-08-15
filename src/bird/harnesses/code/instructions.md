@@ -25,11 +25,18 @@ Rules:
   read files outside the current step's touch/may-affect lists. The moment a
   step is complete, call plan_update {"step": N, "status": "done"}.
 - Read a file before editing it. `edit` needs old_text copied EXACTLY.
-- `bash` allows only read-only search, test runs, linters, and git reads. Test
-  and check commands may be prefixed with `uv run`, `poetry run` or `npx`
-  (`uv run pytest -q`, `npx tsc --noEmit`, `npm run build`). Prefer `grep`/
-  `glob`/`read` over shelling out to grep/find/cat — same answer, better
-  formatted, and no approval prompt.
+- `bash` allows read-only search, test runs, linters, git reads, package-manager
+  installs (`npm install`, `npm ci`, `pnpm install`, `yarn install`), any
+  package.json script (`npm run dev`, `npm run start`, `npm run deploy`, ...),
+  bare python on a script file (`python script.py`, `python3 manage.py migrate`),
+  and `pip install`. Test and check commands may be prefixed with `uv run`,
+  `poetry run` or `npx` (`uv run pytest -q`, `npx tsc --noEmit`, `npm run build`).
+  A virtualenv can be activated for the command line that needs it
+  (`source .venv/bin/activate && pytest -q`) — each bash call is a fresh shell,
+  so the activation does not carry to the next one.
+  `python -c "..."` (inline code) and `python -m <module>` outside the module
+  allowlist are rejected. Prefer `grep`/`glob`/`read` over shelling out to
+  grep/find/cat — same answer, better formatted, and no approval prompt.
 - Verify your change by RUNNING a check — the project's tests, or a type check
   or linter if it has no tests covering your change. Then call `done` with a
   short summary. You MUST end by calling `done` — never just stop. `done` is

@@ -10,23 +10,19 @@ from bird.repl import Repl
 from bird.harnesses.code import code_harness_tools
 from bird.tools import ToolContext
 
-SPEC = ModelSpec(
-    spec="fake:model",
-    provider=ProviderConfig(name="fake", base_url="http://x"),
-    model="model",
-    context_window=32768,
-)
-
 
 class FakeClient:
     def __init__(self, script):
         self.script = list(script)
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         msg = self.script.pop(0)
         if on_delta is not None and msg.content:
             on_delta(msg.content)  # simulate streaming: one chunk, then end marker
             on_delta(None)
+        if on_thinking is not None and getattr(msg, "thinking", None):
+            on_thinking(msg.thinking)
+            on_thinking(None)
         return LLMResponse(message=msg, usage=Usage(10, 5), stop_reason="stop", model=spec.spec)
 
 
@@ -35,8 +31,16 @@ def make_repl(tmp_path, script):
     recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
+    # fresh spec per test — ModelSpec.extra is a mutable dict, so reusing a
+    # module-level constant would leak state (e.g. reasoning_effort) across tests
+    spec = ModelSpec(
+        spec="fake:model",
+        provider=ProviderConfig(name="fake", base_url="http://x"),
+        model="model",
+        context_window=32768,
+    )
     runner = Runner(
-        spec=SPEC, client=FakeClient(script), registry=registry,
+        spec=spec, client=FakeClient(script), registry=registry,
         tools=code_harness_tools(with_kg=False), ctx=ctx,
     )
     return Repl(runner, registry, kg=None, recorder=recorder, run_id="t")
@@ -194,6 +198,142 @@ def test_unknown_command(tmp_path, monkeypatch, capsys):
     feed(monkeypatch, ["/wat", "/quit"])
     repl.run()
     assert "unknown command" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# /think: Ollama thinking-mode picker.
+# ---------------------------------------------------------------------------
+
+def test_think_set_mode_directly(tmp_path, monkeypatch, capsys):
+    repl = make_repl(tmp_path, [])
+    feed(monkeypatch, ["/think medium", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "thinking: medium" in out
+    assert repl.runner.spec.extra["reasoning_effort"] == "medium"
+
+
+def test_think_off_maps_to_none(tmp_path, monkeypatch, capsys):
+    """The friendly label `off` must be stored as the API value `none`."""
+    repl = make_repl(tmp_path, [])
+    feed(monkeypatch, ["/think off", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "thinking: off" in out
+    assert repl.runner.spec.extra["reasoning_effort"] == "none"
+
+
+def test_think_unknown_mode_rejected(tmp_path, monkeypatch, capsys):
+    repl = make_repl(tmp_path, [])
+    feed(monkeypatch, ["/think turbo", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "unknown mode" in out
+    assert "off, low, medium, high, max" in out
+    assert "reasoning_effort" not in repl.runner.spec.extra
+
+
+def test_think_bare_shows_current_mode(tmp_path, monkeypatch, capsys):
+    """Bare /think on a non-tty just lists modes and prints the current one."""
+    repl = make_repl(tmp_path, [])
+    feed(monkeypatch, ["/think high", "/think", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    # the bare /think line shows the active mode as `high`, with a `*` marker
+    assert "thinking: high" in out
+    assert "* high" in out
+    assert "set with /think <mode>" in out  # non-tty hint
+
+
+def test_think_picker_selects_by_name(tmp_path, monkeypatch, capsys):
+    """On a tty the picker prompts for a mode NAME (not a number)."""
+    repl = make_repl(tmp_path, [])
+    monkeypatch.setattr("sys.stdin", Tty())
+    feed(monkeypatch, ["/think", "max", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    # the picker lists modes (no active `*` since none is set yet, shows
+    # "(auto)"), then applies the typed mode name (not a number)
+    assert "thinking: (auto)" in out
+    assert "thinking: max" in out
+    assert repl.runner.spec.extra["reasoning_effort"] == "max"
+
+
+def test_think_carries_over_model_switch(tmp_path, monkeypatch, capsys):
+    """Switching models via /model must not reset the thinking mode."""
+    repl = make_repl(tmp_path, [])
+    reg = repl.registry
+    reg.providers["fake"] = ProviderConfig(name="fake", base_url="http://x")
+    reg.models["fake:model"] = {"context_window": 32768}
+    reg.models["fake:other"] = {"context_window": 65536}
+    feed(monkeypatch, ["/think high", "/model fake:other", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "thinking: high" in out
+    assert repl.runner.spec.spec == "fake:other"
+    assert repl.runner.spec.extra["reasoning_effort"] == "high"
+
+
+def test_think_persists_to_models_json(tmp_path, monkeypatch, capsys):
+    """/think writes reasoning_effort into the model's models.json entry."""
+    import json
+
+    models_json = tmp_path / "models.json"
+    models_json.write_text(json.dumps({
+        "providers": {"fake": {"base_url": "http://x"}},
+        "models": {"fake:model": {"context_window": 32768}},
+        "aliases": {"default": "fake:model"},
+    }))
+    reg = Registry.load(models_json)
+    spec = ModelSpec(
+        spec="fake:model",
+        provider=reg.providers["fake"],
+        model="model",
+        context_window=32768,
+    )
+    recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
+    ctx = ToolContext(repo_root=tmp_path, record=recorder.event)
+    runner = Runner(
+        spec=spec, client=FakeClient([]), registry=reg,
+        tools=code_harness_tools(with_kg=False), ctx=ctx,
+    )
+    repl = Repl(runner, reg, kg=None, recorder=recorder, run_id="t")
+    feed(monkeypatch, ["/think medium", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "thinking: medium" in out
+    assert "this session only" not in out  # persisted, so no session-only note
+    # the file now carries the mode, and a fresh resolve picks it up
+    reloaded = Registry.load(models_json)
+    assert reloaded.models["fake:model"]["reasoning_effort"] == "medium"
+    assert reloaded.resolve("fake:model").extra["reasoning_effort"] == "medium"
+
+
+def test_think_session_only_when_no_file(tmp_path, monkeypatch, capsys):
+    """With an in-memory registry (no models.json), /think notes session-only."""
+    repl = make_repl(tmp_path, [])
+    feed(monkeypatch, ["/think medium", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "thinking: medium (this session only)" in out
+    assert repl.runner.spec.extra["reasoning_effort"] == "medium"
+
+
+def test_think_resume_picks_up_from_models_json(tmp_path, monkeypatch, capsys):
+    """A resumed session resolves the recorded model from models.json, which
+    now carries reasoning_effort — so the thinking mode is restored."""
+    import json
+
+    models_json = tmp_path / "models.json"
+    models_json.write_text(json.dumps({
+        "providers": {"fake": {"base_url": "http://x"}},
+        "models": {"fake:model": {"context_window": 32768, "reasoning_effort": "high"}},
+        "aliases": {"default": "fake:model"},
+    }))
+    reg = Registry.load(models_json)
+    # the resumed session's recorded model resolves with the thinking mode
+    spec = reg.resolve("fake:model")
+    assert spec.extra["reasoning_effort"] == "high"
 
 
 def test_kg_disabled_message(tmp_path, monkeypatch, capsys):

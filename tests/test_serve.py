@@ -26,18 +26,21 @@ class FakeClient:
     def __init__(self, script):
         self.script = list(script)
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         msg = self.script.pop(0)
         if on_delta is not None and msg.content:
             on_delta(msg.content)  # simulate streaming: one chunk, then end marker
             on_delta(None)
+        if on_thinking is not None and getattr(msg, "thinking", None):
+            on_thinking(msg.thinking)
+            on_thinking(None)
         return LLMResponse(message=msg, usage=Usage(10, 5), stop_reason="stop", model=spec.spec)
 
 
-def make_repl(tmp_path, script):
+def make_repl(tmp_path, script, skills=None):
     (tmp_path / "f.py").write_text("x = 1\n")
     recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
-    ctx = ToolContext(repo_root=tmp_path, record=recorder.event)
+    ctx = ToolContext(repo_root=tmp_path, record=recorder.event, skills=skills)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     runner = Runner(
         spec=SPEC, client=FakeClient(script), registry=registry,
@@ -158,11 +161,11 @@ class Out:
                 self.cv.wait(remaining)
 
 
-def run_server(monkeypatch, tmp_path, script):
+def run_server(monkeypatch, tmp_path, script, skills=None):
     feeder, out = Feeder(), Out()
     monkeypatch.setattr("sys.stdin", feeder)
     monkeypatch.setattr("sys.stdout", out)
-    server = Server(make_repl(tmp_path, script))
+    server = Server(make_repl(tmp_path, script, skills))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     return feeder, out, thread
@@ -182,6 +185,134 @@ def test_serve_reply_flow(monkeypatch, tmp_path):
         if m["type"] == "harness_event" and m["event"] == "assistant_delta"
     ]
     assert [d["data"]["text"] for d in deltas] == ["It is a Python file."]
+    feeder.close()
+    thread.join(timeout=5)
+    out.wait_for("bye")
+
+
+def test_serve_done_streams_summary_then_turn_end_matches(monkeypatch, tmp_path):
+    """A `done` turn where the model streams its summary text alongside the
+    done tool call is the duplicate-response precondition: the streamed
+    assistant_delta content equals the done tool's summary, and turn_end
+    carries that same summary as status=done. The TUI dedups on this shape —
+    a regression here would re-introduce the doubled reply for thinking
+    models, whose reasoning trace precedes the streamed content."""
+    done_args = {"summary": "all done"}
+    done_call = Message(
+        role="assistant",
+        content="all done",
+        tool_calls=[ToolCall(id="1", name="done", arguments=done_args, arguments_json=json.dumps(done_args))],
+    )
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [done_call])
+    out.wait_for("ready")
+    feeder.put({"type": "user_input", "text": "finish it"})
+    end = out.wait_for("turn_end")
+    assert end["status"] == "done"
+    assert end["summary"] == "all done"
+    deltas = [
+        m["data"]["text"]
+        for m in out.msgs
+        if m["type"] == "harness_event" and m["event"] == "assistant_delta"
+    ]
+    # the streamed content is the same text turn_end reports as the summary —
+    # exactly the overlap the TUI must not render twice
+    assert "".join(deltas) == "all done"
+    feeder.close()
+    thread.join(timeout=5)
+    out.wait_for("bye")
+
+
+def _skill(name="mr-description", body="write the MR"):
+    from pathlib import Path
+
+    from bird.skills import Skill
+
+    return Skill(name=name, description="d", body=body, path=Path("x"), source="project")
+
+
+def test_skill_command_runs_a_turn_and_never_echoes_the_reply(monkeypatch, tmp_path):
+    """`/<skill>` is a model turn, not a UI command.
+
+    It must reach the client the same way typed input does — streamed deltas
+    plus a turn_end — and must NOT also arrive as command_output. Repl._turn
+    prints the reply for the plain terminal REPL; when a command handler ran
+    that turn under redirect_stdout, the capture came back as command_output
+    and the UI drew the whole answer a second time (rendered once, raw once).
+    """
+    feeder, out, thread = run_server(
+        monkeypatch, tmp_path,
+        [Message(role="assistant", content="no branch changes to describe")],
+        skills=[_skill()],
+    )
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/mr-description describe my branch"})
+    end = out.wait_for("turn_end")
+    assert end["status"] == "reply"
+    assert end["summary"] == "no branch changes to describe"
+
+    deltas = [
+        m["data"]["text"]
+        for m in out.msgs
+        if m["type"] == "harness_event" and m["event"] == "assistant_delta"
+    ]
+    assert "".join(deltas) == "no branch changes to describe"
+    # the reply reached the UI exactly once — no command_output carrying it
+    echoes = [m for m in out.msgs if m["type"] == "command_output"]
+    assert echoes == [], f"reply echoed back as command_output: {echoes}"
+
+    feeder.close()
+    thread.join(timeout=5)
+    out.wait_for("bye")
+
+
+def test_skill_command_prompt_carries_body_and_args(monkeypatch, tmp_path):
+    """The turn the server starts is the same prompt the Repl would build."""
+    repl = make_repl(tmp_path, [], skills=[_skill(body="be concise")])
+    with_args = repl.skill_prompt("mr-description", "describe my branch")
+    assert "be concise" in with_args
+    assert with_args.endswith("Task: describe my branch")
+    assert "Task:" not in repl.skill_prompt("mr-description", "")
+    assert repl.skill_prompt("nope", "") is None
+
+
+def test_builtin_command_beats_a_skill_of_the_same_name(monkeypatch, tmp_path):
+    """A skill named `model` must not shadow /model — no turn, just the picker."""
+    feeder, out, thread = run_server(
+        monkeypatch, tmp_path, [], skills=[_skill(name="model")],
+    )
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/model"})
+    out.wait_for("model_list")
+    assert not any(m["type"] == "turn_end" for m in out.msgs)
+    feeder.close()
+    thread.join(timeout=5)
+    out.wait_for("bye")
+
+
+def test_turn_end_carries_cumulative_tokens(monkeypatch, tmp_path):
+    feeder, out, thread = run_server(
+        monkeypatch, tmp_path,
+        [Message(role="assistant", content="first"), Message(role="assistant", content="second")],
+    )
+    out.wait_for("ready")
+
+    feeder.put({"type": "user_input", "text": "one"})
+    first = out.wait_for("turn_end")
+    # FakeClient reports Usage(10, 5) per completion
+    assert first["input_tokens"] == 10 and first["output_tokens"] == 5
+
+    feeder.put({"type": "user_input", "text": "two"})
+    # keep waiting until the *second* turn_end (wait_for returns the first)
+    deadline = time.time() + 5
+    while True:
+        ends = [m for m in out.msgs if m["type"] == "turn_end"]
+        if len(ends) >= 2:
+            break
+        assert time.time() < deadline, f"timed out waiting for second turn_end; got {out.msgs}"
+        time.sleep(0.02)
+    # session-cumulative: the second report is the running total, not a delta
+    second = ends[-1]
+    assert second["input_tokens"] == 20 and second["output_tokens"] == 10
     feeder.close()
     thread.join(timeout=5)
     out.wait_for("bye")
@@ -236,6 +367,55 @@ def test_serve_model_list(monkeypatch, tmp_path):
     assert msg["default"] == "fake:model"
     assert msg["models"] == [{"spec": "fake:model", "source": "configured", "context_window": 32768}]
     assert msg["notes"] == ["a note"]
+    feeder.close()
+    thread.join(timeout=5)
+
+
+def test_serve_think_list(monkeypatch, tmp_path):
+    """bare /think emits a think_list event with the modes and current mode,
+    mirroring bare /model's model_list — the TUI renders the picker and
+    answers with '/think <mode>'."""
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [])
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/think"})
+    msg = out.wait_for("think_list")
+    # no mode set on a fresh session → None (Ollama's auto/default behavior)
+    assert msg["current"] is None
+    assert msg["modes"] == ["off", "low", "medium", "high", "max"]
+    feeder.close()
+    thread.join(timeout=5)
+
+
+def test_serve_think_mode_falls_through_to_state(monkeypatch, tmp_path):
+    """/think <mode> falls through to the generic _command path (which calls
+    _cmd_think -> _set_think_mode) and emits a state event carrying the updated
+    think_mode, same as /model <spec> does."""
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [])
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/think medium"})
+    # the generic path prints "thinking: medium" then emits state
+    cmd = out.wait_for("command_output")
+    assert "medium" in cmd["text"]
+    state = out.wait_for("state")
+    assert state["model"] == "fake:model"
+    assert state["think_mode"] == "medium"
+    feeder.close()
+    thread.join(timeout=5)
+
+
+def test_serve_think_off_maps_to_none_label(monkeypatch, tmp_path):
+    """`off` maps internally to reasoning_effort 'none' but the friendly label
+    round-trips: setting /think off reports think_mode 'off' in state."""
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [])
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/think off"})
+    out.wait_for("command_output")
+    state = out.wait_for("state")
+    assert state["think_mode"] == "off"
+    # a subsequent bare /think reports the friendly label, not the internal one
+    feeder.put({"type": "command", "line": "/think"})
+    msg = out.wait_for("think_list")
+    assert msg["current"] == "off"
     feeder.close()
     thread.join(timeout=5)
 

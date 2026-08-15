@@ -127,6 +127,31 @@ describe("apply", () => {
       .toEqual([["component", "running"], ["connect", "error"]]);
   });
 
+  it("turn_end token totals are the server's running total, re-seeded on a new ready", () => {
+    // an older server carries no totals at all — hold what we had (zero here),
+    // never flash a misleading reset
+    apply({ type: "turn_end", status: "done" });
+    expect(useSession.getState().totalIn).toBe(0);
+    expect(useSession.getState().totalOut).toBe(0);
+
+    apply({ type: "turn_end", status: "done", input_tokens: 100, output_tokens: 25 });
+    expect(useSession.getState().totalIn).toBe(100);
+    expect(useSession.getState().totalOut).toBe(25);
+
+    // a fresh ready is the session boundary: totals go back to zero
+    apply({ type: "ready", model: "m", kg: false, kg_ready: false, run_id: "r", repo: ".", skills: [] });
+    expect(useSession.getState().totalIn).toBe(0);
+    expect(useSession.getState().totalOut).toBe(0);
+
+    // a respawn re-seeds from the payload instead of showing 0 / 0
+    apply({
+      type: "ready", model: "m", kg: false, kg_ready: false, run_id: "r", repo: ".", skills: [],
+      input_tokens: 300, output_tokens: 40,
+    });
+    expect(useSession.getState().totalIn).toBe(300);
+    expect(useSession.getState().totalOut).toBe(40);
+  });
+
   it("a row still running when the turn closes is not left spinning forever", () => {
     // an interrupt, or a turn that died: the result never arrives, and a
     // permanent "···" would be the page lying about what the harness is doing

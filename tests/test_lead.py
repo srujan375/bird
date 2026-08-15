@@ -96,7 +96,7 @@ class CapturingClient:
     def __init__(self):
         self.seen = []
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         self.seen = list(messages)
         return LLMResponse(
             message=assistant(calls=[tc("done", {"summary": "ok"})]),
@@ -303,7 +303,7 @@ class ScriptClient:
     def __init__(self, script):
         self.script = list(script)
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         return LLMResponse(message=self.script.pop(0), usage=Usage(10, 5),
                            stop_reason="stop", model=spec.spec)
 
@@ -362,7 +362,7 @@ class RoutingClient:
     def __init__(self, lead, arch, code):
         self.q = {"lead": list(lead), "arch": list(arch), "code": list(code)}
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         names = {t.name for t in (tools or [])}
         if "brief" in names:
             key = "arch"

@@ -47,7 +47,7 @@ class FakeClient:
     def __init__(self, script):
         self.script = list(script)
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         msg = self.script.pop(0)
         if on_delta is not None and msg.content:
             on_delta(msg.content)
@@ -247,7 +247,7 @@ def test_interrupt_over_http(tmp_path):
             self.calls = 0
 
         def complete(self, spec, messages, tools=None, temperature=None,
-                     max_tokens=None, on_delta=None):
+                     max_tokens=None, on_delta=None, on_thinking=None):
             self.calls += 1
             assert release.wait(timeout=10)
             return LLMResponse(

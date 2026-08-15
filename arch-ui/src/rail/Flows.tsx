@@ -16,6 +16,7 @@ import { useEffect } from "react";
 import { useCanvas } from "../store/canvas";
 import { useSession } from "../store/session";
 import type { ArchState, Flow } from "../types";
+import { flowView } from "../views";
 
 /** §4: one step per 820ms. Slow enough to follow a hop, fast enough that a
  *  six-step flow does not outlast your attention. */
@@ -54,8 +55,11 @@ function FlowRow({ flow }: { flow: Flow }) {
   const step = useCanvas((s) => s.flowStep);
   const litFlow = useCanvas((s) => s.litFlow);
   const playFlow = useCanvas((s) => s.playFlow);
+  const setView = useCanvas((s) => s.setView);
+  const view = useCanvas((s) => s.view);
 
   const on = lit === flow.id;
+  const focused = view === flowView(flow.id);
   const isPlaying = playing === flow.id;
   const pct = isPlaying && flow.steps.length
     ? ((step + 1) / flow.steps.length) * 100
@@ -77,6 +81,18 @@ function FlowRow({ flow }: { flow: Flow }) {
           {isPlaying ? "■" : "▶"}
         </button>
         <span className="flow-name" title={flow.name}>{flow.name}</span>
+        {/* Lighting a flow shows it against everything else; opening it draws
+            it *as* a diagram, with nothing else on the canvas. The first
+            answers "where does this run?", the second "what is this?" — and
+            with seventeen boxes behind it, only the second is legible. */}
+        <button
+          className="flow-open"
+          data-on={focused}
+          title={focused ? "back to the whole design" : "open this flow as its own diagram"}
+          onClick={() => setView(focused ? null : flowView(flow.id))}
+        >
+          ◱
+        </button>
         <span className="mono flow-count">
           {flow.steps.length} step{flow.steps.length === 1 ? "" : "s"}
         </span>

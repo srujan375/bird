@@ -123,12 +123,19 @@ class Message:
     content: str | list[ContentPart] | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None  # set on role="tool" messages
+    # The reasoning trace of one assistant turn (Ollama thinking models).
+    # Display-only: carried in memory and persisted via to_dict/from_dict so a
+    # session survives /reload and provider swap, but NEVER emitted by
+    # to_openai() — the trace must never re-enter a model prompt as history.
+    thinking: str | None = None
 
     def to_openai(self) -> dict[str, Any]:
         # Multimodal messages carry content as a list of typed parts. The
         # main conversation path only ever uses string content; list content
         # is built solely by the read_image vision sidecar for its one-shot
         # call to the vision model and never reaches the transcript.
+        # NOTE: `thinking` is intentionally absent here — it is display-only
+        # and must never be sent back to the model as conversation history.
         if isinstance(self.content, list):
             wire_content = [p.to_openai() for p in self.content]
         else:
@@ -161,6 +168,11 @@ class Message:
             ]
         if self.tool_call_id is not None:
             d["tool_call_id"] = self.tool_call_id
+        # the reasoning trace round-trips through persistence (so /reload
+        # respawn and provider swap keep it) but never through the wire
+        # format — that asymmetry is the load-bearing invariant.
+        if self.thinking is not None:
+            d["thinking"] = self.thinking
         return d
 
     @classmethod
@@ -185,6 +197,8 @@ class Message:
                 for tc in d.get("tool_calls", [])
             ],
             tool_call_id=d.get("tool_call_id"),
+            # forward-tolerant: old sessions lack the key → None
+            thinking=d.get("thinking"),
         )
 
 

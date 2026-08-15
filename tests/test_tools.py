@@ -3,9 +3,19 @@ import json
 import pytest
 
 from bird.harnesses.code import code_harness_tools
-from bird.tools import BashTool, DoneTool, EditTool, LsTool, ReadImageTool, ReadTool, WriteTool
+from bird.tools import (
+    BashTool,
+    DoneTool,
+    EditTool,
+    GlobTool,
+    GrepTool,
+    LsTool,
+    ReadImageTool,
+    ReadTool,
+    WriteTool,
+)
 from bird.tools.base import ToolContext
-from bird.tools.bash import check_command, is_verification_command
+from bird.tools.bash import check_command, is_pure_search, is_verification_command
 
 
 class _StubBroker:
@@ -484,30 +494,67 @@ ALLOWED = [
     "python -m compileall src",
     "make check",
     "vitest run",
+    # package-manager installs: mutate node_modules/lockfile but contained to
+    # the repo and needed to set up before running tests
+    "npm install",
+    "npm ci",
+    "pnpm install",
+    "yarn install",
+    # any package.json script is the user's own, not arbitrary model code —
+    # the SCRIPT_PREFIXES filter was dropped so dev/start/deploy all run
+    "npm run dev",
+    "npm run start",
+    "npm run deploy",
+    # bare python on a script file: arbitrary code, but the harness already
+    # has edit/write tools that can write arbitrary code, so this removes
+    # friction without adding a new attack surface
+    "python script.py",
+    "python3 manage.py migrate",
+    "python src/app.py --flag",
+    # pip install: dep setup, mutates the environment but needed to run tests
+    "pip install requests",
+    "pip3 install -r requirements.txt",
+    # a runner prefix delegates, it does not widen: the inner command is judged
+    # — and since `python evil.py` is now allowed (bare script), so is this
+    "uv run python evil.py",
+    # activating a virtualenv: matched by path shape, so every layout works
+    "source .venv/bin/activate",
+    "source /Users/me/Workspace/bird/.venv/bin/activate",
+    ". venv/bin/activate",
+    "source env/bin/activate.fish",
+    "source .venv/Scripts/activate",
+    # the point of activating: the segments after it are checked as usual
+    "source .venv/bin/activate && pytest -q",
+    "source .venv/bin/activate && ruff check src/",
 ]
 
 REJECTED = [
     "rm -rf /",
     "git push origin main",
     "git commit -m x",
-    "python evil.py",
-    'python -c "import os"',
+    'python -c "import os"',  # inline code with no file to audit
     "curl http://example.com",
     "echo hi > file.txt",
     "sed -i '' 's/a/b/' f.py",
-    "npm install leftpad",
-    "pip install requests",
     "ls && rm -rf /",  # every segment is checked, not just the first
     # a runner prefix delegates, it does not widen: the inner command is judged
-    "uv run python evil.py",
     "npx rimraf dist",
     "uv run bash -c 'rm -rf src'",
-    "npm run deploy",
+    # python -m stays restricted to the PYTHON_MODULE_ALLOW set
+    "python -m http.server",
     # find/xargs are search commands that can still delete or execute
     "find src -name '*.py' -delete",
     "find . -name '*.py' -exec rm {} ;",
     "find . -name '*.py' | xargs rm",
     "ls | xargs -n 1 rm -f",
+    # source is allowed for a venv activate script, not as a way to run a file
+    "source setup.sh",
+    ". ~/.bashrc",
+    "source ./bin/activate.sh",  # near-miss name
+    "source activate",  # no <dir>/ component to shape-check
+    "source .venv/lib/activate",  # right name, wrong directory
+    # and the rest of the line is still checked
+    "source .venv/bin/activate && rm -rf src",
 ]
 
 
@@ -539,6 +586,16 @@ def test_bash_per_harness_categories(ctx):
     assert check_command("pytest -q", ("search",)) is not None
     # linters stay behind the lint category; the test category doesn't grant them
     assert check_command("mypy src/", ("search", "test")) is not None
+    # activating a venv rides with the test category, not search
+    assert check_command("source .venv/bin/activate", ("search",)) is not None
+
+
+def test_venv_activate_never_runs_unprompted():
+    """`source` executes the file it is handed. Search-only commands skip the
+    permission prompt, so activation must not qualify — otherwise a model that
+    wrote .venv/bin/activate could run it without anyone being asked."""
+    assert not is_pure_search("source .venv/bin/activate")
+    assert not is_pure_search("source .venv/bin/activate && rg TODO src/")
 
 
 IS_VERIFICATION = [
@@ -690,7 +747,7 @@ SCHEMA_TOKEN_BUDGET = 1650
 
 def test_all_schemas_under_token_budget():
     tools = code_harness_tools(with_kg=True)
-    assert len(tools) == 12
+    assert len(tools) == 15
     wire = json.dumps([t.spec().to_openai() for t in tools])
     approx_tokens = len(wire) / 4
     assert approx_tokens < SCHEMA_TOKEN_BUDGET, (
@@ -702,7 +759,7 @@ def test_control_arm_has_no_kg_query():
     names = [t.name for t in code_harness_tools(with_kg=False)]
     assert "kg_query" not in names
     assert names == [
-        "read", "read_image", "ls", "edit", "write", "bash",
+        "read", "read_image", "ls", "grep", "glob", "edit", "write", "bash",
         "WebSearch", "WebFetch",
         "plan", "plan_update", "skill", "done",
     ]
@@ -714,7 +771,10 @@ def test_offline_control_arm_strips_web_too():
     assert "WebSearch" not in names
     assert "WebFetch" not in names
     assert "kg_query" not in names
-    assert names == ["read", "read_image", "ls", "edit", "write", "bash", "plan", "plan_update", "skill", "done"]
+    assert names == [
+        "read", "read_image", "ls", "grep", "glob", "edit", "write", "bash",
+        "plan", "plan_update", "skill", "done",
+    ]
 
 
 # --- ls ---
@@ -858,3 +918,86 @@ def test_ls_mounted_in_all_harnesses():
     assert "ls" in [t.name for t in code_harness_tools()]
     assert "ls" in [t.name for t in lead_harness_tools()]
     assert "ls" in [t.name for t in arch_harness_tools()]
+
+
+# --- grep / glob ---
+
+@pytest.fixture
+def search_repo(repo):
+    (repo / "src" / "auth.js").write_text(
+        "const API_KEY = process.env.API_KEY;\nfunction login() {}\n"
+    )
+    (repo / "src" / "mcp_server.js").write_text("// mcp entrypoint\n")
+    nm = repo / "node_modules" / "@scope" / "sdk"
+    nm.mkdir(parents=True)
+    (nm / "index.js").write_text("export class McpServer {}\nexport const VERSION='1';\n")
+    return repo
+
+
+def test_grep_finds_a_literal_and_reports_path_and_line(search_repo, ctx):
+    r = GrepTool().execute({"pattern": "API_KEY"}, ctx)
+    assert not r.is_error, r.output
+    assert "src/auth.js:1:" in r.output
+    assert r.details["matches"] == 1
+
+
+def test_grep_skips_generated_dirs_by_default_but_says_so(search_repo, ctx):
+    r = GrepTool().execute({"pattern": "McpServer"}, ctx)
+    assert r.details["matches"] == 0
+    assert "node_modules" in r.output  # the skip is disclosed, not silent
+
+
+def test_grep_searches_node_modules_when_the_path_names_it(search_repo, ctx):
+    """The KG excludes dependency sources, which is exactly why grep must
+    reach them — this is the only route to a dependency's API surface."""
+    r = GrepTool().execute(
+        {"pattern": "McpServer", "path": "node_modules/@scope/sdk"}, ctx
+    )
+    assert r.details["matches"] == 1
+    assert "index.js" in r.output
+
+
+def test_grep_glob_filters_by_filename(search_repo, ctx):
+    assert GrepTool().execute({"pattern": "login", "glob": "*.py"}, ctx).details["matches"] == 0
+    assert GrepTool().execute({"pattern": "login", "glob": "*.js"}, ctx).details["matches"] == 1
+
+
+def test_grep_literal_flag_escapes_regex_metacharacters(search_repo, ctx):
+    (search_repo / "src" / "cfg.js").write_text("const re = a.b(c);\n")
+    assert GrepTool().execute({"pattern": "a.b(c)", "literal": True}, ctx).details["matches"] == 1
+
+
+def test_grep_invalid_regex_says_how_to_search_for_it_literally(ctx):
+    r = GrepTool().execute({"pattern": "a(b"}, ctx)
+    assert r.is_error and "literal=true" in r.output
+
+
+def test_grep_files_only_returns_paths(search_repo, ctx):
+    r = GrepTool().execute({"pattern": "mcp", "files_only": True, "ignore_case": True}, ctx)
+    assert "src/mcp_server.js" in r.output
+
+
+def test_glob_finds_files_by_bare_name_pattern(search_repo, ctx):
+    """A bare '*mcp*' must match at any depth — models write it far more
+    often than the '**/' spelling, and the session that motivated this asked
+    the knowledge graph the same filename question five times."""
+    r = GlobTool().execute({"pattern": "*mcp*"}, ctx)
+    assert not r.is_error, r.output
+    assert "src/mcp_server.js" in r.output
+
+
+def test_glob_matches_a_full_relative_path_pattern(search_repo, ctx):
+    r = GlobTool().execute({"pattern": "src/*.js"}, ctx)
+    assert "src/auth.js" in r.output and "src/mcp_server.js" in r.output
+
+
+def test_glob_skips_generated_dirs_unless_named(search_repo, ctx):
+    assert GlobTool().execute({"pattern": "*.js"}, ctx).details["count"] == 2
+    r = GlobTool().execute({"pattern": "*.js", "path": "node_modules"}, ctx)
+    assert r.details["count"] == 1
+
+
+def test_search_tools_are_never_gated(search_repo, ctx):
+    # read-only by construction; they must not carry the permission flag
+    assert GrepTool().requires_permission is False
+    assert GlobTool().requires_permission is False

@@ -37,12 +37,42 @@ import contextlib
 import difflib
 import sys
 import threading
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from .tools import Tool, ToolContext, ToolResult
 
 DIFF_CONTEXT_LINES = 2
 MAX_DIFF_LINES = 40
+
+# ------------------------------------------------------------------- modes
+
+# The three-state approval mode. The default ("normal") asks for every
+# gated call; "auto_edits" auto-approves edit/write (and reads outside the
+# repo) but still asks for bash; "full_auto" additionally auto-approves bash.
+# The console broker and the TUI implement identical semantics against this
+# one reading of the truth — the TUI mirrors it in tui/src/components.ts.
+PermissionMode = Literal["normal", "auto_edits", "full_auto"]
+
+# Shift+Tab / 'A' cycle order.
+NEXT_MODE: dict[PermissionMode, PermissionMode] = {
+    "normal": "auto_edits",
+    "auto_edits": "full_auto",
+    "full_auto": "normal",
+}
+
+# The payload kinds each mode auto-approves. "offer" is NEVER covered: an
+# offer's answer IS the feedback string, so an auto-approved offer with no
+# feedback is a corrupted answer — offers stay manual in every mode.
+AUTO_MODES: dict[PermissionMode, frozenset[str]] = {
+    "normal": frozenset(),
+    "auto_edits": frozenset({"edit", "write", "read_outside_repo"}),
+    "full_auto": frozenset({"edit", "write", "read_outside_repo", "bash"}),
+}
+
+
+def auto_approves(mode: PermissionMode, payload: dict[str, Any]) -> bool:
+    """Does this mode auto-approve this payload without asking?"""
+    return payload.get("kind", "?") in AUTO_MODES[mode]
 
 
 class Broker(Protocol):
@@ -218,39 +248,97 @@ class DenyBroker:
 class ConsoleBroker:
     """Prompts on stdin for the plain REPL and headless-on-a-tty runs.
 
-    'a' turns on auto-approve for edits (edit/write) for the rest of the
-    session — the terminal equivalent of the TUI's Shift+Tab. bash keeps
-    asking either way: it can write anywhere, so auto-accepting *edits* must
-    not quietly auto-accept a shell that can do the same thing unobserved.
+    The approval mode is a three-state cycle (normal | auto_edits | full_auto),
+    the terminal equivalent of the TUI's Shift+Tab. 'a' turns on auto_edits
+    (edit/write/read_outside_repo auto-approved); 'A' escalates to full_auto,
+    which additionally auto-approves bash. The mode lives on this object, so a
+    sub-harness that forks the ToolContext and re-gates on the same broker
+    instance inherits it for free.
+
+    The default ("normal") never auto-accepts bash — bash can write anywhere,
+    so auto-accepting *edits* must not quietly auto-accept a shell that can do
+    the same thing unobserved. Full auto is explicit opt-in via 'A'.
     """
 
     def __init__(self, out=None, ask: Callable[[str], str] | None = None) -> None:
         self.out = out if out is not None else sys.stdout
         self.ask = ask if ask is not None else input
-        self.auto_edits = False
+        self.mode: PermissionMode = "normal"
+
+    # Back-compat view for existing tests and any reader of the attribute:
+    # the old boolean toggle is "auto_edits mode is on".
+    @property
+    def auto_edits(self) -> bool:
+        return self.mode == "auto_edits"
+
+    @auto_edits.setter
+    def auto_edits(self, value: bool) -> None:
+        self.mode = "auto_edits" if value else "normal"
 
     def request(self, payload: dict[str, Any]) -> tuple[bool, str]:
         kind = payload.get("kind", "?")
-        if self.auto_edits and kind in ("edit", "write"):
-            print(f"  ✓ auto-approved {kind} {payload.get('file', '')}", file=self.out)
+        # Check the mode's covered kinds FIRST — same position as the old
+        # auto_edits check, before the offer branch.
+        if self.mode != "normal" and auto_approves(self.mode, payload):
+            self._audit_auto(payload)
             return True, ""
         if kind == "offer":
             return self._offer(payload)
         self._render(payload)
         while True:
             try:
-                answer = self.ask("  approve? [y/N/a=auto-approve edits] ").strip().lower()
+                answer = self.ask(
+                    "  approve? [y/N/a=auto-edits/A=FULL AUTO] "
+                ).strip()
             except (EOFError, KeyboardInterrupt):
                 print(file=self.out)
                 return False, "the user interrupted the approval prompt"
-            if answer in ("y", "yes"):
+            # 'a' (auto-edits) and 'A' (full-auto) are case-sensitive — the
+            # distinction is the whole point — so pull them out before
+            # lowercasing the rest. Everything else (y/yes/n/no and their
+            # mixed-case variants) is matched case-insensitively.
+            if answer == "A":
+                self._enter_full_auto()
                 return True, ""
-            if answer in ("", "n", "no"):
-                return False, ""
             if answer == "a":
-                self.auto_edits = True
+                self.mode = "auto_edits"
                 return True, ""
-            print("  answer y, n, or a", file=self.out)
+            lowered = answer.lower()
+            if lowered in ("y", "yes"):
+                return True, ""
+            if lowered in ("", "n", "no"):
+                return False, ""
+            print("  answer y, n, a, or A", file=self.out)
+
+    def _enter_full_auto(self) -> None:
+        """Escalate to full auto: approve THIS request and flip the session.
+        Prints one loud warning line at escalation time naming what unlocks."""
+        self.mode = "full_auto"
+        print(
+            "  ⚠ FULL AUTO: bash now runs WITHOUT asking. "
+            "Shift+Tab (TUI) or restart to reset.",
+            file=self.out,
+        )
+
+    def _audit_auto(self, payload: dict[str, Any]) -> None:
+        """Every full-auto approval prints an auditable line so
+        execute-without-review leaves a visible trace."""
+        if self.mode != "full_auto":
+            print(
+                f"  ✓ auto-approved {payload.get('kind', '?')} "
+                f"{payload.get('file', payload.get('cmd', payload.get('path', '')))}",
+                file=self.out,
+            )
+            return
+        kind = payload.get("kind", "?")
+        if kind == "bash":
+            print(f"  ✓ ⚠ FULL AUTO ran bash: {payload.get('cmd', '')}", file=self.out)
+        else:
+            print(
+                f"  ✓ ⚠ FULL AUTO ran {kind} "
+                f"{payload.get('file', payload.get('path', ''))}",
+                file=self.out,
+            )
 
     def _offer(self, payload: dict[str, Any]) -> tuple[bool, str]:
         """A multiple-choice question, not an approval. The answer travels back

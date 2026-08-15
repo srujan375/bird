@@ -76,6 +76,44 @@ def test_set_default_without_file_is_session_only():
     assert reg.aliases["default"] == "fake:model"
 
 
+def test_set_think_mode_persists_and_round_trips(registry):
+    assert registry.set_think_mode("ollama:qwen2.5-coder:14b", "medium") is True
+    reloaded = Registry.load(registry.path)
+    assert reloaded.models["ollama:qwen2.5-coder:14b"]["reasoning_effort"] == "medium"
+    # resolve() populates spec.extra from leftover keys in the entry
+    spec = reloaded.resolve("ollama:qwen2.5-coder:14b")
+    assert spec.extra["reasoning_effort"] == "medium"
+    # untouched keys survive the rewrite
+    assert reloaded.aliases["judge"] == "openrouter:anthropic/claude-sonnet-5"
+
+
+def test_set_think_mode_creates_entry_for_unknown_model(registry):
+    """A model with no prior entry gets one with just the thinking mode."""
+    assert registry.set_think_mode("openrouter:some/new-model", "high") is True
+    reloaded = Registry.load(registry.path)
+    assert reloaded.models["openrouter:some/new-model"]["reasoning_effort"] == "high"
+    spec = reloaded.resolve("openrouter:some/new-model")
+    assert spec.extra["reasoning_effort"] == "high"
+
+
+def test_set_think_mode_none_removes_key(registry):
+    registry.set_think_mode("ollama:qwen2.5-coder:14b", "medium")
+    assert registry.set_think_mode("ollama:qwen2.5-coder:14b", None) is True
+    reloaded = Registry.load(registry.path)
+    assert "reasoning_effort" not in reloaded.models["ollama:qwen2.5-coder:14b"]
+    spec = reloaded.resolve("ollama:qwen2.5-coder:14b")
+    assert "reasoning_effort" not in spec.extra
+
+
+def test_set_think_mode_without_file_is_session_only():
+    reg = Registry(providers={}, models={}, aliases={})
+    assert reg.set_think_mode("fake:model", "medium") is False
+    assert reg.models["fake:model"]["reasoning_effort"] == "medium"
+    # clearing on an in-memory registry also returns False
+    assert reg.set_think_mode("fake:model", None) is False
+    assert "reasoning_effort" not in reg.models["fake:model"]
+
+
 def test_builtin_models_json_loads():
     # aliases are user-editable config: assert they resolve, not where they point
     reg = Registry.load()

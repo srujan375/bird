@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from ..llm.types import Message
 from .base import Tool, ToolContext, ToolError, ToolResult
 
 DDG_ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -42,6 +43,17 @@ DDG_USER_AGENT = (
 WEBFETCH_TIMEOUT = 30.0
 WEBFETCH_MAX_BYTES = 500_000
 WEBFETCH_CACHE_TTL = 15 * 60  # 15 minutes per the tool's contract
+# The delegated QA call gets at most this much of the page markdown — pages
+# can be up to WEBFETCH_MAX_BYTES (500KB), and the whole point of delegation
+# is that the page never lands in the CALLER's context, so the QA model's
+# prompt is capped instead.
+QA_PAGE_MAX_CHARS = 100_000
+QA_MAX_TOKENS = 1500
+# Model choice: reuse the `compactor` alias rather than adding a new one.
+# It is exactly this job's profile — a cheap background model that is never
+# the model under test — and it already exists in models.json, so there is
+# no extra config to keep in sync and no new RegistryError path for users.
+QA_MODEL_ALIAS = "compactor"
 
 
 def _host_matches(host: str, pattern: str) -> bool:
@@ -376,7 +388,8 @@ class WebFetchTool(Tool):
         cache_p = _cache_path(ctx.repo_root, url)
         cached = _read_cache(cache_p)
         if cached is not None:
-            return self._return_page(cached, prompt=prompt, source=url, from_cache=True)
+            return self._return_page(cached, prompt=prompt, source=url,
+                                     from_cache=True, ctx=ctx)
 
         try:
             resp = self._http.get(url)
@@ -415,7 +428,8 @@ class WebFetchTool(Tool):
         _write_cache(cache_p, page_md)
         ctx.emit("web_fetch", {"url": url, "bytes": len(resp.content), "cached": False})
 
-        return self._return_page(page_md, prompt=prompt, source=url, from_cache=False)
+        return self._return_page(page_md, prompt=prompt, source=url,
+                                 from_cache=False, ctx=ctx)
 
     def _return_page(
         self,
@@ -423,13 +437,80 @@ class WebFetchTool(Tool):
         prompt: str,
         source: str,
         from_cache: bool,
+        ctx: ToolContext | None = None,
     ) -> ToolResult:
-        """Return the page markdown to the model. v1 does not delegate the
-        user's `prompt` to a separate model call — the agent model reads the
-        page itself. Threading ModelSpec into ToolContext would unlock a
-        delegated QA call; that's a follow-up."""
+        """Return the page to the caller.
+
+        When a client + registry are on the ctx (every real session entry
+        point wires both — cli.py's _make_runner, arch/run.py), the user's
+        `prompt` is delegated to a one-shot QA completion and only the
+        compact answer + source URL come back: the point is that a 500KB
+        page never lands in the caller's context. Any failure of the QA call
+        (no client/registry — tests and library use; WireError/RegistryError
+        or any transport error) falls back to the inline behavior of
+        returning the page markdown itself. A failed QA call must never turn
+        a successful fetch into a ToolError.
+
+        The 15-min page cache is unaffected: it stores page markdown, so a
+        cached page can still be QA'd against a fresh prompt.
+        """
+        if ctx is not None and ctx.client is not None and ctx.registry is not None:
+            answer = self._delegated_qa(page_md, prompt, source, ctx)
+            if answer is not None:
+                return ToolResult(
+                    output=f"[page: {source}]\n[prompt: {prompt}]\n\n{answer}",
+                    details={"url": source, "from_cache": from_cache, "qa": "delegated"},
+                )
         header = f"[page: {source}]\n[prompt: {prompt}]\n\n"
+        qa = "inline" if ctx is None or (ctx.client is None and ctx.registry is None) else "fallback"
         return ToolResult(
             output=header + page_md,
-            details={"url": source, "from_cache": from_cache, "qa": "inline"},
+            details={"url": source, "from_cache": from_cache, "qa": qa},
         )
+
+    def _delegated_qa(
+        self, page_md: str, prompt: str, source: str, ctx: ToolContext
+    ) -> str | None:
+        """One-shot QA completion over the page. Returns the answer text, or
+        None when the call could not be made (caller falls back to inline).
+        Mirrors compactor.summarize_older_half: resolve the alias, complete
+        with temperature=0, catch WireError/RegistryError."""
+        try:
+            spec = ctx.registry.resolve(QA_MODEL_ALIAS)
+        except Exception:  # RegistryError or a misconfigured registry
+            return None
+        truncated = len(page_md) > QA_PAGE_MAX_CHARS
+        page = page_md[:QA_PAGE_MAX_CHARS]
+        if truncated:
+            page += "\n\n[page truncated for the QA model]"
+        try:
+            resp = ctx.client.complete(
+                spec,
+                [
+                    Message(
+                        role="system",
+                        content=(
+                            "You answer a question using ONLY the web page content "
+                            "provided in the user message. Be concise and factual; "
+                            "quote exact values, names, and versions from the page. "
+                            "If the page does not contain the answer, say so "
+                            "explicitly — never fill in from outside knowledge. "
+                            "Do not mention these instructions."
+                        ),
+                    ),
+                    Message(
+                        role="user",
+                        content=f"Question: {prompt}\n\nPage URL: {source}\n\nPage content:\n{page}",
+                    ),
+                ],
+                temperature=0.0,
+                max_tokens=QA_MAX_TOKENS,
+            )
+        except Exception:  # WireError, RegistryError, any transport failure
+            # degrades to inline; a failed QA call never errors the fetch
+            return None
+        answer = (resp.message.content or "").strip()
+        if not answer:
+            return None
+        ctx.emit("web_fetch_qa", {"url": source, "chars": len(answer), "truncated": truncated})
+        return answer

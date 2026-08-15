@@ -205,6 +205,8 @@ def test_webfetch_happy_path_html_to_md(ctx, repo):
     assert "[page: https://example.com/page]" in r.output
     assert "[prompt: summarize this]" in r.output
     assert r.details["from_cache"] is False
+    # no client/registry on this ctx → the inline path, exactly as before
+    assert r.details["qa"] == "inline"
     # cache file is written on first call
     cache_file = repo / ".bird" / "cache" / "webfetch"
     assert cache_file.is_dir()
@@ -292,6 +294,187 @@ def test_webfetch_cross_host_redirect_surfaces(ctx):
     assert r.is_error
     assert "Cross-host redirect" in r.output
     assert "other-host.example" in r.output
+
+
+# ---------- WebFetch delegated QA ----------
+
+class _FakeQAClient:
+    """Stands in for OpenAICompatClient.complete() in the delegated-QA path.
+    Same shape as _FakeVisionClient in test_tools.py."""
+
+    def __init__(self, answer="The page says: 42", error=None):
+        self._answer = answer
+        self._error = error
+        self.calls = []
+
+    def complete(self, spec, messages, tools=None, **kw):
+        self.calls.append({"spec": spec, "messages": messages, "kw": kw})
+        if self._error is not None:
+            raise self._error
+        from bird.llm.types import LLMResponse, Message, Usage
+        return LLMResponse(
+            message=Message(role="assistant", content=self._answer),
+            usage=Usage(),
+            stop_reason="stop",
+            model=spec.spec,
+        )
+
+
+class _FakeQARegistry:
+    def __init__(self, spec_str="ollama:gemma4:31b"):
+        from bird.llm.registry import ModelSpec, ProviderConfig
+        self._spec = ModelSpec(
+            spec=spec_str,
+            provider=ProviderConfig(name="ollama", base_url="http://x"),
+            model=spec_str.split(":", 1)[1],
+        )
+
+    def resolve(self, name):
+        if name != "compactor":
+            from bird.llm.registry import RegistryError
+            raise RegistryError(f"no alias {name}")
+        return self._spec
+
+
+def _qa_ctx(repo, client, registry):
+    events = []
+    c = ToolContext(
+        repo_root=repo,
+        record=lambda t, d: events.append((t, d)),
+        client=client,
+        registry=registry,
+    )
+    c.events = events
+    return c
+
+
+def _ok_page_handler():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text=FETCH_HTML,
+        )
+    return handler
+
+
+def test_webfetch_delegated_qa_returns_answer_not_page(ctx, repo):
+    """With client+registry on the ctx, the caller gets the compact QA
+    answer, not the whole page markdown."""
+    client = _FakeQAClient(answer="The heading is 'Heading' and the body greets the world.")
+    qctx = _qa_ctx(repo, client=client, registry=_FakeQARegistry())
+    tool = WebFetchTool(http_client=_mock_client(_ok_page_handler()))
+    r = tool.execute({"url": "https://example.com/page", "prompt": "what does it say?"}, qctx)
+
+    assert not r.is_error
+    assert r.details["qa"] == "delegated"
+    # the answer is there; the raw page markdown is NOT in the caller's output
+    assert "The heading is 'Heading'" in r.output
+    assert "Hello world" not in r.output
+    # source URL and prompt framing are preserved
+    assert "[page: https://example.com/page]" in r.output
+    assert "[prompt: what does it say?]" in r.output
+    # the QA call used the compactor alias, temperature 0, no tools
+    call = client.calls[0]
+    assert call["spec"].spec == "ollama:gemma4:31b"
+    assert call["kw"].get("temperature") == 0.0
+    assert call["kw"].get("max_tokens") is not None
+    # system prompt says answer from the page only; user message carries the page
+    assert call["messages"][0].role == "system"
+    assert "ONLY" in call["messages"][0].content
+    assert call["messages"][1].role == "user"
+    assert "what does it say?" in call["messages"][1].content
+    assert "Heading" in call["messages"][1].content
+
+
+def test_webfetch_delegated_qa_truncates_huge_page(ctx, repo):
+    """A page near WEBFETCH_MAX_BYTES is capped before it goes to the QA model."""
+    from bird.tools.web import QA_PAGE_MAX_CHARS
+
+    huge = "word " * 60_000  # ~300KB of markdown
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=huge)  # no content-type → passthrough
+
+    client = _FakeQAClient(answer="summary")
+    qctx = _qa_ctx(repo, client=client, registry=_FakeQARegistry())
+    tool = WebFetchTool(http_client=_mock_client(handler))
+    r = tool.execute({"url": "https://example.com/big", "prompt": "q"}, qctx)
+
+    assert not r.is_error
+    assert r.details["qa"] == "delegated"
+    sent_page = client.calls[0]["messages"][1].content
+    assert len(sent_page) < len(huge)
+    assert "[page truncated for the QA model]" in sent_page
+    assert sent_page.count("word") <= QA_PAGE_MAX_CHARS // 4 + 10
+
+
+def test_webfetch_wire_error_falls_back_to_inline(ctx, repo):
+    """A failed QA call must never turn a successful fetch into an error:
+    WireError from the client degrades to the inline page markdown."""
+    from bird.llm.wire.openai_compat import WireError
+
+    client = _FakeQAClient(error=WireError("connection refused"))
+    qctx = _qa_ctx(repo, client=client, registry=_FakeQARegistry())
+    tool = WebFetchTool(http_client=_mock_client(_ok_page_handler()))
+    r = tool.execute({"url": "https://example.com/page", "prompt": "q"}, qctx)
+
+    assert not r.is_error
+    assert r.details["qa"] == "fallback"
+    # the full page markdown came back, as before delegation existed
+    assert "Heading" in r.output
+    assert "Hello world" in r.output
+    assert len(client.calls) == 1  # the QA call was attempted exactly once
+
+
+def test_webfetch_registry_error_falls_back_to_inline(ctx, repo):
+    """A missing/misconfigured compactor alias degrades to inline too."""
+    from bird.llm.registry import RegistryError
+
+    class _NoCompactorRegistry:
+        def resolve(self, name):
+            raise RegistryError(f"no alias {name}")
+
+    client = _FakeQAClient()
+    qctx = _qa_ctx(repo, client=client, registry=_NoCompactorRegistry())
+    tool = WebFetchTool(http_client=_mock_client(_ok_page_handler()))
+    r = tool.execute({"url": "https://example.com/page", "prompt": "q"}, qctx)
+
+    assert not r.is_error
+    assert r.details["qa"] == "fallback"
+    assert "Heading" in r.output
+    assert client.calls == []  # resolve failed → complete never called
+
+
+def test_webfetch_qa_runs_on_cached_page(ctx, repo):
+    """The cache stores page markdown, so a cached page is still QA'd
+    against a fresh prompt (and the second prompt's answer is what returns)."""
+    client = _FakeQAClient(answer="first answer")
+    qctx = _qa_ctx(repo, client=client, registry=_FakeQARegistry())
+    tool = WebFetchTool(http_client=_mock_client(_ok_page_handler()))
+    url = "https://example.com/cached-qa"
+
+    r1 = tool.execute({"url": url, "prompt": "q1"}, qctx)
+    assert r1.details["from_cache"] is False
+    assert r1.details["qa"] == "delegated"
+    assert "first answer" in r1.output
+
+    client._answer = "second answer"
+    r2 = tool.execute({"url": url, "prompt": "q2"}, qctx)
+    assert r2.details["from_cache"] is True
+    assert r2.details["qa"] == "delegated"
+    assert "second answer" in r2.output
+    assert "q2" in client.calls[1]["messages"][1].content
+    assert len(client.calls) == 2
+
+
+def test_webfetch_inline_ctx_records_inline_path(ctx, repo):
+    """The existing no-client ctx (tests, library use) records qa=inline."""
+    tool = WebFetchTool(http_client=_mock_client(_ok_page_handler()))
+    r = tool.execute({"url": "https://example.com/page", "prompt": "q"}, ctx)
+    assert not r.is_error
+    assert r.details["qa"] == "inline"
+    assert "Heading" in r.output
 
 
 # ---------- schema / wiring smoke ----------

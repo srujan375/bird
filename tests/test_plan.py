@@ -22,7 +22,7 @@ class FakeClient:
         self.script = list(script)
         self.requests = []  # message lists as seen at each completion
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
         self.requests.append(list(messages))
         msg = self.script.pop(0)
         return LLMResponse(message=msg, usage=Usage(100, 10), stop_reason="stop", model=spec.spec)

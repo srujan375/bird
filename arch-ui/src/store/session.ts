@@ -37,6 +37,12 @@ interface SessionState {
   turnNo: number;
   turnTools: number;
   turnTokens: number;
+  /** Server truth for the composer's cumulative spend: every token this
+   *  session consumed across the arch runner, its dispatches and the critic.
+   *  The server owns the tally — turn_end carries the running total, we just
+   *  display it. Zeroed (or re-seeded) on each fresh `ready`. */
+  totalIn: number;
+  totalOut: number;
   /**
    * Ids present in the *first* arch_state of this page load.
    *
@@ -46,6 +52,16 @@ interface SessionState {
    * already-in instead.
    */
   bornWith: Record<string, true>;
+  /**
+   * Bumped every time the user says something — typed, tapped or dismissed.
+   *
+   * The transcript alone cannot carry this: the column only follows the stream
+   * while you are already near the bottom, and an answer you gave while reading
+   * back through the turn would land off-screen. Acting is the one event that
+   * should always drag the view to your own words, so it is a signal of its own
+   * rather than something Chat infers from the tail of the log.
+   */
+  acted: number;
   /** Concern ids the critic has already been credited with in the transcript.
    *  The critic never sends a message of its own — it files a Concern and the
    *  state push is the only trace — so its voice is derived, and derived
@@ -116,13 +132,24 @@ export const useSession = create<SessionState>((set, get) => ({
   turnNo: 0,
   turnTools: 0,
   turnTokens: 0,
+  totalIn: 0,
+  totalOut: 0,
   bornWith: {},
   announced: {},
+  acted: 0,
 
   apply: (ev) => {
     switch (ev.type) {
       case "ready":
-        set((s) => ({ ready: ev, conn: s.conn === "complete" ? "complete" : "connected" }));
+        // ready is the session boundary for token accounting too: a respawn
+        // re-seeds the cumulative spend from the payload, a fresh connect
+        // starts from zero (absent field means both look the same).
+        set((s) => ({
+          ready: ev,
+          conn: s.conn === "complete" ? "complete" : "connected",
+          totalIn: ev.input_tokens ?? 0,
+          totalOut: ev.output_tokens ?? 0,
+        }));
         break;
 
       case "arch_state": {
@@ -278,7 +305,16 @@ export const useSession = create<SessionState>((set, get) => ({
             const item = next[i];
             if (item.t === "tool" && item.status === "running") next[i] = { ...item, status: "ok" };
           }
-          return { running: false, stream: null, transcript: next };
+          return {
+            running: false,
+            stream: null,
+            transcript: next,
+            // Server truth for the cumulative totals: what the session spent
+            // so far (the server already folded in dispatches and the judge).
+            // Absent only from an older server — keep the last known values.
+            totalIn: ev.input_tokens ?? s.totalIn,
+            totalOut: ev.output_tokens ?? s.totalOut,
+          };
         });
         break;
 
@@ -401,14 +437,49 @@ export function sendInput(text: string): void {
   // whichever bucket the user would have rounded it into.
   if (permission?.kind === "offer") return respondToGate(true, trimmed);
   if (permission) return respondToGate(false, trimmed);
-  useSession.setState({ running: true });
+  // No echo here: a plain message *does* start a turn, and the harness's
+  // `run_start` carries the text back — with any image path already rewritten
+  // to the copy it saved, which is the version worth showing.
+  useSession.setState((s) => ({ running: true, acted: s.acted + 1 }));
   void post("/input", { text: trimmed });
 }
 
+/**
+ * Answer a gate or an offer — and say so in the transcript.
+ *
+ * The echo happens here rather than being left to the `run_start` echo that
+ * covers an ordinary message, because a gate answer does not start a turn: it
+ * unblocks a tool call inside the turn already running, so no `run_start` ever
+ * arrives. Without this the chat column was the one surface that did not know
+ * you had spoken — the answer reached the model, the brief and the questions
+ * list, and your own words appeared nowhere in your own conversation.
+ *
+ * A tapped option and a typed answer are the same thing on the wire and are
+ * echoed the same way; the options are a shortcut, not a different act.
+ *
+ * An answer with no text is a dismissal, and lands as a notice rather than an
+ * empty bubble: "I don't know yet" is a real answer to an offer, and approving
+ * a gate without comment is a real ruling. Both belong on the record.
+ */
 export function respondToGate(approved: boolean, feedback = ""): void {
   const req = useSession.getState().permission;
   if (!req) return;
-  useSession.setState({ permission: null, running: true });
+  const at = Date.now();
+  const echo: TranscriptItem = feedback
+    ? { t: "user", text: feedback, at }
+    : {
+        t: "notice",
+        at,
+        text:
+          req.kind === "offer" ? "— dismissed the question" :
+          approved ? "— approved" : "— requested changes",
+      };
+  useSession.setState((s) => ({
+    permission: null,
+    running: true,
+    transcript: [...s.transcript, echo],
+    acted: s.acted + 1,
+  }));
   void post("/permission", { id: req.id, approved, feedback });
 }
 
