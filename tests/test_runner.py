@@ -234,6 +234,137 @@ def test_system_prompt_grounds_repo_root(make_runner, repo):
     assert "f.py" in system.content  # shallow-tree fallback when no KG
 
 
+# --- project-level custom instructions (.bird/instructions.md / CLAUDE.md) ---
+
+def _system_prompt(make_runner, repo):
+    """Run a trivial task and return the assembled system prompt string."""
+    r = make_runner([assistant(calls=[tc("done", {"summary": "ok"})])])
+    result = r.run("go")
+    return result.messages[0].content
+
+
+def test_bird_instructions_injected(make_runner, repo):
+    (repo / ".bird").mkdir()
+    (repo / ".bird" / "instructions.md").write_text("PROJECT-RULE: use tabs not spaces")
+    prompt = _system_prompt(make_runner, repo)
+    assert "PROJECT-RULE: use tabs not spaces" in prompt
+
+
+def test_claude_md_injected_when_no_bird_instructions(make_runner, repo):
+    (repo / "CLAUDE.md").write_text("PROJECT-RULE: prefer composition over inheritance")
+    prompt = _system_prompt(make_runner, repo)
+    assert "PROJECT-RULE: prefer composition over inheritance" in prompt
+
+
+def test_bird_instructions_takes_precedence_over_claude_md(make_runner, repo):
+    (repo / ".bird").mkdir()
+    (repo / ".bird" / "instructions.md").write_text("BIRD-WINS")
+    (repo / "CLAUDE.md").write_text("CLAUDE-LOSES")
+    prompt = _system_prompt(make_runner, repo)
+    assert "BIRD-WINS" in prompt
+    assert "CLAUDE-LOSES" not in prompt
+
+
+def test_no_project_instructions_leaves_prompt_unchanged(make_runner, repo):
+    prompt = _system_prompt(make_runner, repo)
+    # no extra blank part is added — the harness instructions and repo-root
+    # block are still present, and there's no stray double-newline artifact
+    assert "Repository root:" in prompt
+    assert str(repo) in prompt
+
+
+def test_project_instructions_truncated_past_8kb(make_runner, repo):
+    (repo / "CLAUDE.md").write_text("X" * 9000)
+    prompt = _system_prompt(make_runner, repo)
+    assert "[project instructions truncated — file exceeded 8KB limit]" in prompt
+    # the body is capped near 8KB, not the full 9000 chars
+    assert prompt.count("X") < 9000
+
+
+def test_project_instructions_after_harness_before_repo_root(make_runner, repo):
+    (repo / "CLAUDE.md").write_text("PROJECT-MARKER")
+    prompt = _system_prompt(make_runner, repo)
+    harness_idx = prompt.index("All tool paths are relative to this root.")
+    # the harness instructions block ends just before the project marker block;
+    # the project marker must come before the repo-root notice
+    project_idx = prompt.index("PROJECT-MARKER")
+    repo_root_idx = prompt.index("Repository root:")
+    assert project_idx < harness_idx
+    assert project_idx < repo_root_idx
+
+
+# --- @path import resolution in project instructions ---
+
+def test_import_inlines_claude_md(make_runner, repo):
+    (repo / ".bird").mkdir()
+    (repo / ".bird" / "instructions.md").write_text("Top.\n@CLAUDE.md\nBottom.\n")
+    (repo / "CLAUDE.md").write_text("IMPORTED-RULE: prefer composition")
+    prompt = _system_prompt(make_runner, repo)
+    assert "Top." in prompt
+    assert "Bottom." in prompt
+    assert "IMPORTED-RULE: prefer composition" in prompt
+    # the @CLAUDE.md directive line itself is gone, replaced by the content
+    assert "@CLAUDE.md" not in prompt
+
+
+def test_import_resolves_nested_path_relative_to_repo_root(make_runner, repo):
+    (repo / ".bird").mkdir()
+    (repo / "docs").mkdir()
+    (repo / ".bird" / "instructions.md").write_text("Intro\n@docs/standards.md\n")
+    (repo / "docs" / "standards.md").write_text("STANDARD: no tabs in markdown")
+    prompt = _system_prompt(make_runner, repo)
+    assert "STANDARD: no tabs in markdown" in prompt
+    assert "@docs/standards.md" not in prompt
+
+
+def test_import_missing_file_replaced_with_comment(make_runner, repo):
+    (repo / ".bird").mkdir()
+    (repo / ".bird" / "instructions.md").write_text("Intro\n@does/not/exist.md\nOutro\n")
+    prompt = _system_prompt(make_runner, repo)
+    assert "<!-- import not found: @does/not/exist.md -->" in prompt
+    assert "@does/not/exist.md" not in prompt.replace(
+        "<!-- import not found: @does/not/exist.md -->", ""
+    )
+    # no crash — the surrounding text is still present
+    assert "Intro" in prompt
+    assert "Outro" in prompt
+
+
+def test_import_pushing_over_8kb_is_truncated(make_runner, repo):
+    (repo / ".bird").mkdir()
+    # the top-level file is small, but the imported file is huge — the cap
+    # applies AFTER import resolution, so the combined content is truncated
+    (repo / ".bird" / "instructions.md").write_text("header\n@big.md\n")
+    (repo / "big.md").write_text("Y" * 9000)
+    prompt = _system_prompt(make_runner, repo)
+    assert "[project instructions truncated — file exceeded 8KB limit]" in prompt
+    assert prompt.count("Y") < 9000
+
+
+def test_import_is_one_level_only(make_runner, repo):
+    (repo / ".bird").mkdir()
+    # the imported file contains its own @line — it must NOT be resolved
+    (repo / ".bird" / "instructions.md").write_text("Start\n@inner.md\n")
+    (repo / "inner.md").write_text("INNER-TEXT\n@unresolved.md\n")
+    prompt = _system_prompt(make_runner, repo)
+    assert "INNER-TEXT" in prompt
+    # the nested @line survives as literal text (one level only)
+    assert "@unresolved.md" in prompt
+    assert "<!-- import not found: @unresolved.md -->" not in prompt
+
+
+def test_inline_at_in_prose_is_not_an_import(make_runner, repo):
+    (repo / ".bird").mkdir()
+    (repo / ".bird" / "instructions.md").write_text(
+        "see @CLAUDE.md for details\n"
+    )
+    (repo / "CLAUDE.md").write_text("SHOULD-NOT-APPEAR")
+    prompt = _system_prompt(make_runner, repo)
+    # the prose line is left untouched; the @CLAUDE.md file is NOT inlined
+    assert "see @CLAUDE.md for details" in prompt
+    assert "SHOULD-NOT-APPEAR" not in prompt
+
+
 class StubKG:
     """Duck-typed ctx.kg: always ready, answers every query."""
 

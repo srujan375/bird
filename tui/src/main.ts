@@ -599,6 +599,24 @@ tui.addInputListener((data) => {
 	// auto_edits → full_auto → normal. Works in any focus state because it's a
 	// global listener that runs before the focused component. Returns
 	// consume:true so the editor never sees the chord.
+	// While the autocomplete dropdown is open, Enter should complete the
+	// selected item (like Tab) instead of submitting. The Editor's own
+	// handleInput treats Enter on a slash-command completion as "apply then
+	// fall through to submit", which submits the partial `/re` before the
+	// user can continue typing their prompt. Intercept Enter here — before
+	// the editor sees it — and route it through the Tab-completion path,
+	// which applies the completion and returns without submitting. The user
+	// then types their prompt and presses Enter again (with the dropdown
+	// closed) to submit.
+	if (
+		editor.focused &&
+		editor.isShowingAutocomplete() &&
+		matchesKey(data, Key.enter)
+	) {
+		editor.handleInput("\t");
+		tui.requestRender();
+		return { consume: true };
+	}
 	if (matchesKey(data, Key.shift("tab"))) {
 		const mode = hint.cycleMode();
 		const notice =

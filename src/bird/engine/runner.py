@@ -9,6 +9,7 @@ compaction trigger, and the "KG now available" injection (decision #9).
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +86,63 @@ def _is_drift_search(command: str) -> bool:
     if head in DRIFT_SEARCH_COMMANDS:
         return True
     return head == "git" and len(tokens) > 1 and tokens[1] == "grep"
+
+
+PROJECT_INSTRUCTIONS_LIMIT = 8192  # ~8KB cap on a project-level instructions file
+PROJECT_INSTRUCTIONS_TRUNCATION_NOTICE = (
+    "\n\n[project instructions truncated — file exceeded 8KB limit]"
+)
+
+
+def _resolve_imports(text: str, repo_root: Path) -> str:
+    """Inline `@path` import directives (one level only, no recursion).
+
+    A line that is *entirely* an import directive — matching `^@(.+)$` — names
+    a file relative to `repo_root`. The file's raw text replaces the `@` line.
+    A missing file becomes a `<!-- import not found: @path -->` comment so the
+    user can debug. `@` references inside an imported file are NOT resolved
+    (one level only — keeps I/O bounded and avoids recursion). Inline `@`
+    mentions in prose ("see @CLAUDE.md for details") are left untouched: only
+    a line that is wholly `@path` is an import.
+    """
+    directive = re.compile(r"^@(.+)$")
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        # only a line that is *entirely* `@path` (no trailing prose, no leading
+        # whitespace) is an import; rstrip the newline before matching
+        m = directive.match(line.rstrip("\r\n"))
+        if not m:
+            out.append(line)
+            continue
+        rel = m.group(1).strip()
+        target = (repo_root / rel).resolve()
+        if target.is_file():
+            try:
+                out.append(target.read_text(encoding="utf-8"))
+            except OSError:
+                out.append(f"<!-- import not found: @{rel} -->")
+        else:
+            out.append(f"<!-- import not found: @{rel} -->")
+    return "".join(out)
+
+
+def _load_project_instructions(repo_root: Path) -> str:
+    """Project-level custom instructions (like CLAUDE.md), injected into every
+    harness's system prompt. First-match-wins at the repo root only — no parent
+    walking, no user-level files. Returns the file contents (with `@path`
+    imports inlined, then truncated past the 8KB cap with a notice) or "" if
+    neither file exists."""
+    for name in (".bird/instructions.md", "CLAUDE.md"):
+        path = repo_root / name
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            text = _resolve_imports(text, repo_root)
+            if len(text.encode("utf-8")) > PROJECT_INSTRUCTIONS_LIMIT:
+                text = text.encode("utf-8")[:PROJECT_INSTRUCTIONS_LIMIT].decode(
+                    "utf-8", errors="ignore"
+                ) + PROJECT_INSTRUCTIONS_TRUNCATION_NOTICE
+            return text
+    return ""
 
 
 def _shallow_tree(root: Path, max_entries: int = 40) -> str:
@@ -225,6 +283,7 @@ class Runner:
         where /testbed-style hallucinations come from)."""
         parts = [
             self.instructions_path.read_text(encoding="utf-8"),
+            _load_project_instructions(self.ctx.repo_root),
             f"Repository root: {self.ctx.repo_root}\n"
             "All tool paths are relative to this root.",
         ]
