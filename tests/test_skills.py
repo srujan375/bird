@@ -20,6 +20,22 @@ def _write_skill(d: Path, name: str, description: str, body: str) -> Path:
     return p
 
 
+def _write_claude_skill(skills_dir: Path, subdir: str, frontmatter: str, body: str) -> Path:
+    """Write a Claude Code-style skill at `<skills_dir>/<subdir>/SKILL.md`.
+
+    `frontmatter` is the raw YAML block (without the surrounding `---` lines).
+    Pass an empty string for a skill with no front-matter at all.
+    """
+    sub = skills_dir / subdir
+    sub.mkdir(parents=True, exist_ok=True)
+    p = sub / "SKILL.md"
+    if frontmatter:
+        p.write_text(f"---\n{frontmatter}\n---\n\n{body}", encoding="utf-8")
+    else:
+        p.write_text(body, encoding="utf-8")
+    return p
+
+
 # --- loader: parsing ---
 
 def test_parse_skill_front_matter(tmp_path):
@@ -123,6 +139,183 @@ def test_project_overrides_builtin(tmp_path):
     sk = next(s for s in skills if s.name == "skill-creator")
     assert sk.source == "project"
     assert sk.body == "my version"
+
+
+# --- loader: Claude Code-format skills (.claude/skills/<name>/SKILL.md) ---
+
+def test_claude_skill_yaml_frontmatter(tmp_path):
+    """A Claude-style skill with YAML front-matter is discovered and loaded —
+    name/description come from front-matter, body is the markdown after the
+    closing `---`."""
+    d = tmp_path / ".claude" / "skills"
+    _write_claude_skill(
+        d, "my-skill",
+        "name: my-skill\ndescription: Does the thing",
+        "# Skill body here\n\nDo the work.",
+    )
+    skills = [s for s in load_skills(tmp_path) if s.source == "project"]
+    assert len(skills) == 1
+    sk = skills[0]
+    assert sk.name == "my-skill"
+    assert sk.description == "Does the thing"
+    assert sk.body == "# Skill body here\n\nDo the work."
+    assert sk.source == "project"
+
+
+def test_claude_skill_no_name_field(tmp_path):
+    """A Claude skill with YAML front-matter but no `name` field — name comes
+    from the subdirectory name."""
+    d = tmp_path / ".claude" / "skills"
+    _write_claude_skill(
+        d, "from-dir",
+        "description: has a description but no name",
+        "Body only.",
+    )
+    skills = [s for s in load_skills(tmp_path) if s.source == "project"]
+    assert len(skills) == 1
+    assert skills[0].name == "from-dir"
+    assert skills[0].description == "has a description but no name"
+    assert skills[0].body == "Body only."
+
+
+def test_claude_skill_extra_frontmatter_fields(tmp_path):
+    """A Claude skill with extra front-matter fields (license, compatibility,
+    allowed-tools) is parsed without error; those fields are ignored."""
+    d = tmp_path / ".claude" / "skills"
+    _write_claude_skill(
+        d, "extra-fields",
+        "name: extra-fields\ndescription: has extras\nlicense: MIT\n"
+        "compatibility: '>=1.0'\nallowed-tools: Read, Grep\nmetadata: foo",
+        "Body.",
+    )
+    skills = [s for s in load_skills(tmp_path) if s.source == "project"]
+    assert len(skills) == 1
+    sk = skills[0]
+    assert sk.name == "extra-fields"
+    assert sk.description == "has extras"
+    assert sk.body == "Body."
+
+
+def test_claude_skill_no_description(tmp_path):
+    """A Claude skill with YAML front-matter but no `description` — empty
+    string description (same as bird-native behavior)."""
+    d = tmp_path / ".claude" / "skills"
+    _write_claude_skill(
+        d, "no-desc",
+        "name: no-desc",
+        "Body.",
+    )
+    skills = [s for s in load_skills(tmp_path) if s.source == "project"]
+    assert len(skills) == 1
+    assert skills[0].name == "no-desc"
+    assert skills[0].description == ""
+    assert skills[0].body == "Body."
+
+
+def test_claude_skill_no_frontmatter(tmp_path):
+    """A Claude skill with no front-matter at all (just markdown body) — name
+    from the subdirectory, body is the whole file."""
+    d = tmp_path / ".claude" / "skills"
+    _write_claude_skill(
+        d, "bare-claude",
+        "",
+        "Just a body, no front-matter.",
+    )
+    skills = [s for s in load_skills(tmp_path) if s.source == "project"]
+    assert len(skills) == 1
+    assert skills[0].name == "bare-claude"
+    assert skills[0].body == "Just a body, no front-matter."
+
+
+def test_claude_skill_subdir_without_skill_md_skipped(tmp_path):
+    """A `.claude/skills/` subdirectory without a SKILL.md is skipped
+    silently."""
+    d = tmp_path / ".claude" / "skills"
+    d.mkdir(parents=True)
+    (d / "no-skill-md").mkdir()
+    # an unrelated file in the subdir, no SKILL.md
+    (d / "no-skill-md" / "README.md").write_text("not a skill", encoding="utf-8")
+    skills = [s for s in load_skills(tmp_path) if s.source == "project"]
+    assert len(skills) == 0
+
+
+def test_claude_skills_dir_with_no_subdirs(tmp_path):
+    """A `.claude/skills/` directory that exists but has no subdirectories →
+    empty list, no error."""
+    d = tmp_path / ".claude" / "skills"
+    d.mkdir(parents=True)
+    skills = [s for s in load_skills(tmp_path) if s.source == "project"]
+    assert len(skills) == 0
+
+
+def test_bird_native_overrides_claude_same_name(tmp_path):
+    """Bird-native skill takes precedence over a Claude skill with the same
+    name (`.bird/skills/research.md` wins over `.claude/skills/research/SKILL.md`)."""
+    _write_skill(tmp_path / ".bird" / "skills", "research", "bird version", "bird body")
+    _write_claude_skill(
+        tmp_path / ".claude" / "skills", "research",
+        "name: research\ndescription: claude version",
+        "claude body",
+    )
+    skills = load_skills(tmp_path)
+    by_name = {s.name: s for s in skills}
+    assert "research" in by_name
+    assert by_name["research"].source == "project"
+    assert by_name["research"].body == "bird body"
+    # only one research skill (dedup kept the first)
+    assert sum(1 for s in skills if s.name == "research") == 1
+
+
+def test_user_claude_skills_loaded(tmp_path, monkeypatch):
+    """User-level Claude skills from `~/.claude/skills/*/SKILL.md` are loaded."""
+    user_claude = tmp_path / "home" / ".claude" / "skills"
+    _write_claude_skill(
+        user_claude, "user-claude",
+        "name: user-claude\ndescription: from user claude",
+        "user claude body",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    skills = load_skills(tmp_path)
+    by_name = {s.name: s for s in skills}
+    assert "user-claude" in by_name
+    assert by_name["user-claude"].source == "user"
+    assert by_name["user-claude"].body == "user claude body"
+
+
+def test_project_claude_overrides_user_claude_same_name(tmp_path, monkeypatch):
+    """Project Claude skill takes precedence over a user Claude skill with the
+    same name."""
+    _write_claude_skill(
+        tmp_path / ".claude" / "skills", "shared",
+        "name: shared\ndescription: project claude",
+        "project claude body",
+    )
+    user_claude = tmp_path / "home" / ".claude" / "skills"
+    _write_claude_skill(
+        user_claude, "shared",
+        "name: shared\ndescription: user claude",
+        "user claude body",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    skills = load_skills(tmp_path)
+    by_name = {s.name: s for s in skills}
+    assert by_name["shared"].source == "project"
+    assert by_name["shared"].body == "project claude body"
+    assert sum(1 for s in skills if s.name == "shared") == 1
+
+
+def test_bird_native_and_claude_coexist(tmp_path):
+    """Different names from bird-native and Claude skills all appear."""
+    _write_skill(tmp_path / ".bird" / "skills", "bird-only", "b", "bird body")
+    _write_claude_skill(
+        tmp_path / ".claude" / "skills", "claude-only",
+        "name: claude-only\ndescription: c",
+        "claude body",
+    )
+    skills = load_skills(tmp_path)
+    names = {s.name for s in skills}
+    assert "bird-only" in names
+    assert "claude-only" in names
 
 
 # --- render_index ---
