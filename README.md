@@ -1,145 +1,90 @@
-# bird: a multi-harness coding agent
+# bird: a coding agent with an architecture workbench
 
-A coding agent built for **small open models**. Instead of one giant prompt and a
-grep loop, `bird` gives the model a **knowledge graph of your repo** to ask
-questions of, and splits the work across **specialized harnesses**: a
-conversational lead, an architect that designs on a live canvas, and a coder that
-edits the repo, all running on one shared engine.
+A coding agent for **small open models**, built around an **architecture
+Workbench**: a live browser canvas where the model designs the system with you,
+a second model argues against that design while it's being drawn, and the
+finished thing hands itself to the coder as a machine-readable bundle.
 
-It runs against local Ollama models, Ollama Cloud, or anything on OpenRouter, and
-you can swap the model mid-conversation without losing the conversation.
+Underneath it is one engine — a conversational lead that routes, the architect at
+the canvas, and a coder that edits the repo. It runs against local Ollama models,
+Ollama Cloud, or anything on OpenRouter, and you can swap the model
+mid-conversation without losing the conversation.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/multi-harness-dark.png">
-  <img alt="bird: lead talks, routes and dispatches to arch (designs the system on a live canvas) and code (edits, tests, verifies the repo); arch hands a bundle to code" src="assets/multi-harness-light.png" width="900">
-</picture>
+<img alt="the bird arch canvas: eight components wired with labelled edges on the left, a flows rail in the middle, and the architect's tool-call log on the right, with three objection stickies pinned over the canvas" src="assets/arch-canvas.png" width="900">
 
-*one engine · one toolbox · knowledge graph · permissions · skills*
+<sub>`bird arch` designing bird's own thinking-trace support: components and their
+edges on the left, flows in the middle, the architect's tool calls on the right.
+All of it is typed state the model mutates through tools — the page only renders
+what the tools recorded.</sub>
+
+*design first · one engine · one toolbox · knowledge graph · permissions · skills*
 
 ---
 
 ## Why we built it
 
-**Small models don't fail at writing code. They fail at finding it.**
+**Agentic coding made writing code cheap. It did not make deciding what to build
+cheap.**
 
-Give a 9-20B model a repo and a `grep` tool and it will spend most of its context
-window wandering: search, read the wrong file, search again, read a 600-line
-module for one function. By the time it knows where to make the change, the
-window is full and the plan is gone. The bottleneck isn't reasoning. It's
-*context acquisition*.
+When a model can produce a working module in a minute, the cost of a bad decision
+goes *up*, not down. A wrong boundary, a missing failure path, a field
+denormalized in the direction that defeats a retry — all of it now gets built at
+full speed, across a dozen files, before anyone reads a diff. Generation was
+never the expensive part of software. Agents made the cheap part cheaper and left
+the expensive part exactly where it was.
 
-So the bet behind `bird` is: **stop making the model explore, and answer it
-instead.**
+So the leverage moves upstream, to the questions an agent is worst at asking
+itself: what are the components, how do they talk, what happens when one of them
+is down, and which trade-offs did we take deliberately rather than by accident.
+`bird` treats that as a first-class mode of work — `bird arch` is a harness with
+its own tools, its own canvas and its own critic, not a paragraph pasted above a
+coding prompt.
 
-- **A knowledge graph, not a grep loop.** The repo is extracted into a graph
-  (`graphify`) using pure AST, with no LLM and no API keys. `kg_query` answers
-  "where is login handled?" with the node, the file, the line, and the
-  neighbourhood around it. One call instead of nine.
-- **Deterministic where it can be.** Query expansion is tokenize → split
-  camelCase → singularize → fuzzy-match against the graph's own vocabulary →
-  IDF-rank. No LLM in the retrieval path, so it's reproducible, free, and works
-  offline. A miss returns the nearest real vocabulary terms so a small model can
-  correct itself.
-- **Provable, not asserted.** Every run can be repeated with `--no-kg`, a
-  control arm with the graph tool removed and nothing else changed. If the
-  context engine doesn't help, the numbers say so.
+- **Architecture is a mode, not a preamble.** `bird arch` opens a live canvas and
+  designs *with* you, recording each decision as you take it alongside the
+  alternatives you rejected, so the reasoning outlives the conversation that
+  produced it.
+- **A second model argues with the first.** A background critic reviews the
+  architect's design on its own thread every turn and files objections of its
+  own — typed, carrying a severity, and hard to lose: open blockers surface at the
+  finalize gate instead of quietly yielding to the last thing anyone said.
+  Agreement is the failure mode here. One model asked to both design and review
+  its own work will approve it, at length, in confident prose.
+- **A design is an artifact, not scrollback.** Finalizing writes a bundle *and*
+  seeds the knowledge graph with a node per component, entity and endpoint, so
+  `bird code` starts able to query a system that doesn't exist yet — and so the
+  trade-offs are still legible six weeks later.
+- **One mode per job.** Designing a system, deciding what to build, and editing
+  files are different jobs with different tools and different failure modes.
+  Cramming them into one prompt makes all three worse, so each is a *harness*
+  with its own instructions, toolset and engine tuning, sharing one runner.
 - **The engine does the babysitting.** Small models loop, restate plans, respond
   with prose when a tool call was needed, and forget to stop. Those are engine
   features, not prompt pleading: validation retries with helpful errors,
   same-call loop detection, explore-without-acting nudges, a pinned plan tracker,
   automatic compaction at 90% of the window, and an explicit `done` tool.
-- **One mode per job.** Designing a system, deciding what to build, and editing
-  files are different jobs with different tools and different failure modes.
-  Cramming them into one prompt makes all three worse, so each is a *harness*
-  with its own instructions, toolset and engine tuning, sharing one runner.
 - **Nothing edits your repo without you.** Every mutating tool is gated at
   construction time, so gating covers the CLI, the TUI, *and* any sub-session a
   harness dispatches. `bash` is allowlisted to read-only search, tests, linters
   and git reads. Anything else is refused loudly and logged.
+- **Context you can query, and switch off.** The repo is extracted into a graph
+  (`graphify`) by pure AST, with no LLM and no API keys, and `kg_query` answers
+  "where is login handled?" with the node, the file, the line and the
+  neighbourhood around it. Expansion is tokenize → split camelCase → singularize →
+  fuzzy-match against the graph's own vocabulary → IDF-rank, so retrieval is
+  reproducible, free and offline. Whether that beats plain `read` and `grep` for
+  the *agent* is a separate question, and `--no-kg` is the control arm that
+  answers it — see [the numbers](#the-numbers).
 
 ---
 
-## Install
+## The Workbench *(`bird arch`)*
 
-```bash
-git clone <this repo> && cd bird
-python3 -m venv .venv && .venv/bin/pip3 install -e '.[dev]'
-```
-
-That gives you `.venv/bin/bird`, which runs from any directory without
-activating anything, because its shebang is absolute. To get `bird` on your `PATH`
-everywhere, either symlink it (`ln -s "$PWD/.venv/bin/bird" ~/.local/bin/bird`)
-or install with [pipx](https://pipx.pypa.io), which manages the venv for you:
-
-```bash
-pipx install .              # from a clone
-pipx install git+<this repo>
-```
-
-Don't `pip3 install` without a venv: on Homebrew or system Python that fails
-with `externally-managed-environment` (PEP 668), and `--break-system-packages`
-"fixes" it by writing bird's dependencies into an interpreter your OS owns.
-
-Requires Python 3.11+, plus at least one model source:
-
-| Source | Setup |
-|---|---|
-| **Ollama Cloud** *(what the shipped `models.json` points at)* | `OLLAMA_API_KEY` |
-| **OpenRouter** | `OPENROUTER_API_KEY` |
-| **Local Ollama** | `ollama serve`, then set the `ollama` provider's `native_url` to `http://localhost:11434` in `models.json`. Missing models are pulled on demand |
-
-Put keys in a `.env` at the repo root. It's loaded automatically.
-
-Optional frontends (both work without them, both are one `npm install`):
-
-```bash
-cd tui      && npm install    # full-screen terminal UI
-cd arch-ui  && npm install    # only needed to rebuild the architecture canvas
-```
-
----
-
-## Quick start
-
-```bash
-cd /path/to/your/project
-
-bird                                       # talk to the lead, the front door
-bird lead "add rate limiting to the API"   # one-shot: it routes and builds
-bird code "fix the failing test in tests/test_pricing.py"
-bird arch "design a job queue for this service"   # opens the canvas
-```
-
-The first run builds the knowledge graph **in the background**, so the harness
-starts immediately. Until the graph is ready, `kg_query` tells the model to fallyy
-back to bash search, and the runner injects a notice the moment the graph comes
-online.
-
----
-
-## The harnesses
-
-Three ship today; two more are in progress.
-
-### `lead`, the front door *(bare `bird`)*
-
-The conversational layer. It answers questions, explores the repo, researches the
-web, and decides each turn whether to reply or to **dispatch**.
-
-It deliberately has **no edit, write, or bash tools**. Every code change routes
-through a dispatched `code` session, so "the agent quietly changed something
-while answering a question" is structurally impossible.
-
-| The ask | What it does |
-|---|---|
-| A question, explanation, or exploration | reads / queries / researches, then answers in plain text |
-| A new feature or non-trivial structural work | `architect` → (user approves) → `code` |
-| A localized change or bug fix | `code` directly |
-
-### `arch`, architecture on a live canvas *(`bird arch`)*
-
-Opens a browser page and designs *with* you. The model mutates typed state; the
-page renders it. The conversation is the work; the tools are the memory.
+The model mutates typed state; the page renders it. Nothing is drawn by hand and
+nothing is a picture of the design — the canvas **is** the design, and every box,
+edge, decision and objection on it got there through a tool call that was
+validated, logged, and can be replayed. The conversation is the work; the tools
+are the memory.
 
 - **Two layers, both always open.** A loose **sketch** layer (`variant`, `node`,
   `link`, `splice`, `depth`) for napkin thinking, and a **design** layer
@@ -167,6 +112,162 @@ page renders it. The conversation is the work; the tools are the memory.
 bird arch "design a multi-tenant billing service"
 bird code "build it" --from-arch latest      # or let the lead do both
 ```
+
+<img alt="the critic, running deepseek-v4-flash, files an objection about emitted[0] being set on the first reasoning chunk; the architect replies 'You're right' and revises the design" src="assets/arch-critic.png" width="900">
+
+<sub>`bird arch` reviewing its own design. The critic — on its own model, here
+`deepseek-v4-flash` — files objections against the architect's work, and each one
+is accepted or overruled on the record rather than silently dropped. The architect
+conceded this one.</sub>
+
+---
+
+## The numbers
+
+One task, three trials: a one-token defect in a private 830-file JavaScript repo,
+two module hops from the test that catches it. `bird` on glm-5.2, against Claude
+Code on Sonnet, against bird's own `--no-kg` control arm.
+
+| Metric | bird glm-5.2 | bird `--no-kg` | Claude Code Sonnet |
+|---|---:|---:|---:|
+| Task solved | 3 / 3 | 3 / 3 | 2 / 2 |
+| Retrieval latency | <1 ms | 7.2 s | n/a |
+| Tool calls to the fix | 5 | 6 | 6.5 |
+| **Context at the fix** | **7,847** | **5,693** | **57,577** |
+| Total tool calls | 22 | 21 | 8 |
+| Wall time | 51 s | 48 s | 37 s |
+| Cost per run | ~$0 | ~$0 | $0.36 |
+
+<sub>Medians per run · one task · n=3, and n=2 for the Claude Code arm.</sub>
+
+The row that matters is context at the fix. `bird` gets there carrying **7,847
+tokens where Claude Code carries 57,577** — same defect found, same tests green,
+at roughly nothing per run against $0.36. Most of a small model's budget goes to
+the harness it's running inside; the point of this one is to hand that budget back
+to the task.
+
+**That's the harness, not the graph.** The `--no-kg` arm is leaner still at 5,693
+and solves the task just as often. On this task the knowledge graph bought
+sub-millisecond retrieval and one fewer tool call, and paid about 2,150 tokens of
+context for it. It did not make the agent better, and we're not going to claim it
+did before a control arm says so — which is exactly why `--no-kg` ships and why
+its column is in this table.
+
+We think we know where that 2,150 goes: `kg_query` traverses up to
+`MAX_RESULT_NODES = 60` and truncates to a `budget * 4` char cap, so an answer
+costs about 2,000 tokens whether the question needed sixty nodes or three. The
+open experiment is to drop the default budget by an order of magnitude and re-run
+the same three arms — one variable, and the first version where the graph has a
+real shot at winning its column.
+
+One task on a repo we can't publish is a signal, not a benchmark. A public
+large-repo task pinned to a git SHA is the next thing to build here. In the
+meantime the flag is on your machine: run any task both ways and see what you get.
+
+---
+
+## Install
+
+```bash
+git clone https://github.com/srujan375/bird.git && cd bird
+python3 -m venv .venv && .venv/bin/pip3 install -e '.[dev]'
+```
+
+That gives you `.venv/bin/bird`, which runs from any directory without
+activating anything, because its shebang is absolute. To get `bird` on your `PATH`
+everywhere, either symlink it (`ln -s "$PWD/.venv/bin/bird" ~/.local/bin/bird`)
+or install with [pipx](https://pipx.pypa.io), which manages the venv for you:
+
+```bash
+pipx install .              # from a clone
+pipx install git+https://github.com/srujan375/bird.git
+```
+
+Don't `pip3 install` without a venv: on Homebrew or system Python that fails
+with `externally-managed-environment` (PEP 668), and `--break-system-packages`
+"fixes" it by writing bird's dependencies into an interpreter your OS owns.
+
+Requires Python 3.11+, plus at least one model source:
+
+| Source | Setup |
+|---|---|
+| **Ollama Cloud** *(what the shipped `models.json` points at)* | `OLLAMA_API_KEY` |
+| **OpenRouter** | `OPENROUTER_API_KEY` |
+| **Local Ollama** | `ollama serve`, then set the `ollama` provider's `native_url` to `http://localhost:11434` in `models.json`. Missing models are pulled on demand |
+
+Put keys in a `.env` at the repo root. It's loaded automatically.
+
+Optional frontends (both work without them, both are one `npm install`):
+
+```bash
+cd tui      && npm install    # full-screen terminal UI
+cd arch-ui  && npm install    # only needed to rebuild the architecture canvas
+```
+
+**What to actually run it on.** Any tool-calling model in `models.json` should
+work, and `/model` swaps between them mid-conversation. These are the ones with
+real hours on them:
+
+| Role | Run on | Notes |
+|---|---|---|
+| `default` — the `code` loop | `qwen3.8:27b` today; `ornith` (9B) and `ornith:35b` before it | where most of the mileage is |
+| `architect` — `bird arch` | `qwen3.8:27b` today; `glm-5.2` before it | `glm-5.2` is the arm measured in [the numbers](#the-numbers) |
+| `judge` — the critic | `deepseek-v4-flash` | deliberately *not* the architect's model, so it reads the design cold |
+| `compactor` | `gemma4:31b` | only ever summarizes a transcript; it never sees a task |
+| `kg` | `kimi-k2.7-code` | reads docs and papers into the graph. No code reaches it — extraction there is pure AST — so a cheap mid-tier model is the right call |
+
+A 9B model is enough for the `code` loop on localized work. The architect is the
+role that rewards a bigger model, because it is the one doing the reasoning the
+rest of the system is built to protect.
+
+---
+
+## Quick start
+
+```bash
+cd /path/to/your/project
+
+bird                                       # talk to the lead, the front door
+bird lead "add rate limiting to the API"   # one-shot: it routes and builds
+bird code "fix the failing test in tests/test_pricing.py"
+bird arch "design a job queue for this service"   # opens the canvas
+```
+
+The first run builds the knowledge graph **in the background**, so the harness
+starts immediately. Until the graph is ready, `kg_query` tells the model to fall
+back to bash search, and the runner injects a notice the moment the graph comes
+online.
+
+---
+
+## The harnesses
+
+Three ship today; two more are in progress. The Workbench above is one of them.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/multi-harness-dark.png">
+  <img alt="bird: lead talks, routes and dispatches to arch (designs the system on a live canvas) and code (edits, tests, verifies the repo); arch hands a bundle to code" src="assets/multi-harness-light.png" width="900">
+</picture>
+
+### `lead`, the front door *(bare `bird`)*
+
+The conversational layer. It answers questions, explores the repo, researches the
+web, and decides each turn whether to reply or to **dispatch**.
+
+It deliberately has **no edit, write, or bash tools**. Every code change routes
+through a dispatched `code` session, so "the agent quietly changed something
+while answering a question" is structurally impossible.
+
+| The ask | What it does |
+|---|---|
+| A question, explanation, or exploration | reads / queries / researches, then answers in plain text |
+| A new feature or non-trivial structural work | `architect` → (user approves) → `code` |
+| A localized change or bug fix | `code` directly |
+
+### `arch`, the architect *(`bird arch`)*
+
+The Workbench harness, [above](#the-workbench-bird-arch). It is the only one that
+opens a browser page, and the only one whose output is a design rather than a diff.
 
 ### `code`, the builder *(`bird code`, `bird chat`)*
 
@@ -265,14 +366,18 @@ bird serve [--harness code|lead]      # JSON-lines bridge over stdio
 **Flags**, shared by `code` / `chat` / `lead` / `serve` / `arch`:
 `--repo <path>` · `--model <alias|provider:model>` · `--max-turns N` ·
 `--resume <run-id>` · `--models-json <path>` · `--no-kg` (control arm: drop the
-graph tool). Then `-y/--yes` (auto-approve, for unattended `code`/`lead` runs) ·
-`--tui` / `--plain` (interactive surface) · `--from-arch <run-id|latest>` ·
-`--no-open` (arch, headless). `kg` takes only `--repo` and `--budget`.
+graph tool) · `--no-web` (drop `web_search` / `web_fetch`, for a network-free
+run). Then `-y/--yes` (auto-approve, for unattended `code`/`lead` runs) ·
+`--tui` / `--plain` (interactive surface) · `--from-arch <run-id|latest>`.
+`arch` adds `--no-open` / `--headless`, plus `--no-critic` and `--judge-model
+<spec>` to control the background critic. `kg` takes `--repo`, `--budget` and
+`--models-json`.
 
 **Slash commands** (REPL and TUI):
 
 ```
-/help  /model [spec|filter]  /kg status|build|update|query  /tools  /skills
+/help  /model [spec|filter]  /think [off|low|medium|high|max]
+/kg status|build|update|query  /tools  /skills
 /compact  /clear  /reload  /session  /sessions [filter]  /continue <id>
 /rename <name>  /quit          plus /<skill-name> for any loaded skill
 ```
@@ -333,7 +438,6 @@ src/bird/
 
 tui/        terminal UI (TypeScript, pi-tui)
 arch-ui/    architecture Workbench (React + Vite), built into harnesses/arch/static/
-docs/       arch-state-schema.md · arch-ui-features.md · arch-remaining-work.md
 ```
 
 The engine knows no harness by name. `harnesses/registry.py` is the only module
@@ -346,12 +450,9 @@ the same permission gate as its parent.
 ## Development
 
 ```bash
-.venv/bin/pytest -q                  # 462 tests
-cd arch-ui && npm run check          # tsc + 42 vitest tests
+.venv/bin/pytest -q                  # 747 tests
+cd arch-ui && npm run check          # tsc + 109 vitest tests
 cd tui     && npm run check          # tsc
-
-python3 scripts/arch_devserver.py    # the real arch stack, scripted model;
-                                     # for working on the Workbench page
 ```
 
 The Workbench build output in `src/bird/harnesses/arch/static/` **is committed on
@@ -370,10 +471,8 @@ tools it reaches for.
 ## Status
 
 The engine, the three harnesses, the context engine, permissions, skills,
-sessions and both frontends are built and tested. What's left, mostly Workbench
-polish, is tracked in `docs/arch-remaining-work.md`. The architecture state
-contract lives in `docs/arch-state-schema.md`; the page's behaviour in
-`docs/arch-ui-features.md`.
+sessions and both frontends are built and tested. What's left is mostly
+Workbench polish.
 
 ### Coming soon
 
@@ -395,3 +494,9 @@ and skills for free.
 Contributions and issues are welcome. The harness registry
 (`src/bird/harnesses/registry.py`) is the extension point if you want to build
 your own.
+
+---
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
