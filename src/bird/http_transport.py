@@ -8,6 +8,7 @@ Carries the same event vocabulary as StdioTransport, over HTTP on localhost:
   POST /permission  → {"id": n, "approved": bool, "feedback": "optional"}
   POST /interrupt   → {}
   POST /mutate      → {"op": ..., ...} — a UI edit; 200 {"ok": true} or 400
+  POST /board       → {} — send what the user drew; starts a turn
                       {"ok": false, "error": ...}. The resulting state arrives
                       on /events like every other change, so the reply carries
                       only the verdict.
@@ -30,6 +31,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 REPLAY_LIMIT = 500  # transcript events kept for refresh replay
+# A page can only select one box today; this bounds a malformed client,
+# not the UI.
+MAX_SUBJECTS = 8
 SSE_PING_SECONDS = 15.0
 BUFFERED_TYPES = {"harness_event", "turn_end", "error"}
 LINGER_POLL_SECONDS = 0.5
@@ -163,7 +167,11 @@ class HttpTransport:
                 replay.append(self._ready)
             replay.extend(self._buffer)
             if self._arch_state is not None:
-                replay.append(self._arch_state)
+                # Stamped so the page can tell "this design was already here when
+                # I opened" from "this just arrived". A refresh mid-session
+                # delivers the whole board at once, and a page that animates it
+                # claims eleven boxes were created a moment ago.
+                replay.append({**self._arch_state, "replayed": True})
             if self._pending_perm is not None:
                 replay.append(self._pending_perm)
             q: queue.Queue = queue.Queue()
@@ -259,7 +267,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._respond(400, {"error": f"bad JSON: {e}"})
             return
         if self.path == "/input":
-            handlers.on_user_input(str(payload.get("text", "")))
+            # `subjects` is what the page had selected. It arrives over HTTP,
+            # so nothing but this bounds its shape — the session decides what
+            # the ids mean and drops the ones it cannot resolve.
+            raw = payload.get("subjects")
+            subjects = [str(s) for s in raw][:MAX_SUBJECTS] if isinstance(raw, list) else []
+            handlers.on_user_input(str(payload.get("text", "")), subjects)
         elif self.path == "/permission":
             self._transport._resolve_pending_perm()
             handlers.on_permission(
@@ -269,6 +282,17 @@ class _RequestHandler(BaseHTTPRequestHandler):
             )
         elif self.path == "/interrupt":
             handlers.on_interrupt()
+        elif self.path == "/board":
+            # "send what I drew". Deliberately an explicit act: inferring it
+            # from a pause spends a model call on an unfinished thought and
+            # asks the architect to respond to something the user had not
+            # finished saying. getattr, like /mutate: not every embedder
+            # serves it.
+            on_submit = getattr(handlers, "on_board_submit", None)
+            if on_submit is None:
+                self._respond(404, {"error": "not found"})
+                return
+            on_submit()
         elif self.path == "/mutate":
             # getattr, not a hard call: a transport shouldn't require every
             # embedder's Handlers to grow a method for a route it never serves

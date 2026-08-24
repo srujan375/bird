@@ -43,6 +43,7 @@ import io
 import json
 import sys
 import threading
+from collections.abc import Sequence
 from typing import Any, Callable, Protocol
 
 from .attachments import ingest_images
@@ -72,11 +73,12 @@ class _Interrupted(Exception):
 class Handlers(Protocol):
     """What a transport delivers inbound messages to (implemented by Server)."""
 
-    def on_user_input(self, text: str) -> None: ...
+    def on_user_input(self, text: str, subjects: Sequence[str] = ()) -> None: ...
     def on_permission(self, req_id: int, approved: bool, feedback: str) -> None: ...
     def on_interrupt(self) -> None: ...
     def on_command(self, line: str) -> bool | None: ...
     def on_mutate(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def on_board_submit(self) -> None: ...
 
 
 class Transport(Protocol):
@@ -159,9 +161,9 @@ class Server:
         # runs. A Server's own runner contributes nothing here — its per-turn
         # usage lands in every turn_end carried by `_start_turn` — but the
         # harnesses it spawns mid-turn report themselves: the lead's `code`
-        # fork pushes its RunResult deltas, and the arch judge pushes each
-        # critique, via a `usage_notify` record event (they know about this
-        # total because the fork carries it — see harnesses/lead/tools.py).
+        # fork pushes its RunResult deltas via a `usage_notify` record event
+        # (it knows about this total because the fork carries it — see
+        # harnesses/lead/tools.py).
         self.usage = Usage()
 
         # tee harness events to the UI; honor interrupts between events
@@ -240,10 +242,6 @@ class Server:
             # fires at 90% of this, so the denominator has to be on screen
             # before it does rather than explained after the fact
             "context_window": repl.runner.spec.context_window,
-            # the critic is a *different* model, and the transcript names it:
-            # "the architect changed its mind" and "a second model disagrees"
-            # are different events and must not look the same
-            "judge_model": self._alias_spec(repl, "judge"),
             "kg": repl.kg is not None,
             "kg_ready": bool(repl.kg and repl.kg.is_ready()),
             "run_id": repl.run_id,
@@ -279,8 +277,49 @@ class Server:
 
     # ---- inbound handlers (the Handlers protocol) ----
 
-    def on_user_input(self, text: str) -> None:
-        self._start_turn(self._ingest(text))
+    def on_user_input(self, text: str, subjects: Sequence[str] = ()) -> None:
+        # Anything drawn since the last turn travels with what was typed: they
+        # are one message, and splitting them into two turns would have the
+        # architect answer half of it at a time.
+        #
+        # `subjects` is what the page had selected when Send was pressed. It
+        # goes in ahead of the words so "why this one?" arrives already knowing
+        # which one — the selection is the page's, and a question that leans on
+        # it is unanswerable without it.
+        drawn = self._board_edits()
+        pointed = self._board_focus(subjects)
+        typed = self._ingest(text)
+        parts = [p for p in (drawn, pointed, typed) if p]
+        self._start_turn("\n\n".join(parts))
+
+    def on_board_submit(self) -> None:
+        """Send what the user drew, because they said to.
+
+        Drawing is talking, but only the user knows when they have finished a
+        sentence. Inferring it from a pause spends a model call on an
+        unfinished thought and gets an answer to something nobody had finished
+        saying — so this happens when they ask for it, and not before.
+        """
+        if self.worker and self.worker.is_alive():
+            self._emit("error", message="a turn is already running")
+            return
+        prompt = self._board_edits()
+        if prompt:
+            self._start_turn(prompt)
+
+    def _board_edits(self) -> str | None:
+        """What the user has drawn that the architect has not been shown."""
+        arch = getattr(self.repl.runner.ctx, "arch", None)
+        return getattr(arch, "compose_activity_prompt", lambda: None)()
+
+    def _board_focus(self, subjects: Sequence[str]) -> str | None:
+        """What the user had selected, described. getattr like _board_edits:
+        a harness with no board has nothing to point at."""
+        if not subjects:
+            return None
+        arch = getattr(self.repl.runner.ctx, "arch", None)
+        describe = getattr(arch, "describe_subjects", None)
+        return describe(subjects) if describe is not None else None
 
     def on_permission(self, req_id: int, approved: bool, feedback: str) -> None:
         self.broker.resolve(req_id, approved, feedback)
@@ -354,7 +393,7 @@ class Server:
                     self.repl.recorder.run_dir,
                 )
                 # What this turn actually spent, session-cumulative. Mid-turn
-                # sessions (the lead's dispatches, the arch judge) already
+                # sessions (the lead's dispatches) already
                 # pushed their deltas onto server.usage while the loop was
                 # running — the remainder, if any, is this runner's own loop.
                 self.usage = self.usage + result.usage

@@ -2,7 +2,7 @@
 
 Specs are `provider:model` strings (split on the FIRST colon only — Ollama
 model names themselves contain colons, e.g. `ollama:qwen2.5-coder:14b`).
-Aliases (`default`, `judge`, `compactor`) resolve to full specs. Unknown but
+Aliases (`default`, `architect`, `compactor`) resolve to full specs. Unknown but
 well-formed specs resolve with conservative defaults so a user can point at
 any OpenRouter/Ollama model without editing models.json first.
 """

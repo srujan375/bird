@@ -1,275 +1,200 @@
-"""POST /mutate — the page editing the architecture.
+"""User edits from the page, applied through the architect's own code paths.
 
-The whole point of the endpoint is that a user edit and a model edit are the
-same edit: same validation, same amendment trail, same state push. These pin
-that, plus the refusals — because an optimistic client is only safe to write if
-the server actually says no.
+The contract: an edit made on the canvas lands in the same `_upsert_node` the
+model's tools call, so validation and the state push cannot diverge between
+"the architect renamed this" and "the person reading it renamed this".
 """
 
-import json
-import threading
+from __future__ import annotations
 
 import pytest
 
-from bird.harnesses.arch.mutate import MutationError, apply_mutation
+from bird.harnesses.arch.mutate import EDITABLE_NODE_FIELDS, MutationError, apply_mutation
 from bird.harnesses.arch.session import ArchSession
-from bird.harnesses.arch.state import ArchState, Component, Concern, Connection, Flow, FlowStep
-from bird.harnesses.arch.tools import ComponentTool
-from bird.tools import ToolContext
-
-from .test_arch_e2e import Page, build_stack
+from bird.harnesses.arch.state import Approach, ArchState, Node
 
 
-def make_session(**kw):
-    events = []
-    session = ArchSession(state=ArchState(), on_state=events.append, **kw)
-    state = session.state
-    state.phase = "propose"
-    state.components["gw"] = Component(id="gw", name="gateway", kind="gateway",
-                                       responsibility="http entry", trace=["shorten urls"])
-    state.components["db"] = Component(id="db", name="url-db", kind="store",
-                                       responsibility="mappings", trace=["shorten urls"],
-                                       data_owned="short->long")
-    state.connections.append(Connection(src="gw", dst="db", label="lookup", kind="sync"))
-    state.flows.append(Flow(id="shorten", name="shorten", kind="happy",
-                            steps=[FlowStep(src="gw", dst="db", action="INSERT")]))
-    return session, events
+@pytest.fixture
+def session(tmp_path):
+    s = ArchState()
+    s.approaches["queue-first"] = Approach(id="queue-first", name="Queue first",
+                                           summary="a broker drains it")
+    s.nodes["orders"] = Node(id="orders", label="Orders", kind="store",
+                             responsibility="holds attempts")
+    s.nodes["queue"] = Node(id="queue", label="Queue", kind="queue",
+                            approaches=["queue-first"])
+    return ArchSession(state=s, run_dir=tmp_path / "run")
 
 
-# ---------------------------------------------------------------- components
+def test_editing_prose_on_a_box(session):
+    out = apply_mutation(session, {"op": "node", "id": "orders",
+                                   "responsibility": "holds delivery attempts"})
+    assert "Updated orders" in out["applied"]
+    assert session.state.nodes["orders"].responsibility == "holds delivery attempts"
 
 
-def test_rename_changes_the_name_and_nothing_else():
-    """The acceptance check from the handover: a rename must leave the id in
-    every connection, flow and future bundle exactly where it was."""
-    session, events = make_session()
-    result = session.apply_mutation({"op": "component", "id": "db", "name": "postgres-urls"})
-
-    assert "db" in result["applied"]
-    assert session.state.components["db"].name == "postgres-urls"
-    assert session.state.components["db"].id == "db"
-    assert session.state.connections[0].dst == "db"
-    assert session.state.flows[0].steps[0].dst == "db"
-    # the edit reaches the page the same way a tool call does
-    assert events[-1]["type"] == "arch_state"
-    assert events[-1]["changed"] == {"kind": "component", "id": "db"}
+def test_the_kind_stays_the_architects_call(session):
+    """Structural changes come from the conversation, not from typing in a
+    panel — so `kind` is simply not in the editable set."""
+    assert "kind" not in EDITABLE_NODE_FIELDS
+    with pytest.raises(MutationError, match="editable fields"):
+        apply_mutation(session, {"op": "node", "id": "orders", "kind": "queue"})
 
 
-def test_editing_responsibility_clears_the_gap_it_was_causing():
-    session, _ = make_session()
-    session.state.components["gw"].responsibility = ""
-    assert "gw" in session.state.gaps_by_subject()
-
-    session.apply_mutation({"op": "component", "id": "gw", "responsibility": "terminates TLS"})
-    assert "gw" not in session.state.gaps_by_subject()
+def test_editing_a_box_that_is_not_there(session):
+    with pytest.raises(MutationError, match="does not have"):
+        apply_mutation(session, {"op": "node", "id": "ghost", "label": "Ghost"})
 
 
-def test_a_user_edit_goes_through_the_same_validation_as_the_tool(tmp_path):
-    """Same code path, so a payload the tool would refuse is refused here too."""
-    session, _ = make_session()
-    ctx = ToolContext(repo_root=tmp_path, arch=session)
-    tool_said = ComponentTool().execute({"id": "db", "kind": "nonsense"}, ctx)
-    assert tool_said.is_error
-
-    with pytest.raises(MutationError) as e:
-        apply_mutation(session, {"op": "component", "id": "db", "kind": "nonsense"})
-    # kind isn't user-editable at all, so it never even reaches validation
-    assert "nothing to change" in str(e.value)
+def test_a_box_cannot_be_left_nameless(session):
+    with pytest.raises(MutationError, match="needs a label"):
+        apply_mutation(session, {"op": "node", "id": "orders", "label": "  "})
 
 
-@pytest.mark.parametrize("payload, expected", [
-    ({"op": "component", "id": "nope", "name": "x"}, "no component 'nope'"),
-    ({"op": "component", "name": "x"}, "which component"),
-    ({"op": "component", "id": "db", "name": "  "}, "needs a name"),
-    ({"op": "component", "id": "db", "trace": "one goal"}, "trace must be a list"),
-    ({"op": "component", "id": "db"}, "nothing to change"),
-    ({"op": "wat", "id": "db"}, "unknown mutation"),
-])
-def test_refusals(payload, expected):
-    session, events = make_session()
-    before = json.dumps(session.state.to_dict(), default=str)
-    with pytest.raises(MutationError) as e:
-        session.apply_mutation(payload)
-    assert expected in str(e.value)
-    # a refused mutation changes nothing and pushes nothing
-    assert json.dumps(session.state.to_dict(), default=str) == before
-    assert events == []
+def test_the_user_can_grey_an_approach_from_the_page(session):
+    """"I'm taking the left one" is the user's call — it should not require
+    asking the model to type it out."""
+    out = apply_mutation(session, {"op": "approach", "id": "queue-first",
+                                   "status": "greyed",
+                                   "rejected_reason": "not worth operating a broker"})
+    assert "greyed out" in out["applied"]
+    app = session.state.approaches["queue-first"]
+    assert app.status == "greyed"
+    assert app.rejected_reason == "not worth operating a broker"
+    assert session.state.is_greyed(session.state.nodes["queue"])
 
 
-def test_structural_fields_are_not_user_editable():
-    """Ids are immutable and `kind` is the architect's call; asking for either
-    is a no-op refusal rather than a silent partial edit."""
-    session, _ = make_session()
-    with pytest.raises(MutationError):
-        session.apply_mutation({"op": "component", "id": "db", "kind": "service", "remove": True})
-    assert session.state.components["db"].kind == "store"
+def test_greying_from_the_page_still_needs_the_reason(session):
+    """The refusal the model would have seen reaches the page verbatim, rather
+    than being filled in with a placeholder."""
+    with pytest.raises(MutationError, match="reason it lost"):
+        apply_mutation(session, {"op": "approach", "id": "queue-first", "status": "greyed"})
 
 
-def test_post_approval_edit_records_who_made_it():
-    session, _ = make_session()
-    session.state.phase = "expand"  # the user has approved the top level
-    session.apply_mutation({"op": "component", "id": "gw", "responsibility": "terminates TLS"})
-
-    assert len(session.state.amendments) == 1
-    amendment = session.state.amendments[0]
-    assert amendment.description.startswith("user edit")
-    assert amendment.structural is False  # prose doesn't re-open the approval
+def test_bringing_a_greyed_approach_back(session):
+    apply_mutation(session, {"op": "approach", "id": "queue-first", "status": "greyed",
+                             "rejected_reason": "too much infra"})
+    out = apply_mutation(session, {"op": "approach", "id": "queue-first", "status": "active"})
+    assert "brought back" in out["applied"]
+    assert not session.state.is_greyed(session.state.nodes["queue"])
 
 
-def test_edits_before_approval_leave_no_amendment():
-    session, _ = make_session()
-    session.apply_mutation({"op": "component", "id": "gw", "responsibility": "terminates TLS"})
-    assert session.state.amendments == []
+def test_an_unknown_approach_is_named_in_the_error(session):
+    with pytest.raises(MutationError, match="queue-first"):
+        apply_mutation(session, {"op": "approach", "id": "nope"})
 
 
-# ------------------------------------------------------------------ concerns
+def test_an_unknown_op_is_refused_with_what_is_allowed(session):
+    with pytest.raises(MutationError, match="node, approach"):
+        apply_mutation(session, {"op": "delete_everything"})
 
 
-def test_overruling_a_concern_from_the_rail_keeps_the_reason():
-    session, _ = make_session()
-    session.state.concerns.append(
-        Concern(id="c1", severity="blocker", target="db", claim="unbounded growth")
-    )
-    session.apply_mutation({
-        "op": "concern", "id": "c1", "status": "overruled",
-        "resolution": "single-tenant, we prune by hand for now",
-    })
-    c = session.state.concerns[0]
-    assert c.status == "overruled"
-    assert c.resolution == "single-tenant, we prune by hand for now"
-    assert session.state.open_blockers() == []
+def test_a_handed_off_design_is_read_only(session):
+    session.state.handed_off = True
+    with pytest.raises(MutationError, match="read-only"):
+        apply_mutation(session, {"op": "node", "id": "orders", "label": "Late"})
 
 
-def test_overruling_without_a_reason_is_refused():
-    """The reason IS the record — the thing the code harness inherits. A
-    placeholder in its place is worse than a refusal."""
-    session, _ = make_session()
-    session.state.concerns.append(Concern(id="c1", severity="blocker", target="db", claim="x"))
-    with pytest.raises(MutationError) as e:
-        session.apply_mutation({"op": "concern", "id": "c1", "status": "overruled"})
-    assert "needs a reason" in str(e.value)
-    assert session.state.concerns[0].status == "open"
+def test_a_mutation_pushes_state_exactly_once(session):
+    """State travels on one channel — the arch_state push. A second copy over
+    a different wire is a second thing to keep in sync."""
+    pushed = []
+    session.on_state = pushed.append
+    out = apply_mutation(session, {"op": "node", "id": "orders", "tech": "Postgres"})
+    assert len(pushed) == 1
+    assert "state" not in out, "the reply is a receipt, not a copy of the state"
+    assert pushed[0]["state"]["nodes"]["orders"]["tech"] == "Postgres"
 
 
-def test_accepting_a_concern_needs_no_reason():
-    session, _ = make_session()
-    session.state.concerns.append(Concern(id="c1", severity="risk", target="db", claim="x"))
-    session.apply_mutation({"op": "concern", "id": "c1", "status": "accepted"})
-    assert session.state.concerns[0].status == "accepted"
+# ------------------------------------------------- arranging the board
 
 
-@pytest.mark.parametrize("payload, expected", [
-    ({"op": "concern", "id": "c9", "status": "accepted"}, "no concern 'c9'"),
-    ({"op": "concern", "id": "c1", "status": "open"}, "status must be one of"),
-])
-def test_concern_refusals(payload, expected):
-    session, _ = make_session()
-    session.state.concerns.append(Concern(id="c1", severity="risk", target="db", claim="x"))
-    with pytest.raises(MutationError) as e:
-        session.apply_mutation(payload)
-    assert expected in str(e.value)
+def test_moving_a_box_is_the_users_call_and_it_persists(session):
+    """Arranging the board is how a person says what belongs with what. No tool
+    takes coordinates, so this is the only writer."""
+    out = apply_mutation(session, {"op": "move", "id": "orders", "x": 590, "y": 250})
+    assert "Moved orders" in out["applied"]
+    assert (session.state.nodes["orders"].x, session.state.nodes["orders"].y) == (590, 250)
 
 
-# ------------------------------------------------------------------ promote
+def test_a_move_needs_real_coordinates(session):
+    with pytest.raises(MutationError, match="numeric x and y"):
+        apply_mutation(session, {"op": "move", "id": "orders", "x": "left a bit"})
 
 
-def test_promoting_a_variant_from_the_canvas_seeds_the_design():
-    from bird.harnesses.arch.sketch import SketchLink, SketchNode, Variant
-
-    session, _ = make_session()
-    session.state.components.clear()
-    session.state.connections.clear()
-    session.state.flows.clear()
-    session.state.phase = "brainstorm"
-    v = Variant(id="v2", name="evented", summary="bus in the middle")
-    v.nodes["api"] = SketchNode(id="api", label="api", kind="service", note="entry")
-    v.nodes["bus"] = SketchNode(id="bus", label="events", kind="queue", note="")
-    v.links.append(SketchLink(src="api", dst="bus", label="publish", kind="async"))
-    session.state.sketchbook.variants["v2"] = v
-
-    result = session.apply_mutation({"op": "promote", "variant_id": "v2"})
-
-    assert "evented" in result["applied"]
-    assert set(session.state.components) == {"api", "bus"}
-    assert session.state.components["bus"].kind == "queue"
-    assert session.state.sketchbook.variants["v2"].status == "chosen"
-    assert session.state.phase == "propose"
+def test_moving_a_box_that_is_not_there(session):
+    with pytest.raises(MutationError, match="does not have"):
+        apply_mutation(session, {"op": "move", "id": "ghost", "x": 1, "y": 2})
 
 
-def test_promoting_an_empty_variant_is_refused():
-    from bird.harnesses.arch.sketch import Variant
-
-    session, _ = make_session()
-    session.state.sketchbook.variants["v3"] = Variant(id="v3", name="empty", summary="")
-    with pytest.raises(MutationError) as e:
-        session.apply_mutation({"op": "promote", "variant_id": "v3"})
-    assert "nothing sketched" in str(e.value)
-
-
-# ------------------------------------------------------------------- lifecycle
-
-
-def test_a_finalized_session_refuses_every_mutation():
-    session, _ = make_session()
-    session.state.phase = "finalized"
-    with pytest.raises(MutationError) as e:
-        session.apply_mutation({"op": "component", "id": "db", "name": "anything"})
-    assert "read-only" in str(e.value)
+def test_tidy_hands_the_board_back_to_the_layout(session):
+    """The page arranges around what nobody has moved. A position somebody chose
+    is chosen precisely so nothing else moves it, so the only way to get one back
+    is to say so."""
+    apply_mutation(session, {"op": "move", "id": "orders", "x": 590, "y": 250})
+    apply_mutation(session, {"op": "move", "id": "queue", "x": -40, "y": 1900})
+    out = apply_mutation(session, {"op": "tidy"})
+    assert "2 boxes" in out["applied"]
+    for node in session.state.nodes.values():
+        assert (node.x, node.y) == (None, None)
 
 
-def test_mutation_persists_to_the_state_file(tmp_path):
-    session, _ = make_session(run_dir=tmp_path / "run")
-    session.apply_mutation({"op": "component", "id": "db", "name": "postgres-urls"})
-    saved = json.loads((tmp_path / "run" / "arch_state.json").read_text())
-    assert saved["components"]["db"]["name"] == "postgres-urls"
+def test_tidy_says_so_when_there_is_nothing_to_tidy(session):
+    with pytest.raises(MutationError, match="already arranged"):
+        apply_mutation(session, {"op": "tidy"})
 
 
-# ----------------------------------------------------------------- over HTTP
+def test_tidy_changes_nothing_but_position(session):
+    apply_mutation(session, {"op": "move", "id": "queue", "x": 1, "y": 2})
+    before = list(session.state.nodes["queue"].approaches)
+    edges = list(session.state.edges)
+    apply_mutation(session, {"op": "tidy"})
+    assert session.state.nodes["queue"].approaches == before
+    assert session.state.edges == edges
 
 
-def test_mutate_over_http(tmp_path):
-    """The route itself: 200 + a state push for an accepted edit, 400 with a
-    readable message for a refused one, and no session left behind either way."""
-    server, transport, arch, _ = build_stack(tmp_path, [])
-    arch.state.phase = "propose"
-    arch.state.components["db"] = Component(id="db", name="url-db", kind="store",
-                                            responsibility="mappings", trace=["urls"])
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    host, port = transport._server.server_address[:2]
-    page = Page(host, port)
-    try:
-        body = page.post("/mutate", {"op": "component", "id": "db", "name": "postgres-urls"})
-        assert body["ok"] is True
-        assert arch.state.components["db"].name == "postgres-urls"
-        pushed = page.wait_for(
-            lambda e: e["type"] == "arch_state"
-            and e["state"]["components"]["db"]["name"] == "postgres-urls",
-            "renamed state push",
-        )
-        assert pushed["changed"] == {"kind": "component", "id": "db"}
-
-        body = page.post("/mutate", {"op": "component", "id": "ghost", "name": "x"}, status=400)
-        assert body["ok"] is False
-        assert "ghost" in body["error"]
-    finally:
-        transport.shutdown()
-        thread.join(timeout=5)
+def test_moving_does_not_reassign_which_approach_a_box_belongs_to(session):
+    """Dragging across a column boundary is a design change with a reason
+    behind it, and the reason is what the architect is for."""
+    before = list(session.state.nodes["queue"].approaches)
+    apply_mutation(session, {"op": "move", "id": "queue", "x": 10, "y": 10})
+    assert session.state.nodes["queue"].approaches == before
 
 
-def test_mutate_is_refused_when_the_session_has_no_arch_state(tmp_path):
-    """`bird code` and the plain REPL share this pump; the route must decline
-    politely rather than explode."""
-    server, transport, arch, _ = build_stack(tmp_path, [])
-    server.repl.runner.ctx.arch = None
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    host, port = transport._server.server_address[:2]
-    page = Page(host, port)
-    try:
-        body = page.post("/mutate", {"op": "component", "id": "db", "name": "x"}, status=400)
-        assert body["ok"] is False
-        assert "no state a UI can edit" in body["error"]
-    finally:
-        transport.shutdown()
-        thread.join(timeout=5)
+def test_a_note_can_be_pinned_to_a_box(session):
+    apply_mutation(session, {"op": "note", "id": "n1", "text": "bill nobody budgets for",
+                             "x": 60, "y": 780, "anchor": "orders"})
+    note = session.state.annotation_by_id("n1")
+    assert note.text == "bill nobody budgets for"
+    assert [a.id for a in session.state.notes_on("orders")] == ["n1"]
+
+
+def test_a_note_can_sit_on_the_canvas_with_no_anchor(session):
+    apply_mutation(session, {"op": "note", "id": "n1", "text": "revisit at 100 episodes"})
+    assert session.state.annotation_by_id("n1").anchor == ""
+
+
+def test_pinning_a_note_to_a_box_that_is_not_there(session):
+    with pytest.raises(MutationError, match="no such box"):
+        apply_mutation(session, {"op": "note", "id": "n1", "text": "x", "anchor": "ghost"})
+
+
+def test_clearing_a_notes_text_removes_it(session):
+    """The same gesture as emptying the box on the canvas — the page never has
+    to send a separate delete."""
+    apply_mutation(session, {"op": "note", "id": "n1", "text": "temporary"})
+    apply_mutation(session, {"op": "note", "id": "n1", "text": "  "})
+    assert session.state.annotations == []
+
+
+def test_a_new_note_with_no_text_is_refused(session):
+    with pytest.raises(MutationError, match="needs text"):
+        apply_mutation(session, {"op": "note", "id": "n1", "text": ""})
+
+
+def test_a_note_can_be_dragged_without_retexting_it(session):
+    apply_mutation(session, {"op": "note", "id": "n1", "text": "keep me", "x": 0, "y": 0})
+    apply_mutation(session, {"op": "note", "id": "n1", "x": 300, "y": 400})
+    note = session.state.annotation_by_id("n1")
+    assert (note.x, note.y) == (300, 400)
+    assert note.text == "keep me"

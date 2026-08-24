@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -651,3 +652,41 @@ def test_load_messages_missing_events_returns_none(tmp_path):
     run_dir = tmp_path / "empty_session"
     run_dir.mkdir()
     assert load_messages(run_dir) is None
+
+
+def test_run_takes_an_opening_message_before_handing_over(monkeypatch):
+    """`bird arch --repl "design me a webhook relay"` runs one turn, then
+    prompts. Without this the opening argument would be silently dropped."""
+    import builtins
+
+    turns = []
+    monkeypatch.setattr(builtins, "input", lambda *a: (_ for _ in ()).throw(EOFError))
+
+    repl = Repl.__new__(Repl)
+    repl._turn = turns.append
+    repl.runner = SimpleNamespace(on_delta=None, ctx=SimpleNamespace(skills=[]))
+    repl.kg = None
+    repl._setup_completion = lambda: None
+    repl._auto_resume_prompt = lambda: True
+    monkeypatch.setattr("bird.repl.attach_printer", lambda ctx: None)
+
+    assert repl.run("design a webhook relay") == 0
+    assert turns == ["design a webhook relay"]
+
+
+def test_run_without_an_opening_message_goes_straight_to_the_prompt(monkeypatch):
+    import builtins
+
+    turns = []
+    monkeypatch.setattr(builtins, "input", lambda *a: (_ for _ in ()).throw(EOFError))
+
+    repl = Repl.__new__(Repl)
+    repl._turn = turns.append
+    repl.runner = SimpleNamespace(on_delta=None, ctx=SimpleNamespace(skills=[]))
+    repl.kg = None
+    repl._setup_completion = lambda: None
+    repl._auto_resume_prompt = lambda: True
+    monkeypatch.setattr("bird.repl.attach_printer", lambda ctx: None)
+
+    assert repl.run() == 0
+    assert turns == []

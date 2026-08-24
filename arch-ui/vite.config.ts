@@ -16,6 +16,7 @@ export default defineConfig({
     proxy: {
       "/events": { target: process.env.BIRD_URL || "http://127.0.0.1:8000", changeOrigin: true },
       "/input": { target: process.env.BIRD_URL || "http://127.0.0.1:8000", changeOrigin: true },
+      "/mutate": { target: process.env.BIRD_URL || "http://127.0.0.1:8000", changeOrigin: true },
       "/permission": { target: process.env.BIRD_URL || "http://127.0.0.1:8000", changeOrigin: true },
       "/interrupt": { target: process.env.BIRD_URL || "http://127.0.0.1:8000", changeOrigin: true },
     },

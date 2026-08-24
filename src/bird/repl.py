@@ -89,7 +89,10 @@ class Repl:
             self._streamed = True
             print(chunk, end="", flush=True)
 
-    def run(self) -> int:
+    def run(self, first_input: str | None = None) -> int:
+        """The prompt loop. `first_input` runs one turn before handing over to
+        the user — for commands that take the opening message as an argument
+        (`bird arch --repl "design me a webhook relay"`)."""
         self.runner.on_delta = self._print_delta
         attach_printer(self.runner.ctx)  # `› tool …` headers while the agent works
         self._setup_completion()
@@ -100,6 +103,8 @@ class Repl:
             print(self._welcome_banner())
         if self.kg is not None and not self.kg.is_ready():
             print("kg: building in background")
+        if first_input:
+            self._turn(first_input)
         while True:
             try:
                 line = input("bird> ").strip()

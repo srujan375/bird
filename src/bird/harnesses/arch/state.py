@@ -1,324 +1,184 @@
-"""ArchState — the single source of truth for an architecture session.
+"""ArchState — one graph, and the record of what was decided about it.
 
-Tools mutate it, the UI renders it, the two human gates read it, and the
-handoff bundle is serialized from it at finalize.
+There is exactly one representation of the design. A node is loose or
+committed depending on its `depth`, not on which layer it lives in; there is
+no sketchbook, no promote step, no parallel world to keep in sync. "Reduce the
+depth" and "flesh this out" are the same move in opposite directions on the
+same object.
 
-Two kinds of check live here, and the difference is the whole posture of the
-harness:
+Approaches are *labels on nodes*, not separate designs. A node with an empty
+`approaches` list is shared by all of them — the database both takes use once,
+drawn once. A rejected approach is greyed, not deleted, and it keeps the reason
+it lost: that reason is the most valuable thing the session produces and the
+thing an archived object nobody opens reliably loses.
 
-- `validate_*` raises ValueError for things that are *broken* — a malformed id,
-  an edge to a component that does not exist. The tool layer turns those into
-  ToolErrors verbatim, because accepting them would corrupt the graph.
-- `*_gaps` returns advice for things that are merely *thin* — no trace, a store
-  that never says what it owns, an async edge with no named mechanism. These
-  never refuse a tool call. They surface in the tracker, on the page and in the
-  bundle, so the design can be argued about instead of form-filled.
+Two kinds of check live here, and the split is the posture of the harness:
+
+- `validate_*` raises ValueError for what is *broken* — a malformed id, an
+  unknown kind. The tool layer turns those into ToolErrors verbatim, because
+  accepting them would corrupt the graph.
+- `derive.py` reports what is *thin*. Nothing there ever refuses a call; it
+  feeds the architect's next recommendation, so the design gets argued about
+  instead of form-filled.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
-
-from .sketch import Sketchbook
-
-Mode = Literal["system", "feature"]
-Phase = Literal[
-    "brainstorm", "propose", "toplevel_review", "expand", "resolved", "finalized"
-]
-PHASES: tuple[str, ...] = (
-    "brainstorm", "propose", "toplevel_review", "expand", "resolved", "finalized"
-)
-
-# Phases the overhaul retired, and where a state file written before it lands.
-# `intake` gated components behind a complete brief; the brief now accretes
-# through the whole session, so a session that never got past it had nothing
-# promoted — that is brainstorm. `challenge` was a one-shot critique pass
-# between expand and resolved; the critic runs continuously now, so a session
-# sitting in it was mid-design — that is expand.
-RETIRED_PHASES: dict[str, str] = {"intake": "brainstorm", "challenge": "expand"}
+from typing import Any
 
 KINDS: tuple[str, ...] = (
-    "service", "api", "gateway", "store", "queue", "cache",
-    "job", "ui", "llm", "external", "infra",
+    "service", "store", "queue", "api", "ui", "llm", "external", "infra",
 )
-CONNECTION_KINDS: tuple[str, ...] = ("sync", "async", "batch")
-FLOW_KINDS: tuple[str, ...] = ("happy", "failure", "background")
-SCOPES: tuple[str, ...] = ("prototype", "internal", "production", "high_scale")
-DECISION_CATEGORIES: tuple[str, ...] = (
-    "storage", "communication", "consistency", "deployment", "integration", "llm", "other"
-)
-DECISION_SOURCES: tuple[str, ...] = ("model", "user", "judge")
+EDGE_KINDS: tuple[str, ...] = ("sync", "async", "batch")
+# a two-way slider on one object, not a one-way expand
+DEPTHS: tuple[str, ...] = ("stub", "sketch", "detailed")
+STATUSES: tuple[str, ...] = ("active", "greyed")
+DECISION_SOURCES: tuple[str, ...] = ("model", "user")
+QUESTION_STATUSES: tuple[str, ...] = ("open", "answered", "deferred")
 
-# What an unstated scope means. Absent, it used to read as "unconstrained",
-# which a model resolves as "be safe" — and being safe about a number nobody
-# gave you is how a 1k-user app gets a 100k-user bill. The smallest thing that
-# could work is the honest default, and the harness says out loud that it is
-# assuming it.
-ASSUMED_SCOPE = "prototype"
-QUESTION_SOURCES: tuple[str, ...] = ("model", "harness_audit", "judge", "user")
-CONCERN_SEVERITIES: tuple[str, ...] = ("blocker", "risk", "smell")
-CONCERN_SOURCES: tuple[str, ...] = ("model", "judge", "harness_audit")
-CONCERN_STATUSES: tuple[str, ...] = ("open", "accepted", "overruled", "withdrawn")
+# Kinds whose contents outlive every rewrite around them, most expensive first.
+# Used to order the frontier: when several branches are equally askable, the one
+# that is costliest to get wrong goes first.
+COST_ORDER: dict[str, int] = {
+    "store": 0, "api": 1, "queue": 2, "llm": 3, "infra": 4,
+    "ui": 5, "service": 6, "external": 7,
+}
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 
-# which facet variant each component kind owes when expanded
-FACET_FOR_KIND: dict[str, str] = {
-    "api": "api",
-    "gateway": "api",
-    "store": "store",
-    "cache": "store",
-    "queue": "queue",
-    "service": "service",
-    "job": "service",
-    "ui": "service",
-    "llm": "llm",
-    "infra": "infra",
-    # "external" deliberately absent: not ours to design
-}
+# Keys that only ever appeared in the pre-rebuild state file. A session written
+# by the old two-layer harness cannot be read into this model without inventing
+# things nobody said, so resume refuses it by name instead of silently starting
+# from an empty design that looks like a lost session.
+LEGACY_KEYS = ("sketchbook", "components", "obligations", "concerns")
 
 
-# ---------------------------------------------------------------- brief
+class LegacyStateError(Exception):
+    """A state file from the pre-rebuild arch harness."""
 
 
-@dataclass
-class Scale:
-    users: str | None = None
-    reads_per_sec: str | None = None
-    writes_per_sec: str | None = None
-    data_volume: str | None = None
-    growth: str | None = None
-
-    def any_set(self) -> bool:
-        return any(v for v in asdict(self).values())
+# ------------------------------------------------------------------ brief
 
 
 @dataclass
 class Brief:
+    """What the design is for. Accreted from the conversation as facts surface,
+    never a form with required fields — a blank brief is a session that has not
+    got there yet, not an error state."""
+
     goal: str = ""
     actors: list[str] = field(default_factory=list)
-    scope: str = ""
-    scale: Scale = field(default_factory=Scale)
-    latency: str | None = None
-    consistency: str | None = None
-    availability: str | None = None
-    deploy_target: str | None = None
+    scale: str = ""  # free prose: "a few hundred users, bursty" beats five empty numbers
     constraints: list[str] = field(default_factory=list)
     non_goals: list[str] = field(default_factory=list)
 
-    def scope_assumed(self) -> bool:
-        """True when nobody has stated a scope and ASSUMED_SCOPE is standing in."""
-        return self.scope not in SCOPES
-
-    def effective_scope(self) -> str:
-        """The scope actually being designed for. Never empty: an unset scope
-        is ASSUMED_SCOPE, not "no constraint"."""
-        return ASSUMED_SCOPE if self.scope_assumed() else self.scope
-
-    def stated_numbers(self) -> list[str]:
-        """The load-bearing figures, for pinning into the tracker. The critique
-        posture is "where does this fall over at their numbers", so the numbers
-        themselves have to be in front of the model — not a boolean saying they
-        exist."""
+    def stated(self) -> list[str]:
+        """The load-bearing facts, for the architect's own state note."""
         out: list[str] = []
-        for label, val in (
-            ("users", self.scale.users),
-            ("reads/s", self.scale.reads_per_sec),
-            ("writes/s", self.scale.writes_per_sec),
-            ("data", self.scale.data_volume),
-            ("growth", self.scale.growth),
-            ("latency", self.latency),
-            ("consistency", self.consistency),
-            ("availability", self.availability),
-            ("deploy", self.deploy_target),
-        ):
-            if (val or "").strip():
-                out.append(f"{label}={val}")
+        if self.goal.strip():
+            out.append(f"goal={self.goal.strip()}")
+        if self.actors:
+            out.append("actors=" + ", ".join(self.actors))
+        if self.scale.strip():
+            out.append(f"scale={self.scale.strip()}")
+        if self.constraints:
+            out.append("constraints=" + "; ".join(self.constraints))
+        if self.non_goals:
+            out.append("non-goals=" + "; ".join(self.non_goals))
         return out
 
-    def missing(self) -> list[str]:
-        """Load-bearing fields still absent — the `component` unlock gate."""
-        missing = []
-        if not self.goal.strip():
-            missing.append("goal")
-        if not self.actors:
-            missing.append("actors")
-        if self.scope not in SCOPES:
-            missing.append("scope")
-        if self.scope in ("production", "high_scale"):
-            if not self.scale.any_set():
-                missing.append("scale")
-            if self.consistency not in ("strong", "eventual", "mixed"):
-                missing.append("consistency")
-            if not (self.availability or "").strip():
-                missing.append("availability")
-        return missing
 
-
-# ------------------------------------------------------------- structure
+# ------------------------------------------------------------------ graph
 
 
 @dataclass
-class Component:
+class Node:
+    """A box on the board.
+
+    `depth` is the fidelity slider. A stub is a name you can react to; a sketch
+    has a responsibility and maybe a tech; a detailed node has said what is
+    inside it. Nodes deepen when the conversation walks to their branch, which
+    is why depth is a property of the node and not a phase of the session.
+
+    `approaches` is the set of approach ids this node belongs to. Empty means
+    shared — drawn once, used by every approach on the board.
+    """
+
     id: str
-    name: str
-    kind: str
-    responsibility: str
-    trace: list[str] = field(default_factory=list)
-    existing: bool = False
-    tech: str | None = None
-    data_owned: str | None = None
-    failure_notes: str | None = None
-    facet: Any | None = None  # one of the *Facet classes; None = black box
-    origin: str = ""  # "sketch:<variant_id>" when seeded by promote; "" = hand-written
-
-
-@dataclass
-class Connection:
-    src: str
-    dst: str
     label: str
-    kind: str
-    mechanism: str | None = None
-    protocol: str | None = None
-    data: str | None = None
-    failure_mode: str | None = None
+    kind: str = "service"
+    responsibility: str = ""
+    tech: str = ""
+    depth: str = "stub"
+    detail: str = ""  # prose, not a schema — what is inside, in the words that fit
+    approaches: list[str] = field(default_factory=list)
+    status: str = "active"  # greyed travels with its approach
+    notes: str = ""
+    existing: bool = False  # imported from the repo: background, not ours to design
+    # Where the box sits, once somebody has put it somewhere. None means the
+    # board has not been arranged by hand and the canvas may lay it out.
+    #
+    # Position is design, not decoration: which column a box sits in says which
+    # approach it belongs to, and what it sits next to says what it is part of.
+    # A board whose arrangement dies with the tab loses that, so the coordinates
+    # live here — written by the person dragging, never by the architect, which
+    # is why no tool takes them.
+    x: float | None = None
+    y: float | None = None
+
+    def shared(self) -> bool:
+        return not self.approaches
 
 
 @dataclass
-class FlowStep:
+class Edge:
     src: str
     dst: str
-    action: str
-    note: str | None = None
+    label: str = ""
+    kind: str = "sync"
+    notes: str = ""  # including what happens when dst is down
+
+    def key(self) -> tuple[str, str, str]:
+        return (self.src, self.dst, self.label)
 
 
 @dataclass
-class Flow:
+class Approach:
+    """One take on the board. Not a separate world — a label a subset of nodes
+    carries. Greyed approaches stay visible with `rejected_reason`; that line is
+    the ADR the session exists to produce."""
+
     id: str
     name: str
-    kind: str
-    steps: list[FlowStep] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------- facets
-
-
-@dataclass
-class Endpoint:
-    route: str
-    method: str
-    request: str
-    response: str
-    auth: str
-    errors: list[str] = field(default_factory=list)
-    idempotency: str | None = None
-    pagination: str | None = None
+    summary: str = ""
+    status: str = "active"
+    rejected_reason: str = ""
 
 
 @dataclass
-class ApiFacet:
-    endpoints: list[Endpoint] = field(default_factory=list)
-    facet_kind: str = field(default="api", init=False)
+class Annotation:
+    """A note left on the board.
+
+    The reasoning that belongs *next to* something rather than inside it — why
+    this column is cheaper, what killed the third option, what to revisit and
+    when. It travels into the handoff, because a note nobody can read later is
+    just a decoration.
+
+    `anchor` names the box it hangs off, or is empty for a note pinned to the
+    canvas itself.
+    """
+
+    id: str
+    text: str
+    x: float = 0
+    y: float = 0
+    w: float = 190
+    anchor: str = ""
 
 
-@dataclass
-class Entity:
-    name: str
-    keys: str
-    fields: list[str] = field(default_factory=list)
-    indexes: list[str] = field(default_factory=list)
-
-
-@dataclass
-class StoreFacet:
-    entities: list[Entity] = field(default_factory=list)
-    access_patterns: list[str] = field(default_factory=list)
-    retention: str | None = None
-    migration_risk: str | None = None
-    facet_kind: str = field(default="store", init=False)
-
-
-@dataclass
-class QueueMessage:
-    name: str
-    schema: str
-    ordering: str
-    delivery: str
-    dlq_policy: str | None = None
-
-
-@dataclass
-class QueueFacet:
-    messages: list[QueueMessage] = field(default_factory=list)
-    facet_kind: str = field(default="queue", init=False)
-
-
-@dataclass
-class Module:
-    name: str
-    purpose: str
-
-
-@dataclass
-class ServiceFacet:
-    interface: list[str] = field(default_factory=list)
-    modules: list[Module] | None = None
-    facet_kind: str = field(default="service", init=False)
-
-
-@dataclass
-class LlmTask:
-    name: str
-    model_tier: str
-    prompt_contract: str
-    context_strategy: str
-    fallback: str
-    guardrails: str
-    eval_hook: str | None = None
-    cost_envelope: str | None = None
-
-
-@dataclass
-class LlmFacet:
-    tasks: list[LlmTask] = field(default_factory=list)
-    facet_kind: str = field(default="llm", init=False)
-
-
-@dataclass
-class DeployUnit:
-    name: str
-    components: list[str] = field(default_factory=list)
-    scaling_policy: str = ""
-    region: str | None = None
-
-
-@dataclass
-class InfraFacet:
-    units: list[DeployUnit] = field(default_factory=list)
-    state_locality: str = ""
-    facet_kind: str = field(default="infra", init=False)
-
-
-FACET_CLASSES: dict[str, type] = {
-    "api": ApiFacet,
-    "store": StoreFacet,
-    "queue": QueueFacet,
-    "service": ServiceFacet,
-    "llm": LlmFacet,
-    "infra": InfraFacet,
-}
-
-_FACET_ITEM_FIELDS: dict[str, tuple[str, type]] = {
-    "api": ("endpoints", Endpoint),
-    "queue": ("messages", QueueMessage),
-    "llm": ("tasks", LlmTask),
-}
-
-
-# ------------------------------------- decisions / questions / audit trail
+# ---------------------------------------------------- decisions & questions
 
 
 @dataclass
@@ -330,76 +190,42 @@ class Option:
 
 @dataclass
 class Decision:
+    """A settled call, with what it was weighed against.
+
+    `pragmatism_note` is first-class, not an apology. "Less robust, and right,
+    because it ships in a week and the rewrite is cheap" is a complete
+    architectural verdict; recording it as a compromise against some unbuilt
+    ideal misrepresents what was decided and why.
+    """
+
     id: str
     topic: str
-    category: str
-    options: list[Option]
-    choice: str
-    rationale: str
-    status: str = "decided"  # decided | deferred (deferred still records the default taken)
-    source: str = "model"    # model | user | judge — who put this choice on the table
-    #
-    # `source="user"` is the trigger for the harness's one non-negotiable
-    # courtesy: a choice the user handed us gets a verdict, not silent
-    # absorption. Recording it with a single option is the detectable bad
-    # state — it means nothing was weighed against it. See
-    # `ArchState.unweighed_user_choices`.
+    options: list[Option] = field(default_factory=list)
+    choice: str = ""
+    rationale: str = ""
+    source: str = "model"  # model | user — who put the choice on the table
+    pragmatism_note: str = ""
 
 
 @dataclass
-class OpenQuestion:
+class Question:
+    """Something only the user can settle, parked until they do.
+
+    Every one carries a `recommendation`: the user reacts to a concrete
+    proposal rather than starting from a blank page. A question with no
+    recommendation is an interview question, and this harness does not conduct
+    interviews.
+    """
+
     id: str
     question: str
-    blocking: bool
-    source: str
-    answer: str | None = None
-    resolution: str | None = None  # answered | deferred | dropped
-    target: str | None = None      # component/decision id, "brief.<field>", or None
-
-    @property
-    def open(self) -> bool:
-        return self.resolution is None
-
-
-@dataclass
-class Concern:
-    """A recorded objection — the harness's memory of disagreement.
-
-    An OpenQuestion says "I need to know something". A Concern says "I think
-    this is wrong, here is what breaks, here is the cheaper option". It can
-    target the design, a decision, or the user's own instruction, and the agent
-    can raise one against its own earlier proposal.
-
-    Overruled concerns are *kept*, with the reason: "we knew, we chose anyway,
-    here's why" is the most valuable thing the code harness can inherit.
-    """
-    id: str
-    severity: str          # blocker | risk | smell
-    target: str            # component/decision id, "brief", "user", or free text
-    claim: str             # what breaks, concretely
-    alternative: str = ""  # the cheaper or safer option, when there is one
-    status: str = "open"   # open | accepted | overruled | withdrawn
-    resolution: str = ""   # why it was accepted / overruled
-    source: str = "model"  # model | judge | harness_audit
+    recommendation: str = ""
+    answer: str = ""
+    status: str = "open"
 
     @property
     def open(self) -> bool:
         return self.status == "open"
-
-
-@dataclass
-class Obligation:
-    component_id: str
-    facet: str
-    reason: str
-    status: str = "pending"  # pending | done | waived (waived only by the user)
-
-
-@dataclass
-class Amendment:
-    turn: int
-    description: str
-    structural: bool
 
 
 # ------------------------------------------------------------- the state
@@ -407,332 +233,236 @@ class Amendment:
 
 @dataclass
 class ArchState:
-    mode: str = "system"
-    phase: str = "brainstorm"  # a session opens on the loose sketch layer
     brief: Brief = field(default_factory=Brief)
-    sketchbook: Sketchbook = field(default_factory=Sketchbook)
-    components: dict[str, Component] = field(default_factory=dict)
-    connections: list[Connection] = field(default_factory=list)
-    flows: list[Flow] = field(default_factory=list)
+    nodes: dict[str, Node] = field(default_factory=dict)
+    edges: list[Edge] = field(default_factory=list)
+    approaches: dict[str, Approach] = field(default_factory=dict)
     decisions: list[Decision] = field(default_factory=list)
-    questions: list[OpenQuestion] = field(default_factory=list)
-    concerns: list[Concern] = field(default_factory=list)
-    obligations: list[Obligation] = field(default_factory=list)
-    amendments: list[Amendment] = field(default_factory=list)
+    questions: list[Question] = field(default_factory=list)
+    annotations: list[Annotation] = field(default_factory=list)
+    # the session ends when the user says it is done; this is that, and the
+    # only irreversible thing in the model
+    handed_off: bool = False
 
-    # ---- gates ----
+    # ---- reading the board ----
 
-    def scope_is_production(self) -> bool:
-        return self.brief.scope in ("production", "high_scale")
+    def live_approaches(self) -> list[Approach]:
+        return [a for a in self.approaches.values() if a.status == "active"]
 
-    def blocking_questions(self) -> list[OpenQuestion]:
-        return [q for q in self.questions if q.blocking and q.open]
+    def greyed_approaches(self) -> list[Approach]:
+        return [a for a in self.approaches.values() if a.status == "greyed"]
 
-    def open_concerns(self) -> list[Concern]:
-        return [c for c in self.concerns if c.open]
+    def nodes_in(self, approach_id: str) -> list[Node]:
+        """Nodes carrying this approach's label. Shared nodes are not included —
+        ask for those with `shared_nodes()`; a caller that wants the whole
+        drawing of one approach wants both."""
+        return [n for n in self.nodes.values() if approach_id in n.approaches]
 
-    def open_blockers(self) -> list[Concern]:
-        """Surfaced at the finalize gate so the user overrules deliberately —
-        they never stop the session from continuing."""
-        return [c for c in self.concerns if c.open and c.severity == "blocker"]
+    def shared_nodes(self) -> list[Node]:
+        return [n for n in self.nodes.values() if n.shared()]
 
-    def unweighed_user_choices(self) -> list[Decision]:
-        """User-originated choices that were recorded without an alternative
-        beside them.
+    def active_nodes(self) -> list[Node]:
+        """Boxes still in play. A box is out either because it was greyed on its
+        own, or because every approach it belonged to lost."""
+        return [n for n in self.nodes.values() if not self.is_greyed(n)]
 
-        This is the SQS case. The user says "let's use SQS here"; if that lands
-        as a one-option decision, nothing was weighed and the user never got an
-        answer to the question they did not know they were asking. The harness
-        cannot know whether SQS is right — but it can know that nobody checked,
-        and keep saying so until someone does."""
-        return [d for d in self.decisions if d.source == "user" and len(d.options) < 2]
+    def is_greyed(self, node: Node) -> bool:
+        """Whether a box has fallen out of the live design.
 
-    def questions_targeting(self, subject: str) -> list[OpenQuestion]:
-        """Open questions hanging on a specific component/decision/brief field."""
-        return [q for q in self.questions if q.open and q.target == subject]
-
-    def pending_obligations(self) -> list[Obligation]:
-        return [o for o in self.obligations if o.status == "pending"]
-
-    def happy_flows(self) -> list[Flow]:
-        return [f for f in self.flows if f.kind == "happy"]
-
-    def toplevel_missing(self) -> list[str]:
-        """What a top level would normally have before the user approves it.
-        Advisory since the overhaul: reported to the model and shown at the
-        approval gate so the user can judge, never used to refuse `done`."""
-        missing = []
-        if not self.components:
-            missing.append("at least one component")
-        if not self.happy_flows():
-            missing.append("a happy flow covering the primary goal")
-        if not self.decisions:
-            missing.append("at least one major decision with alternatives")
-        # promoted-from-brainstorm components arrive as drafts (no trace / bare
-        # responsibility); they must be tightened before the top level is approved.
-        untightened = sorted(
-            c.id for c in self.components.values()
-            if not c.existing and (not c.trace or not c.responsibility.strip())
+        A box with one surviving approach stays live even when its other
+        approaches lost — that is what makes "take the lambda from the left and
+        the queue from the right" work: the hybrid keeps its boxes while the
+        approaches around them grey out. Shared boxes (no label at all) outlive
+        every approach.
+        """
+        if node.status == "greyed":
+            return True
+        if not node.approaches:
+            return False
+        return all(
+            a in self.approaches and self.approaches[a].status == "greyed"
+            for a in node.approaches
         )
-        if untightened:
-            missing.append("trace + responsibility for: " + ", ".join(untightened))
-        return missing
 
-    # ---- validation: only what is BROKEN (ValueError text reaches the model) ----
-    #
-    # The bar is "would accepting this corrupt the graph or the render?", not
-    # "is this design finished?". Thinness is advice — see the *_gaps methods.
+    def open_questions(self) -> list[Question]:
+        return [q for q in self.questions if q.open]
 
-    def validate_component(self, comp: Component, updating: bool) -> None:
-        if not _ID_RE.match(comp.id):
+    def edges_touching(self, node_id: str) -> list[Edge]:
+        return [e for e in self.edges if node_id in (e.src, e.dst)]
+
+    def edge_index(self, src: str, dst: str, label: str | None = None) -> int:
+        for i, e in enumerate(self.edges):
+            if e.src == src and e.dst == dst and (label is None or e.label == label):
+                return i
+        return -1
+
+    def references_to(self, node_id: str) -> list[str]:
+        """What would dangle if the id vanished."""
+        return [f"{e.src} -> {e.dst}" for e in self.edges_touching(node_id)]
+
+    def decision_by_id(self, did: str) -> Decision | None:
+        return next((d for d in self.decisions if d.id == did), None)
+
+    def question_by_id(self, qid: str) -> Question | None:
+        return next((q for q in self.questions if q.id == qid), None)
+
+    def annotation_by_id(self, aid: str) -> Annotation | None:
+        return next((a for a in self.annotations if a.id == aid), None)
+
+    def notes_on(self, node_id: str) -> list[Annotation]:
+        return [a for a in self.annotations if a.anchor == node_id]
+
+    def next_node_id(self, label: str) -> str:
+        """A free kebab-case id derived from a label."""
+        base = slug(label)
+        if base not in self.nodes:
+            return base
+        n = 2
+        while f"{base}-{n}" in self.nodes:
+            n += 1
+        return f"{base}-{n}"
+
+    def next_id(self, prefix: str, existing: Any) -> str:
+        taken = {getattr(x, "id", x) for x in existing}
+        n = len(taken) + 1
+        while f"{prefix}{n}" in taken:
+            n += 1
+        return f"{prefix}{n}"
+
+    # ---- validation: only what is BROKEN ----
+
+    def validate_node(self, node: Node) -> None:
+        if not _ID_RE.match(node.id):
             raise ValueError(
-                f"component id {comp.id!r} must be kebab-case (lowercase letters, "
-                "digits, hyphens; starts with a letter), e.g. 'worker-pool'."
+                f"node id {node.id!r} must be kebab-case (lowercase letters, digits, "
+                "hyphens; starts with a letter), e.g. 'order-store'."
             )
-        if comp.kind not in KINDS:
-            raise ValueError(f"unknown kind {comp.kind!r}; one of: {', '.join(KINDS)}.")
-
-    def validate_connection(self, conn: Connection) -> None:
-        for ref in (conn.src, conn.dst):
-            if ref not in self.components:
+        if node.kind not in KINDS:
+            raise ValueError(f"unknown kind {node.kind!r}; one of: {', '.join(KINDS)}.")
+        if node.depth not in DEPTHS:
+            raise ValueError(f"depth must be one of {', '.join(DEPTHS)}.")
+        if node.status not in STATUSES:
+            raise ValueError(f"status must be one of {', '.join(STATUSES)}.")
+        for aid in node.approaches:
+            if aid not in self.approaches:
                 raise ValueError(
-                    f"connection references unknown component {ref!r}; add it with "
-                    "`component` first."
+                    f"node {node.id!r} is labelled with unknown approach {aid!r}; "
+                    "name it with `approach` first, or leave the label off to make "
+                    "the node shared."
                 )
-        if conn.kind not in CONNECTION_KINDS:
-            raise ValueError(f"connection kind must be one of {', '.join(CONNECTION_KINDS)}.")
 
-    def validate_flow(self, flow: Flow) -> None:
-        if flow.kind not in FLOW_KINDS:
-            raise ValueError(f"flow kind must be one of {', '.join(FLOW_KINDS)}.")
-        if not flow.steps:
-            raise ValueError("a flow needs at least one step.")
-        for s in flow.steps:
-            for ref in (s.src, s.dst):
-                if ref not in self.components:
-                    raise ValueError(
-                        f"flow step references unknown component {ref!r}; add it with "
-                        "`component` first."
-                    )
+    def validate_edge(self, edge: Edge) -> None:
+        for ref in (edge.src, edge.dst):
+            if ref not in self.nodes:
+                raise ValueError(f"edge references unknown node {ref!r}.")
+        if edge.kind not in EDGE_KINDS:
+            raise ValueError(f"edge kind must be one of {', '.join(EDGE_KINDS)}.")
+        if edge.src == edge.dst:
+            raise ValueError(f"edge from {edge.src!r} to itself.")
 
-    def validate_decision(self, dec: Decision) -> None:
-        if dec.category not in DECISION_CATEGORIES:
-            raise ValueError(f"decision category must be one of {', '.join(DECISION_CATEGORIES)}.")
+    @staticmethod
+    def validate_decision(dec: Decision) -> None:
+        if not dec.topic.strip():
+            raise ValueError("a decision needs a topic.")
         names = [o.name for o in dec.options]
-        if names and dec.choice not in names:
+        if names and dec.choice and dec.choice not in names:
             raise ValueError(f"choice {dec.choice!r} must match one option name: {names}.")
 
-    # ---- gaps: what is THIN (advice; never refuses a tool call) ----
-
-    def component_gaps(self, comp: Component) -> list[str]:
-        gaps = []
-        if not comp.responsibility.strip():
-            gaps.append("no responsibility — one sentence on what it does")
-        if not comp.trace and not comp.existing:
-            gaps.append("no trace — which brief goal does it serve? (a component that serves none is YAGNI)")
-        if comp.kind == "store" and not (comp.data_owned or "").strip():
-            gaps.append("store with no data_owned — what data does it own?")
-        if self.scope_is_production() and not (comp.failure_notes or "").strip():
-            gaps.append(f"no failure_notes at {self.brief.scope} scope — what happens when it fails?")
-        return gaps
-
-    def connection_gaps(self, conn: Connection) -> list[str]:
-        gaps = []
-        if conn.kind == "async" and not (conn.mechanism or "").strip():
-            gaps.append("async with no mechanism — which queue/bus/stream carries it?")
-        if self.scope_is_production() and not (conn.failure_mode or "").strip():
-            gaps.append(f"no failure_mode at {self.brief.scope} scope — what does {conn.src} do when {conn.dst} is down?")
-        return gaps
-
     @staticmethod
-    def decision_gaps(dec: Decision) -> list[str]:
-        if len(dec.options) < 2:
-            return ["only one option — a choice without alternatives isn't a decision"]
-        return []
-
-    def gaps_by_subject(self) -> dict[str, list[str]]:
-        """Thinness keyed by what it is about ('api', 'api->db', 'd1').
-
-        The page renders this per node, so the rules for what counts as thin
-        live here only — the UI never re-implements them."""
-        out: dict[str, list[str]] = {}
-        for comp in self.components.values():
-            if gaps := self.component_gaps(comp):
-                out[comp.id] = gaps
-        for conn in self.connections:
-            if gaps := self.connection_gaps(conn):
-                out.setdefault(f"{conn.src}->{conn.dst}", []).extend(gaps)
-        for dec in self.decisions:
-            if gaps := self.decision_gaps(dec):
-                out[dec.id] = gaps
-        return out
-
-    def gaps(self) -> list[str]:
-        """Everything thin in the design, as '<subject>: <what's missing>' lines.
-        Read by the tracker, the page and the bundle — never by a gate."""
-        return [
-            f"{subject}: {gap}"
-            for subject, gaps in self.gaps_by_subject().items()
-            for gap in gaps
-        ]
-
-    def references_to(self, component_id: str) -> list[str]:
-        """Human-readable list of things that would dangle if the id vanished."""
-        refs = []
-        for c in self.connections:
-            if component_id in (c.src, c.dst):
-                refs.append(f"connection {c.src} -> {c.dst}")
-        for f in self.flows:
-            if any(component_id in (s.src, s.dst) for s in f.steps):
-                refs.append(f"flow {f.id!r}")
-        return refs
-
-    # ---- obligations (deterministic; the model can never write these) ----
-
-    def compute_obligations(self) -> None:
-        """Scope baseline + per-component risk signals. Called on top-level
-        approval and after structural amendments; preserves done/waived
-        statuses across recomputes."""
-        previous = {(o.component_id, o.facet): o.status for o in self.obligations}
-        critical: set[str] = set()
-        for flow in self.happy_flows():
-            for s in flow.steps:
-                critical.update((s.src, s.dst))
-
-        computed: list[Obligation] = []
-        scope = self.brief.scope
-        for comp in self.components.values():
-            if comp.existing:
-                continue  # brownfield background is frozen, not owed
-            facet = FACET_FOR_KIND.get(comp.kind)
-            if facet is None:
-                continue
-            reason = self._obligation_reason(comp, scope, comp.id in critical)
-            if reason is None:
-                continue
-            status = previous.get((comp.id, facet), "pending")
-            computed.append(Obligation(comp.id, facet, reason, status))
-        self.obligations = computed
-
-    @staticmethod
-    def _obligation_reason(comp: Component, scope: str, on_critical_flow: bool) -> str | None:
-        """Cost-of-change-later decides: schemas and public contracts always
-        owe depth at production scope; stateless internals usually don't."""
-        stateful = comp.kind in ("store", "cache")
-        public = comp.kind in ("api", "gateway")
-        backbone = comp.kind == "queue"
-        if scope == "prototype":
-            return None
-        if scope == "internal":
-            if stateful:
-                return "stateful — schema changes are expensive even internally"
-            if public and on_critical_flow:
-                return "public surface on the critical flow"
-            return None
-        # production / high_scale
-        if stateful:
-            return f"stateful at {scope} scope — the schema is the hardest thing to change later"
-        if public:
-            return f"public contract at {scope} scope"
-        if backbone:
-            return f"async backbone at {scope} scope — message contracts and delivery semantics"
-        if comp.kind == "llm":
-            return f"llm task contracts at {scope} scope — prompts, fallbacks, cost envelope"
-        if scope == "high_scale":
-            if comp.kind == "infra":
-                return "deployment topology at high scale"
-            if on_critical_flow:
-                return "on the critical flow at high scale"
-        return None
+    def validate_approach(app: Approach) -> None:
+        if not _ID_RE.match(app.id):
+            raise ValueError(f"approach id {app.id!r} must be kebab-case, e.g. 'queue-first'.")
+        if app.status not in STATUSES:
+            raise ValueError(f"approach status must be one of {', '.join(STATUSES)}.")
+        if app.status == "greyed" and not app.rejected_reason.strip():
+            raise ValueError(
+                "greying an approach needs the reason it lost — that reason is the "
+                "whole point of leaving it on the board."
+            )
 
     # ---- serialization ----
 
     def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        # asdict flattens facet dataclasses fine (facet_kind rides along);
-        # components stay a dict keyed by id
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArchState":
-        phase = d.get("phase", "brainstorm")
-        state = cls(mode=d.get("mode", "system"), phase=RETIRED_PHASES.get(phase, phase))
-        state.sketchbook = Sketchbook.from_dict(d.get("sketchbook"))
-        b = d.get("brief", {})
+        present = [k for k in LEGACY_KEYS if k in d]
+        if present:
+            raise LegacyStateError(
+                "this session was recorded by the previous arch harness "
+                f"(found: {', '.join(present)}). Its two-layer design cannot be "
+                "read into the current one-graph model — start a new session."
+            )
+        state = cls(handed_off=bool(d.get("handed_off", False)))
+        b = d.get("brief") or {}
         state.brief = Brief(
             goal=b.get("goal", ""),
             actors=list(b.get("actors", [])),
-            scope=b.get("scope", ""),
-            scale=Scale(**(b.get("scale") or {})),
-            latency=b.get("latency"),
-            consistency=b.get("consistency"),
-            availability=b.get("availability"),
-            deploy_target=b.get("deploy_target"),
+            scale=b.get("scale", ""),
             constraints=list(b.get("constraints", [])),
             non_goals=list(b.get("non_goals", [])),
         )
-        for cid, c in (d.get("components") or {}).items():
-            state.components[cid] = Component(
-                id=c["id"], name=c.get("name", cid), kind=c["kind"],
-                responsibility=c.get("responsibility", ""),
-                trace=list(c.get("trace", [])),
-                existing=bool(c.get("existing", False)),
-                tech=c.get("tech"), data_owned=c.get("data_owned"),
-                failure_notes=c.get("failure_notes"),
-                facet=facet_from_dict(c.get("facet")),
-                origin=c.get("origin", ""),
+        for aid, a in (d.get("approaches") or {}).items():
+            state.approaches[aid] = Approach(
+                id=a.get("id", aid),
+                name=a.get("name", aid),
+                summary=a.get("summary", ""),
+                status=a.get("status", "active"),
+                rejected_reason=a.get("rejected_reason", ""),
             )
-        state.connections = [Connection(**c) for c in d.get("connections", [])]
-        state.flows = [
-            Flow(
-                id=f["id"], name=f.get("name", f["id"]), kind=f.get("kind", "happy"),
-                steps=[FlowStep(**s) for s in f.get("steps", [])],
+        for nid, n in (d.get("nodes") or {}).items():
+            state.nodes[nid] = Node(
+                id=n.get("id", nid),
+                label=n.get("label", nid),
+                kind=n.get("kind", "service"),
+                responsibility=n.get("responsibility", ""),
+                tech=n.get("tech", ""),
+                depth=n.get("depth", "stub"),
+                detail=n.get("detail", ""),
+                approaches=list(n.get("approaches", [])),
+                status=n.get("status", "active"),
+                notes=n.get("notes", ""),
+                existing=bool(n.get("existing", False)),
+                x=n.get("x"),
+                y=n.get("y"),
             )
-            for f in d.get("flows", [])
+        state.edges = [
+            Edge(
+                src=e["src"], dst=e["dst"], label=e.get("label", ""),
+                kind=e.get("kind", "sync"), notes=e.get("notes", ""),
+            )
+            for e in d.get("edges", [])
         ]
         state.decisions = [
             Decision(
-                id=x["id"], topic=x.get("topic", ""), category=x.get("category", "other"),
+                id=x["id"], topic=x.get("topic", ""),
                 options=[Option(**o) for o in x.get("options", [])],
                 choice=x.get("choice", ""), rationale=x.get("rationale", ""),
-                status=x.get("status", "decided"),
                 source=x.get("source", "model"),
+                pragmatism_note=x.get("pragmatism_note", ""),
             )
             for x in d.get("decisions", [])
         ]
-        state.questions = [OpenQuestion(**q) for q in d.get("questions", [])]
-        state.concerns = [Concern(**c) for c in d.get("concerns", [])]
-        state.obligations = [Obligation(**o) for o in d.get("obligations", [])]
-        state.amendments = [Amendment(**a) for a in d.get("amendments", [])]
+        state.questions = [
+            Question(
+                id=q["id"], question=q.get("question", ""),
+                recommendation=q.get("recommendation", ""),
+                answer=q.get("answer", ""), status=q.get("status", "open"),
+            )
+            for q in d.get("questions", [])
+        ]
+        state.annotations = [
+            Annotation(
+                id=a["id"], text=a.get("text", ""),
+                x=a.get("x", 0), y=a.get("y", 0), w=a.get("w", 190),
+                anchor=a.get("anchor", ""),
+            )
+            for a in d.get("annotations", [])
+        ]
         return state
 
 
-def facet_from_dict(d: dict[str, Any] | None) -> Any | None:
-    if not d:
-        return None
-    kind = d.get("facet_kind")
-    if kind == "api":
-        return ApiFacet(endpoints=[Endpoint(**e) for e in d.get("endpoints", [])])
-    if kind == "store":
-        return StoreFacet(
-            entities=[Entity(**e) for e in d.get("entities", [])],
-            access_patterns=list(d.get("access_patterns", [])),
-            retention=d.get("retention"),
-            migration_risk=d.get("migration_risk"),
-        )
-    if kind == "queue":
-        return QueueFacet(messages=[QueueMessage(**m) for m in d.get("messages", [])])
-    if kind == "service":
-        modules = d.get("modules")
-        return ServiceFacet(
-            interface=list(d.get("interface", [])),
-            modules=[Module(**m) for m in modules] if modules is not None else None,
-        )
-    if kind == "llm":
-        return LlmFacet(tasks=[LlmTask(**t) for t in d.get("tasks", [])])
-    if kind == "infra":
-        return InfraFacet(
-            units=[DeployUnit(**u) for u in d.get("units", [])],
-            state_locality=d.get("state_locality", ""),
-        )
-    raise ValueError(f"unknown facet_kind {kind!r}")
+def slug(text: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", str(text).strip().lower()).strip("-")
+    return s or "node"

@@ -1,196 +1,129 @@
-"""The KG seed: the design, queryable before the code exists.
+"""The design, written into the knowledge graph at handoff.
 
-The point is not that nodes land in a file — it is that `kg_query` answers a
-builder's question on turn one of a greenfield session. So these tests ask the
-real KG real questions, through the same path the code harness uses.
+`architecture.md` answers "what am I building". This answers "what writes to the
+attempts table", asked eleven turns later — and, uniquely, "why is it like this"
+and "why not the other way", because decisions and losing approaches are seeded
+as queryable nodes too.
 """
 
-import json
-
-import pytest
+from __future__ import annotations
 
 from bird.context.kg import KG
 from bird.harnesses.arch.kg_seed import build_seed, seed_kg
 from bird.harnesses.arch.state import (
-    ApiFacet,
+    Approach,
     ArchState,
-    Component,
-    Connection,
-    Endpoint,
-    Entity,
-    Flow,
-    FlowStep,
-    QueueFacet,
-    QueueMessage,
-    StoreFacet,
+    Decision,
+    Edge,
+    Node,
+    Option,
 )
 
 
-def design() -> ArchState:
-    st = ArchState(phase="expand")
-    st.brief.goal = "capture orders"
-    st.components["order-api"] = Component(
-        id="order-api", name="order-api", kind="api",
-        responsibility="the public order surface", trace=["capture orders"],
-        facet=ApiFacet(endpoints=[
-            Endpoint(route="/orders", method="POST", request="{items, address}",
-                     response="{id, status}", auth="session cookie", errors=["422"]),
-        ]),
+def _designed() -> ArchState:
+    s = ArchState()
+    s.brief.goal = "relay webhooks"
+    s.approaches["queue-first"] = Approach(
+        id="queue-first", name="Queue first", status="greyed",
+        rejected_reason="the volume never justifies operating a broker",
     )
-    st.components["order-db"] = Component(
-        id="order-db", name="order-db", kind="store",
-        responsibility="durable order state", trace=["capture orders"],
-        data_owned="orders, lines, payment intents",
-        facet=StoreFacet(
-            entities=[Entity(name="order", keys="id",
-                             fields=["id", "user_id", "status", "total_cents"])],
-            access_patterns=["orders by user, newest first"],
-        ),
-    )
-    st.components["bus"] = Component(
-        id="bus", name="events-bus", kind="queue", responsibility="carries domain events",
-        facet=QueueFacet(messages=[
-            QueueMessage(name="OrderPlaced", schema="{order_id, total_cents}",
-                         ordering="per order_id", delivery="at-least-once", dlq_policy="5 tries"),
-        ]),
-    )
-    st.connections.append(Connection(src="order-api", dst="order-db", label="writes", kind="sync"))
-    st.connections.append(Connection(src="order-api", dst="bus", label="publishes",
-                                     kind="async", mechanism="nats jetstream"))
-    st.flows.append(Flow(id="place-order", name="place order", kind="happy", steps=[
-        FlowStep(src="order-api", dst="order-db", action="INSERT order"),
-        FlowStep(src="order-api", dst="bus", action="publish OrderPlaced"),
-    ]))
-    return st
+    s.nodes["api"] = Node(id="api", label="Ingest API", kind="api",
+                          responsibility="accepts the hook and 202s", tech="FastAPI")
+    s.nodes["store"] = Node(id="store", label="Attempts", kind="store",
+                            detail="attempts table; 30-day retention")
+    s.nodes["queue"] = Node(id="queue", label="Broker", kind="queue",
+                            approaches=["queue-first"])
+    s.edges.append(Edge("api", "store", "records attempts", notes="503s when it is down"))
+    s.decisions.append(Decision(
+        id="d1", topic="delivery", choice="in-process retry",
+        options=[Option(name="in-process retry"), Option(name="durable queue")],
+        rationale="a broker buys nothing at this volume",
+    ))
+    return s
 
 
-# ---------------------------------------------------------------- the shape
+def _labels(nodes):
+    return " || ".join(n["label"] for n in nodes)
 
 
-def test_every_component_and_its_internals_become_nodes():
-    nodes, edges = build_seed(design())
-    labels = {n["id"]: n["label"] for n in nodes}
+def test_a_box_label_carries_the_words_someone_would_search_for():
+    """`query()` matches on labels alone, so a bare id retrieves nothing."""
+    nodes, _ = build_seed(_designed())
+    assert "Ingest API — accepts the hook and 202s (on FastAPI)" in _labels(nodes)
 
-    assert "arch_order_db" in labels
-    assert "durable order state" in labels["arch_order_db"]
-    # the words a builder would search for are IN the label — query() matches
-    # on labels alone, so an id-only node would be unreachable
-    assert "total_cents" in labels["arch_order_db_entity_order"]
-    assert "/orders" in labels["arch_order_api_endpoint_post_orders"]
-    assert "at-least-once" in labels["arch_bus_message_orderplaced"]
+
+def test_every_seeded_node_says_it_came_from_the_design():
+    nodes, _ = build_seed(_designed())
+    assert all(n["file_type"] == "design" for n in nodes)
     assert all(n["_origin"] == "arch" for n in nodes)
-    # a hit must read as "the design said this", not as discovered code —
-    # source_location is what kg_query prints beside the node
-    assert all(n["source_file"].endswith(".md") for n in nodes)
-    assert all(n["source_location"].startswith("design:") for n in nodes)
+    assert all("design:" in n["source_location"] for n in nodes)
 
 
-def test_connections_and_flows_become_edges():
-    nodes, edges = build_seed(design())
-    pairs = {(e["source"], e["target"], e["relation"]) for e in edges}
-
-    assert ("arch_order_api", "arch_order_db", "writes") in pairs
-    assert ("arch_order_api", "arch_bus", "publishes") in pairs
-    assert ("arch_order_db", "arch_order_db_entity_order", "defines_entity") in pairs
-    assert ("arch_flow_place_order", "arch_order_db", "step_in_flow") in pairs
-    # the async edge keeps its mechanism, which is half of what makes it real
-    async_edge = next(e for e in edges if e["relation"] == "publishes")
-    assert "nats jetstream" in async_edge["context"]
+def test_edges_carry_their_label_and_failure_note():
+    _, edges = build_seed(_designed())
+    edge = next(e for e in edges if e["relation"] == "records_attempts")
+    assert edge["source"] == "arch_api" and edge["target"] == "arch_store"
+    assert "503s when it is down" in edge["context"]
 
 
-def test_no_edge_dangles():
-    """A connection to a component that vanished must not leave a half-edge —
-    node_link_graph would silently invent the missing node."""
-    st = design()
-    st.connections.append(Connection(src="order-api", dst="ghost", label="calls", kind="sync"))
-    nodes, edges = build_seed(st)
-    ids = {n["id"] for n in nodes}
-    assert all(e["source"] in ids and e["target"] in ids for e in edges)
+def test_a_decision_is_queryable_with_its_reason_and_its_rivals():
+    """"Why is it like this" is a question the graph should answer."""
+    nodes, _ = build_seed(_designed())
+    label = next(n["label"] for n in nodes if n["type"] == "decision")
+    assert "delivery → in-process retry" in label
+    assert "a broker buys nothing at this volume" in label
+    assert "[not: durable queue]" in label
 
 
-def test_a_black_box_component_still_lands():
-    st = ArchState()
-    st.components["ext"] = Component(id="ext", name="stripe", kind="external",
-                                     responsibility="takes the money")
-    nodes, _ = build_seed(st)
-    assert [n["id"] for n in nodes] == ["arch_ext"]
+def test_a_losing_approach_is_queryable_with_why_it_lost():
+    """"Why not X" — the other question a builder asks most."""
+    nodes, _ = build_seed(_designed())
+    label = next(n["label"] for n in nodes if n["type"] == "approach")
+    assert "Approach not taken: Queue first" in label
+    assert "Why not: the volume never justifies operating a broker" in label
 
 
-# ------------------------------------------------------- through the real KG
+def test_a_box_that_lost_is_seeded_marked_rather_than_dropped():
+    """"We considered this and dropped it" is a real answer to a query."""
+    nodes, _ = build_seed(_designed())
+    box = next(n for n in nodes if n["id"] == "arch_queue")
+    assert box["greyed"] is True
+    assert box["label"].startswith("[not taken]")
 
 
-@pytest.fixture
-def kg(tmp_path):
-    return KG(repo_root=tmp_path, store_dir=tmp_path / "kg-out")
+def test_a_boxs_detail_becomes_its_own_searchable_node():
+    nodes, edges = build_seed(_designed())
+    detail = next(n for n in nodes if n["type"] == "detail")
+    assert "30-day retention" in detail["label"]
+    assert any(e["relation"] == "detailed_as" for e in edges)
 
 
-def test_seeding_creates_a_graph_a_greenfield_session_can_query(kg):
-    """The whole point: no code on disk, and turn one can still ask."""
-    assert not kg.is_ready()
-    report = seed_kg(kg, design())
+def test_seeding_a_real_graph_makes_the_design_queryable(tmp_path):
+    kg = KG(repo_root=tmp_path, store_dir=tmp_path / "kg")
+    report = seed_kg(kg, _designed())
     assert "seeded the knowledge graph" in report
     assert kg.is_ready()
-
-    answer = kg.query("where are orders stored").text
-    assert "order-db" in answer
-    assert "durable order state" in answer
-
-    answer = kg.query("what publishes OrderPlaced").text
-    assert "OrderPlaced" in answer
-    assert "events-bus" in answer or "bus" in answer
-
-
-def test_seeding_merges_into_an_existing_graph_instead_of_replacing_it(kg):
-    """A brownfield repo already has a graph; the design joins it."""
-    kg.seed(
-        [{"id": "src_pay", "label": "charge_card", "type": "function",
-          "source_file": "src/pay.py"}],
-        [],
+    G = kg._load_graph()
+    assert any(
+        "design:" in str(nd.get("source_location", "")) for _, nd in G.nodes(data=True)
     )
-    seed_kg(kg, design())
-    graph = json.loads(kg.graph_path.read_text())
-    ids = {n["id"] for n in graph["nodes"]}
-    assert "src_pay" in ids and "arch_order_db" in ids
-    assert "charge_card" in kg.query("charge card").text
 
 
-def test_a_broken_graph_never_fails_the_finalize(kg, monkeypatch):
-    """The design is already on disk by then. A graph that won't take the seed
-    is a worse next session, not a failed architecture."""
-    def boom(*a, **k):
-        raise RuntimeError("disk on fire")
-
-    monkeypatch.setattr(kg, "seed", boom)
-    report = seed_kg(kg, design())
-    assert "not seeded" in report and "disk on fire" in report
+def test_no_graph_is_silence_not_a_failure():
+    assert seed_kg(None, _designed()) == ""
 
 
-def test_no_kg_is_not_an_error():
-    assert seed_kg(None, design()) == ""
+def test_a_graph_that_refuses_the_seed_never_fails_the_handoff():
+    """The design is already on disk by the time this runs; a bad graph is a
+    worse next session, not a lost one."""
+
+    class Broken:
+        def seed(self, nodes, edges):
+            raise RuntimeError("disk full")
+
+    report = seed_kg(Broken(), _designed())
+    assert "not seeded" in report and "the bundle is unaffected" in report
 
 
-def test_finalize_seeds_the_graph(tmp_path):
-    """Through the real gate: `done` writes the bundle and the graph together,
-    because a builder needs both — the prose to read and the graph to ask."""
-    from bird.harnesses.arch.session import ArchSession
-    from bird.harnesses.arch.tools import ArchDoneTool
-    from bird.tools import ToolContext
-
-    class Broker:
-        def request(self, payload):
-            return True, ""
-
-    run_dir = tmp_path / "run"
-    kg = KG(repo_root=tmp_path, store_dir=tmp_path / "kg-out")
-    session = ArchSession(state=design(), run_dir=run_dir, broker=Broker(),
-                          on_state=lambda e: None)
-    ctx = ToolContext(repo_root=tmp_path, arch=session, kg=kg)
-
-    res = ArchDoneTool().execute({"summary": "ship it"}, ctx)
-    assert not res.is_error, res.output
-    assert session.state.phase == "finalized"
-    assert "seeded the knowledge graph" in res.output
-    assert (run_dir / "bundle" / "architecture.md").is_file()
-    # the graph points back at the bundle it was seeded from
-    assert kg.is_ready()
-    assert "order-db" in kg.query("where are orders stored").text
+def test_an_empty_design_seeds_nothing():
+    assert build_seed(ArchState()) == ([], [])

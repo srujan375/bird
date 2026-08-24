@@ -31,8 +31,11 @@ class HarnessDef:
     tracker: Callable[[ToolContext], str | None] | None = None
     tracker_prefix: str | None = None
     explore_nudge: str | None = None
-    # arch opens a browser and blocks on human gates; a harness with this set
-    # cannot be dispatched headless without silently auto-approving those gates
+    # which tool ends a session. None = the engine's default ("done"); arch
+    # names its own, because handing a design off is not finishing a task.
+    done_tool: str | None = None
+    # arch opens a browser and expects a person in the room; a harness with this
+    # set is not something to dispatch headless and call a design session
     interactive: bool = False
     # `done` refuses to close over files edited since the last passing check.
     # Only for harnesses that edit the repo and can run its tests — arch and
@@ -55,18 +58,18 @@ def _code_def() -> HarnessDef:
 def _arch_def() -> HarnessDef:
     from . import arch as _  # noqa: F401  (ensure package import)
     from .arch import harness as a
-    from .arch.render import TRACKER_PREFIX
-    from .arch.tools import arch_harness_tools
+    from .arch.tools import MUTATING_TOOLS, arch_harness_tools
 
     return HarnessDef(
         name="arch",
         tools=arch_harness_tools,
         instructions_path=a.INSTRUCTIONS_PATH,
         default_model="architect",
-        mutating_tools=a.MUTATING_TOOLS,
+        mutating_tools=MUTATING_TOOLS,
         tracker=a.arch_tracker,
-        tracker_prefix=TRACKER_PREFIX,
+        tracker_prefix=a.TRACKER_PREFIX,
         explore_nudge=a.EXPLORE_NUDGE,
+        done_tool="handoff",
         interactive=True,
     )
 
@@ -147,4 +150,5 @@ def build_runner(
         tracker_prefix=d.tracker_prefix,
         explore_nudge=d.explore_nudge,
         seed_context=seed_context,
+        done_tool=d.done_tool,
     )

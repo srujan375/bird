@@ -1,0 +1,612 @@
+/* ─── tokens · modern-minimal, bound verbatim ─────────────────────────── */
+:root{
+  --bg:      oklch(99% 0.002 240);
+  --surface: oklch(100% 0 0);
+  --fg:      oklch(18% 0.012 250);
+  --muted:   oklch(54% 0.012 250);
+  --border:  oklch(92% 0.005 250);
+  --accent:  oklch(58% 0.18 255);
+
+  --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+  --font-body:    -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  --font-mono:    ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+
+  /* derived — contrast-safe secondary ink (raw --muted is 3.9:1 on --bg,
+     under the 4.5:1 floor for body text, so text uses this instead) */
+  --ink-2:      color-mix(in oklch, var(--muted) 62%, var(--fg));
+  --accent-ink: color-mix(in oklch, var(--accent) 80%, black);
+  --accent-dim: color-mix(in oklch, var(--accent) 12%, transparent);
+  --fg-soft:    color-mix(in oklch, var(--fg) 6%, transparent);
+  --fg-hair:    color-mix(in oklch, var(--fg) 12%, transparent);
+
+  /* territory — paper tone, not colour. ~2% chroma, never a wash of accent.
+     Five steps at locked L and C: only the hue moves, so no column can shout
+     louder than another. A lane takes a step by its position in the approach
+     list (adapter.ts) and wears it as --lane-tint / --lane-edge / --lane-line,
+     so a third approach needs no new rule. Hue order is chosen so the common
+     cases — two or three approaches — land furthest apart. */
+  --ramp-1-tint: oklch(97.5% 0.018 168);
+  --ramp-1-line: oklch(69% 0.075 168);
+  --ramp-1-edge: color-mix(in oklch, var(--ramp-1-line) 32%, transparent);
+  --ramp-2-tint: oklch(97.5% 0.018 302);
+  --ramp-2-line: oklch(69% 0.075 302);
+  --ramp-2-edge: color-mix(in oklch, var(--ramp-2-line) 32%, transparent);
+  --ramp-3-tint: oklch(97.5% 0.018 35);
+  --ramp-3-line: oklch(69% 0.075 35);
+  --ramp-3-edge: color-mix(in oklch, var(--ramp-3-line) 32%, transparent);
+  --ramp-4-tint: oklch(97.5% 0.018 235);
+  --ramp-4-line: oklch(69% 0.075 235);
+  --ramp-4-edge: color-mix(in oklch, var(--ramp-4-line) 32%, transparent);
+  --ramp-5-tint: oklch(97.5% 0.018 95);
+  --ramp-5-line: oklch(69% 0.075 95);
+  --ramp-5-edge: color-mix(in oklch, var(--ramp-5-line) 32%, transparent);
+  /* the shared spine is not an approach, so it takes no hue and no edge tint */
+  --ramp-s-tint: oklch(98.6% 0.002 250);
+  --ramp-s-line: var(--border);
+  --ramp-s-edge: var(--border);
+
+  --danger: oklch(51% 0.175 27);   /* the only semantic colour; used once, on rejected files */
+
+  --grid: oklch(94.5% 0.004 250);
+  --edge: oklch(58% 0.014 250);
+
+  --r: 10px;
+  --rail: 400px;
+  --bar: 52px;
+
+  --ease-in-out: cubic-bezier(.22,.61,.24,1);
+  --ease-out:    cubic-bezier(.16,1,.3,1);
+  color-scheme: light;
+}
+
+*,*::before,*::after{ box-sizing:border-box; }
+html,body{ height:100%; margin:0; overflow:hidden; }
+body{
+  background:var(--bg); color:var(--fg);
+  font-family:var(--font-body); font-size:14px; line-height:1.5;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+}
+button,input,textarea{ font:inherit; color:inherit; }
+button{ cursor:pointer; background:none; border:0; padding:0; }
+p{ margin:0; text-wrap:pretty; }
+:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; border-radius:6px; }
+.mono{ font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
+
+/* ─── shell ───────────────────────────────────────────────────────────── */
+/* `minmax(0,1fr)`, not `1fr`: an auto track's floor is its content's min-content
+   width, and the appbar's title is `white-space:nowrap`, so its min-content is
+   the whole string. A long goal used to size this track wider than the window —
+   which pushed `.split`, and with it the chat rail, clean off the right edge
+   with no way to scroll to it (`body` is `overflow:hidden`). */
+.app{ height:100%; display:grid; grid-template-rows:var(--bar) 1fr; grid-template-columns:minmax(0,1fr); }
+
+.appbar{
+  display:flex; align-items:center; gap:16px;
+  padding:0 16px 0 20px;
+  border-bottom:1px solid var(--border);
+  background:var(--bg);
+}
+.appbar .goal{
+  margin:0; font-family:var(--font-display); font-size:15px; font-weight:600;
+  letter-spacing:-.012em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  /* so the ellipsis can actually happen: a flex item will not shrink below its
+     own min-content unless told it may, and nowrap text has no wrap point */
+  min-width:0;
+}
+.appbar .sub{ color:var(--ink-2); font-size:12.5px; white-space:nowrap; }
+.appbar .spacer{ flex:1; }
+.bar-btn{
+  font-size:12.5px; color:var(--ink-2);
+  padding:5px 10px; border-radius:7px; border:1px solid transparent;
+  transition:background .16s var(--ease-in-out), color .16s var(--ease-in-out);
+}
+.bar-btn:hover{ background:var(--fg-soft); color:var(--fg); }
+.split{
+  display:grid; grid-template-columns:minmax(0,1fr) var(--rail); min-height:0;
+  transition:grid-template-columns .42s var(--ease-in-out);
+}
+.app[data-chat="closed"] .split{ grid-template-columns:1fr 0px; }
+.split.sizing{ transition:none; }
+
+/* the appbar's sidebar toggle */
+.chat-toggle{ display:inline-flex; align-items:center; gap:7px; }
+.chat-toggle svg{ width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.4; }
+.chat-toggle svg .pane{ fill:currentColor; stroke:none; transition:opacity .2s var(--ease-in-out); }
+.app[data-chat="closed"] .chat-toggle svg .pane{ opacity:.22; }
+.chat-toggle .unread{
+  width:5px; height:5px; border-radius:50%; background:var(--fg);
+  transform:scale(0); transition:transform .34s var(--ease-out);
+}
+.chat-toggle[data-unread="1"] .unread{ transform:scale(1); }
+
+/* ─── board ───────────────────────────────────────────────────────────── */
+.board{ position:relative; overflow:hidden; background:var(--bg); }
+.viewport{
+  position:absolute; inset:0; cursor:default;
+  background-image:radial-gradient(var(--grid) 1px, transparent 1px);
+  background-size:24px 24px;
+}
+.viewport[data-tool="node"],.viewport[data-tool="note"]{ cursor:crosshair; }
+.viewport[data-panning="1"]{ cursor:grabbing; }
+.world{ position:absolute; top:0; left:0; width:1400px; height:1200px; transform-origin:0 0; }
+
+/* lanes */
+.lane{
+  position:absolute; border:1px dashed var(--lane-edge, var(--border)); border-radius:16px;
+  background:var(--lane-tint, transparent);
+  transition:background .7s var(--ease-in-out), border-color .7s var(--ease-in-out), opacity .7s var(--ease-in-out);
+}
+.lane[data-out="1"]{
+  background:repeating-linear-gradient(-45deg, var(--fg-soft) 0 1px, transparent 1px 9px);
+  border-color:var(--border);
+}
+/* Bounded on the right, or the approach's name wraps a letter at a time down
+   the left edge of its own lane and the note runs out under the boxes. The name
+   holds one line and the note takes what is left. */
+.lane-label{
+  position:absolute; top:11px; left:16px; right:16px;
+  display:flex; align-items:baseline; gap:8px;
+  font-family:var(--font-mono); font-size:11px; letter-spacing:.07em; text-transform:uppercase;
+  color:var(--ink-2);
+}
+.lane-label b{
+  font-weight:600; color:var(--fg); letter-spacing:.07em;
+  flex:none; max-width:58%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.lane[data-out="1"] .lane-label b{ color:var(--ink-2); }
+/* Two lines of summary is a caption; the rest is the conversation's job. A
+   rejected lane is the exception — its note is the reason it lost, which is
+   what that lane is still on the board to say. The full text is in `title`
+   either way. */
+.lane-note{
+  font-family:var(--font-body); font-size:12px; line-height:1.35;
+  letter-spacing:0; text-transform:none; color:var(--ink-2);
+  flex:1; min-width:0;
+  display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden;
+}
+.lane[data-out="1"] .lane-note{ -webkit-line-clamp:6; }
+.taken{
+  font-family:var(--font-mono); font-size:10px; letter-spacing:.08em;
+  padding:2px 6px; border:1px solid var(--fg); border-radius:999px; color:var(--fg);
+}
+
+/* wires */
+.wires{ position:absolute; top:0; left:0; width:1400px; height:1200px; overflow:visible; pointer-events:none; }
+.wires path.wire{ fill:none; stroke:var(--edge); stroke-width:1.5; }
+.wires path.wire[data-out="1"]{ stroke:color-mix(in oklch, var(--muted) 45%, transparent); stroke-dasharray:5 5; }
+.wires path.wire[data-lit="1"]{ stroke:var(--accent); stroke-width:2; }
+.wires marker path{ fill:var(--edge); stroke:none; }
+.wires marker#head-out path{ fill:color-mix(in oklch, var(--muted) 45%, transparent); }
+.wires marker#head-lit path{ fill:var(--accent); }
+.wires text.wire-label{
+  font-family:var(--font-mono); font-size:10.5px; fill:var(--ink-2);
+  paint-order:stroke; stroke:var(--bg); stroke-width:4px; stroke-linejoin:round;
+}
+@keyframes draw{ to{ stroke-dashoffset:0; } }
+.wires path.drawing{ animation:draw .85s var(--ease-out) forwards; }
+
+/* ─── node ────────────────────────────────────────────────────────────── */
+.node{
+  position:absolute; background:var(--surface);
+  border:1px solid var(--border); border-radius:var(--r);
+  padding:9px 12px 10px; cursor:grab; user-select:none;
+  transition:border-color .2s var(--ease-in-out), box-shadow .2s var(--ease-in-out),
+             transform .55s var(--ease-out), opacity .55s var(--ease-out);
+}
+.node:active{ cursor:grabbing; }
+.node[data-depth="stub"]{ border-style:dashed; background:color-mix(in oklch, var(--surface) 55%, transparent); }
+.node[data-depth="detailed"]{ box-shadow:0 1px 2px color-mix(in oklch, var(--fg) 7%, transparent); }
+.node[data-lane]{ border-color:color-mix(in oklch, var(--border) 50%, var(--lane-line, var(--border))); }
+.node:hover{ border-color:color-mix(in oklch, var(--fg) 30%, transparent); }
+.node:focus-visible{ outline:2px solid var(--accent); outline-offset:3px; border-radius:var(--r); }
+.node[data-sel="1"]{ border-color:var(--accent); border-style:solid; box-shadow:0 0 0 3px var(--accent-dim); }
+
+.node-head{ display:flex; align-items:baseline; gap:8px; }
+.node-label{
+  font-size:13.5px; font-weight:600; letter-spacing:-.008em; line-height:1.3;
+  flex:1; min-width:0; overflow-wrap:anywhere;
+}
+.node-label[contenteditable="true"]{
+  outline:none; border-bottom:1.5px solid var(--accent); cursor:text; user-select:text;
+}
+.node-kind{
+  font-family:var(--font-mono); font-size:10px; letter-spacing:.06em;
+  color:var(--ink-2); flex:none;
+}
+.node-resp{
+  font-size:12.5px; line-height:1.42; color:var(--ink-2); margin-top:5px;
+}
+.node-deep{ margin-top:9px; border-top:1px solid var(--border); padding-top:8px; }
+.node-tech{
+  font-family:var(--font-mono); font-size:11px; color:var(--fg); letter-spacing:-.01em;
+}
+.node-rows{ list-style:none; margin:7px 0 0; padding:0; display:grid; gap:3px; }
+.node-rows li{
+  font-family:var(--font-mono); font-size:11px; color:var(--ink-2);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+
+/* retired */
+.node[data-out="1"]{ background:transparent; border-style:dashed; border-color:var(--border); box-shadow:none; }
+.node[data-out="1"] .node-label{
+  color:var(--ink-2); font-weight:500;
+  text-decoration:line-through;
+  text-decoration-color:color-mix(in oklch, var(--muted) 55%, transparent);
+}
+.node[data-out="1"] .node-resp,.node[data-out="1"] .node-rows li{ color:var(--muted); }
+.node[data-out="1"] .node-tech{ color:var(--ink-2); }
+
+/* the just-changed halo */
+@keyframes halo{
+  0%{ box-shadow:0 0 0 0 var(--accent-dim); }
+  35%{ box-shadow:0 0 0 9px color-mix(in oklch, var(--accent) 4%, transparent); }
+  100%{ box-shadow:0 0 0 0 color-mix(in oklch, var(--accent) 0%, transparent); }
+}
+.node.just{ animation:halo 1.9s var(--ease-out) 2; }
+
+/* arrival */
+.node.arriving{ opacity:0; transform:translateY(30px) scale(.95); }
+
+/* deepening — the box grows and the new lines rise into it */
+@keyframes grew{ from{ opacity:0; transform:translateY(24px); } to{ opacity:1; transform:none; } }
+.node.grew .node-resp,.node.grew .node-deep{ animation:grew .55s var(--ease-out) both; }
+.node.grew .node-deep{ animation-delay:.09s; }
+
+/* port */
+.port{
+  position:absolute; right:-7px; top:50%; margin-top:-7px;
+  width:14px; height:14px; border-radius:50%;
+  background:var(--surface); border:1.5px solid var(--fg);
+  opacity:0; visibility:hidden; transform:scale(.5);
+  transition:opacity .18s, transform .18s var(--ease-out), border-color .14s, visibility .18s;
+  cursor:crosshair;
+}
+.port:hover{ border-color:var(--accent); }
+.node:hover .port,.node[data-sel="1"] .port{ opacity:1; visibility:visible; transform:scale(1); }
+.node[data-out="1"] .port{ display:none; }
+
+/* node toolbar */
+.node-bar{
+  position:absolute; left:50%; transform:translate(-50%,10px);
+  bottom:-14px; display:flex; gap:2px; padding:3px;
+  background:var(--surface); border:1px solid var(--border); border-radius:9px;
+  box-shadow:0 4px 14px color-mix(in oklch, var(--fg) 10%, transparent);
+  opacity:0; visibility:hidden; pointer-events:none;
+  transition:opacity .22s var(--ease-out), transform .22s var(--ease-out), visibility .22s;
+}
+.node[data-sel="1"] .node-bar{ opacity:1; visibility:visible; pointer-events:auto; transform:translate(-50%,100%); }
+.node-bar button{
+  width:26px; height:24px; display:grid; place-items:center; border-radius:6px;
+  color:var(--ink-2); transition:background .14s, color .14s;
+}
+.node-bar button:hover{ background:var(--fg-soft); color:var(--fg); }
+.node-bar button svg{ width:14px; height:14px; stroke:currentColor; fill:none; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
+.node-bar .sep{ width:1px; margin:3px 2px; background:var(--border); }
+
+/* annotations */
+.anno{
+  position:absolute; max-width:190px; padding:6px 10px;
+  border:1px dashed color-mix(in oklch, var(--muted) 45%, transparent);
+  border-radius:8px; background:color-mix(in oklch, var(--surface) 60%, transparent);
+  font-size:12px; line-height:1.38; color:var(--ink-2); cursor:grab;
+  transition:transform .55s var(--ease-out), opacity .55s var(--ease-out), border-color .18s;
+}
+.anno:hover{ border-color:color-mix(in oklch, var(--fg) 34%, transparent); }
+.anno::before{
+  content:''; position:absolute; left:-4px; top:-4px;
+  width:7px; height:7px; border-radius:50%;
+  background:color-mix(in oklch, var(--muted) 60%, transparent);
+}
+.anno[data-sel="1"]{ border-style:solid; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
+.anno.arriving{ opacity:0; transform:translateY(26px); }
+.anno[contenteditable="true"]{ outline:none; cursor:text; user-select:text; border-style:solid; border-color:var(--accent); color:var(--fg); }
+
+/* ─── floating board controls ─────────────────────────────────────────── */
+.dock,.zoomer{
+  position:absolute; bottom:16px; z-index:4;
+  display:flex; align-items:center; gap:2px; padding:4px;
+  background:color-mix(in oklch, var(--surface) 88%, transparent);
+  backdrop-filter:blur(10px);
+  border:1px solid var(--border); border-radius:11px;
+  box-shadow:0 2px 10px color-mix(in oklch, var(--fg) 7%, transparent);
+}
+.dock{ left:16px; }
+.zoomer{ right:16px; }
+.dock button,.zoomer button{
+  height:28px; min-width:28px; padding:0 8px;
+  display:grid; place-items:center; border-radius:7px;
+  color:var(--ink-2); font-size:12.5px;
+  transition:background .14s var(--ease-in-out), color .14s var(--ease-in-out);
+}
+.dock button:hover,.zoomer button:hover{ background:var(--fg-soft); color:var(--fg); }
+/* nothing has been moved by hand, so there is nothing to hand back */
+.zoomer button:disabled{ color:var(--muted); cursor:default; }
+.zoomer button:disabled:hover{ background:transparent; color:var(--muted); }
+.dock button[data-on="1"]{ background:var(--fg); color:var(--surface); }
+.dock button svg,.zoomer button svg{ width:15px; height:15px; stroke:currentColor; fill:none; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
+.zoomer .lvl{ font-family:var(--font-mono); font-size:11.5px; min-width:44px; text-align:center; color:var(--ink-2); }
+.dock .sep,.zoomer .sep{ width:1px; align-self:stretch; margin:4px 3px; background:var(--border); }
+
+/* The hint floats over the canvas, so whatever the board has drawn under it
+   reads through the gaps between the words. It carries its own ground for the
+   same reason the dock does. */
+.hint{
+  position:absolute; left:16px; bottom:56px; z-index:3;
+  padding:4px 9px; border-radius:9px;
+  background:color-mix(in oklch, var(--surface) 84%, transparent);
+  backdrop-filter:blur(8px);
+  font-size:11.5px; color:var(--ink-2); letter-spacing:-.002em;
+  pointer-events:none;
+}
+.hint kbd{
+  font-family:var(--font-mono); font-size:10.5px; padding:1px 4px;
+  border:1px solid var(--border); border-radius:4px; background:var(--surface);
+}
+
+/* ─── chat ────────────────────────────────────────────────────────────── */
+.chat{
+  position:relative; overflow:hidden; min-width:0; min-height:0;
+  border-left:1px solid var(--border); background:var(--bg);
+  transition:border-color .18s var(--ease-in-out);
+}
+.app[data-chat="closed"] .chat{ border-left-color:transparent; }
+.chat:has(.grip:hover),.chat:has(.grip[data-on="1"]),.chat:has(.grip:focus-visible){
+  border-left-color:var(--fg);
+}
+/* the interior keeps its width and slides out of the clip, so the
+   conversation never reflows on the way to being put away */
+.chat-inner{
+  position:absolute; top:0; right:0; width:var(--rail); height:100%;
+  display:grid; grid-template-rows:1fr auto; min-height:0;
+}
+/* drag the seam to resize the rail */
+.grip{
+  position:absolute; left:0; top:0; width:9px; height:100%; z-index:4;
+  cursor:col-resize; touch-action:none;
+}
+.grip::after{
+  content:''; position:absolute; left:0; top:0; width:2px; height:100%;
+  background:transparent; transition:background .16s var(--ease-in-out);
+}
+.grip[data-on="1"]::after{ background:var(--fg); }
+.grip:focus-visible{ outline-offset:-4px; }
+.app[data-chat="closed"] .grip{ display:none; }
+.thread{ overflow-y:auto; padding:22px 22px 8px; scrollbar-width:thin; }
+.thread::-webkit-scrollbar{ width:9px; }
+.thread::-webkit-scrollbar-thumb{ background:var(--border); border-radius:99px; border:3px solid var(--bg); }
+
+.turn{ margin-bottom:22px; }
+.turn.entering{ opacity:0; transform:translateY(26px); }
+.turn{ transition:opacity .55s var(--ease-out), transform .55s var(--ease-out); }
+
+.say{ font-size:14px; line-height:1.58; letter-spacing:-.003em; }
+.say + .say{ margin-top:10px; }
+.say em{ font-style:normal; color:var(--ink-2); }
+
+.turn.you{
+  border-left:2px solid var(--fg); padding-left:13px;
+}
+.turn.you .who{
+  font-family:var(--font-mono); font-size:11px; letter-spacing:.09em;
+  text-transform:uppercase; color:var(--ink-2); display:block; margin-bottom:5px;
+}
+.turn.you .say{ color:var(--fg); }
+
+/* the one line the model's machinery gets */
+.board-line{
+  display:flex; align-items:center; gap:8px; width:100%;
+  margin-top:12px; padding:6px 9px; border-radius:8px;
+  font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2);
+  border:1px solid transparent; text-align:left;
+  transition:background .16s var(--ease-in-out), border-color .16s var(--ease-in-out), color .16s var(--ease-in-out);
+}
+button.board-line:hover{ background:var(--fg-soft); border-color:var(--border); color:var(--fg); }
+.board-line .dot{ width:5px; height:5px; border-radius:50%; background:var(--muted); flex:none; }
+.board-line .go{ margin-left:auto; opacity:0; transition:opacity .16s; }
+button.board-line:hover .go,button.board-line:focus-visible .go{ opacity:1; }
+
+/* question + reply chips */
+.ask{ margin-top:14px; }
+.ask q{ display:block; font-size:14px; line-height:1.5; quotes:none; }
+.chips{ display:flex; flex-wrap:wrap; gap:7px; margin-top:11px; }
+.chip{
+  display:inline-flex; align-items:baseline; gap:7px;
+  padding:7px 12px; border-radius:999px;
+  border:1px solid var(--border); background:var(--surface);
+  font-size:13px; letter-spacing:-.005em; color:var(--fg);
+  transition:border-color .16s var(--ease-in-out), background .16s var(--ease-in-out), transform .12s var(--ease-out);
+}
+.chip:hover{ border-color:var(--fg); background:var(--fg-soft); }
+.chip:active{ transform:translateY(1px); }
+.chip[data-rec="1"]{ border-color:var(--fg); }
+.chip .rec{
+  font-family:var(--font-mono); font-size:10px; letter-spacing:.07em;
+  color:var(--ink-2); text-transform:uppercase;
+}
+.chip:hover .rec{ color:var(--fg); }
+.chips.spent{ pointer-events:none; }
+.chips.spent .chip{ opacity:.55; }
+.chips.spent .chip[data-picked="1"]{ opacity:1; border-color:var(--fg); background:var(--fg-soft); }
+
+.thinking{ display:flex; gap:5px; align-items:center; height:18px; }
+.thinking i{
+  width:5px; height:5px; border-radius:50%; background:var(--muted);
+  animation:blip 1.25s var(--ease-in-out) infinite;
+}
+.thinking i:nth-child(2){ animation-delay:.16s; }
+.thinking i:nth-child(3){ animation-delay:.32s; }
+@keyframes blip{ 0%,60%,100%{ opacity:.25; transform:translateY(0); } 30%{ opacity:1; transform:translateY(-4px); } }
+
+/* composer */
+.composer{ border-top:1px solid var(--border); padding:14px 16px 16px; background:var(--bg); }
+.composer-box{
+  border:1px solid var(--border); border-radius:12px; background:var(--surface);
+  padding:10px 12px 8px; transition:border-color .16s var(--ease-in-out), box-shadow .16s var(--ease-in-out);
+}
+.composer-box:focus-within{ border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
+.composer textarea{
+  width:100%; border:0; outline:none; resize:none; background:none;
+  font-size:14px; line-height:1.5; max-height:132px; min-height:22px;
+}
+.composer textarea::placeholder{ color:var(--ink-2); }
+.composer-foot{ display:flex; align-items:center; gap:10px; margin-top:7px; }
+.composer-foot .tip{ font-size:11.5px; color:var(--ink-2); }
+.send{
+  margin-left:auto; padding:6px 14px; border-radius:8px;
+  background:var(--accent-ink); color:var(--surface);
+  font-size:13px; font-weight:500; letter-spacing:-.005em;
+  transition:background .16s var(--ease-in-out), transform .1s var(--ease-out);
+}
+.send:hover{ background:color-mix(in oklch, var(--accent) 62%, black); }
+.send:active{ transform:translateY(1px); }
+.send:disabled{ background:color-mix(in oklch, var(--muted) 30%, var(--border)); color:var(--ink-2); cursor:default; }
+
+/* the board with nothing on it says what to do next */
+.board-empty{
+  position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  z-index:2; width:min(360px, calc(100% - 48px)); text-align:center;
+  pointer-events:none;
+}
+.board-empty[hidden]{ display:none; }
+.be-title{
+  font-family:var(--font-display); font-size:16px; font-weight:600;
+  letter-spacing:-.012em; color:var(--fg); margin:0 0 7px;
+}
+.be-body{ font-size:13px; line-height:1.55; color:var(--ink-2); margin:0; text-wrap:balance; }
+.be-body kbd{
+  font-family:var(--font-mono); font-size:11px; padding:1px 5px;
+  border:1px solid var(--border); border-radius:4px; background:var(--surface); color:var(--fg);
+}
+
+/* the one thing that can actually fail here */
+.composer-error{
+  margin:0 0 9px; font-size:12.5px; line-height:1.45; color:var(--danger);
+  display:flex; align-items:flex-start; gap:7px;
+}
+.composer-error[hidden]{ display:none; }
+.composer-error svg{
+  width:14px; height:14px; flex:none; margin-top:2px;
+  fill:none; stroke:currentColor; stroke-width:1.6; stroke-linecap:round;
+}
+
+/* ─── attachments ─────────────────────────────────────────────────────── */
+.attach{
+  width:30px; height:30px; margin-left:-5px; flex:none;
+  display:grid; place-items:center; border-radius:8px; color:var(--ink-2);
+  transition:background .16s var(--ease-in-out), color .16s var(--ease-in-out);
+}
+.attach svg{
+  width:16px; height:16px; fill:none; stroke:currentColor;
+  stroke-width:1.5; stroke-linecap:round; stroke-linejoin:round;
+}
+.attach:hover{ background:var(--fg-soft); color:var(--fg); }
+
+/* what is staged but not sent yet */
+.tray{ display:flex; flex-wrap:wrap; gap:9px; margin-bottom:10px; }
+.tray:empty{ display:none; }
+.att{
+  position:relative; display:inline-flex; align-items:center; gap:8px;
+  border:1px solid var(--border); border-radius:9px; background:var(--bg);
+  max-width:100%;
+  transition:opacity .26s var(--ease-out), transform .26s var(--ease-out);
+}
+.att.arriving{ opacity:0; transform:scale(.86); }
+.att svg{ width:14px; height:14px; flex:none; fill:none; stroke:var(--ink-2); stroke-width:1.5; }
+.att .nm{
+  font-size:12.5px; letter-spacing:-.004em; max-width:148px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.att .sz{ font-family:var(--font-mono); font-size:10.5px; color:var(--ink-2); }
+.att-file{ padding:6px 10px; }
+.att-img{ width:52px; height:52px; overflow:hidden; }
+.att-img img{ width:100%; height:100%; object-fit:cover; display:block; }
+.att-x{
+  position:absolute; top:-7px; right:-7px; width:19px; height:19px;
+  display:grid; place-items:center; border-radius:50%;
+  background:var(--fg); color:var(--bg);
+  opacity:0; transform:scale(.6);
+  transition:opacity .14s var(--ease-in-out), transform .16s var(--ease-out);
+}
+.att-x svg{ width:9px; height:9px; stroke:currentColor; stroke-width:2.4; }
+.att:hover .att-x,.att-x:focus-visible{ opacity:1; transform:scale(1); }
+
+/* drag a file anywhere over the rail */
+.composer-box.dropping{ border-color:var(--fg); background:var(--fg-soft); }
+.drop-note{
+  display:none; margin:0 0 8px; color:var(--fg);
+  font-family:var(--font-mono); font-size:11.5px; letter-spacing:.04em;
+}
+.composer-box.dropping .drop-note{ display:block; }
+
+/* what was actually sent, inside the turn */
+.turn .files{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.shot{
+  border:1px solid var(--border); border-radius:9px; overflow:hidden;
+  background:var(--surface); line-height:0;
+  transition:border-color .16s var(--ease-in-out), transform .12s var(--ease-out);
+}
+.shot img{ display:block; max-width:164px; max-height:128px; object-fit:cover; }
+.shot:hover{ border-color:var(--fg); }
+.shot:active{ transform:translateY(1px); }
+.doc{
+  display:inline-flex; align-items:center; gap:8px; max-width:100%;
+  padding:7px 10px; border:1px solid var(--border); border-radius:9px;
+  background:var(--surface);
+}
+.doc svg{ width:14px; height:14px; flex:none; fill:none; stroke:var(--ink-2); stroke-width:1.5; }
+.doc .nm{
+  font-size:12.5px; max-width:176px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.doc .sz{ font-family:var(--font-mono); font-size:10.5px; color:var(--ink-2); }
+
+/* full-size look at a screenshot */
+.lightbox{
+  position:fixed; inset:0; z-index:60; display:grid; place-items:center;
+  padding:56px 48px 64px; cursor:zoom-out;
+  background:color-mix(in oklch, var(--fg) 64%, transparent);
+  opacity:0; transition:opacity .3s var(--ease-in-out);
+}
+.lightbox[data-on="1"]{ opacity:1; }
+.lightbox img{
+  max-width:100%; max-height:100%; border-radius:10px; background:var(--bg);
+  box-shadow:0 26px 64px color-mix(in oklch, var(--fg) 38%, transparent);
+  transform:translateY(28px) scale(.94);
+  transition:transform .5s var(--ease-out);
+}
+.lightbox[data-on="1"] img{ transform:none; }
+.lightbox .cap{
+  position:absolute; left:0; right:0; bottom:22px; text-align:center;
+  font-size:11.5px; color:var(--bg);
+}
+
+/* ─── responsive ──────────────────────────────────────────────────────── */
+@media (max-width:940px){
+  .split{
+    grid-template-columns:1fr; grid-template-rows:minmax(0,54fr) minmax(0,46fr);
+    transition:grid-template-rows .42s var(--ease-in-out);
+  }
+  .app[data-chat="closed"] .split{ grid-template-columns:1fr; grid-template-rows:1fr 0px; }
+  .chat{ border-left:0; border-top:1px solid var(--border); }
+  .app[data-chat="closed"] .chat{ border-top-color:transparent; }
+  .chat-inner{ width:100%; height:100%; top:auto; bottom:0; }
+  .grip{ display:none; }
+  .appbar .sub{ display:none; }
+  .hint{ display:none; }
+  .attach{ width:44px; height:44px; margin-left:-9px; }
+  .lightbox{ padding:24px 20px 56px; }
+}
+
+@media (max-width:560px){
+  .appbar{ padding:0 10px 0 14px; gap:10px; }
+  .bar-btn{ padding:5px 8px; }
+  .wide{ display:none; }
+  .chat-toggle span:not(.unread){ display:none; }
+  .board-empty{ width:calc(100% - 32px); }
+}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{ animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
+  .node.arriving,.anno.arriving,.turn.entering,.att.arriving{ opacity:1; transform:none; }
+  .lightbox img{ transform:none; }
+}

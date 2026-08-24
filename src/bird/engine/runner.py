@@ -24,6 +24,7 @@ from ..skills import render_index
 from .compactor import compact, needs_compaction
 
 MAX_TURNS = 40
+DONE_TOOL = "done"  # the default terminal tool; harnesses may name their own
 MAX_VALIDATION_RETRIES = 2  # per tool call chain
 MAX_TEXT_ONLY_TURNS = 3
 SAME_CALL_LOOP_THRESHOLD = 3
@@ -235,6 +236,7 @@ class Runner:
         tracker_prefix: str | None = None,
         explore_nudge: str | None = None,
         seed_context: str | None = None,
+        done_tool: str | None = None,
     ):
         self.spec = spec
         self.client = client
@@ -256,6 +258,11 @@ class Runner:
         self.tracker = tracker or _plan_tracker
         self.tracker_prefix = tracker_prefix or PLAN_TRACKER_PREFIX
         self.explore_nudge = explore_nudge or EXPLORE_NUDGE
+        # which tool ends the session. Parameterized rather than hard-coded so a
+        # harness can call its terminal move what it actually is (arch hands off
+        # a design; it does not finish a task) without the engine learning any
+        # harness's name.
+        self.done_tool = done_tool or DONE_TOOL
         # stable reference material seeded into the system prompt (survives
         # compaction, which always keeps messages[:2]) — e.g. the arch handoff
         # doc the lead hands a code sub-session
@@ -448,7 +455,7 @@ class Runner:
                 # termination is signaled by the result's details, not by the
                 # name alone: a phase-gate done (arch toplevel approval) can
                 # succeed without ending the session
-                if tc.name == "done" and not result.is_error and result.details.get("done"):
+                if tc.name == self.done_tool and not result.is_error and result.details.get("done"):
                     self.ctx.emit("run_done", {"turn": turn, "summary": result.output})
                     # the plan lived its life with this task — clear it (and its
                     # pinned tracker) so the next exchange isn't steered by a

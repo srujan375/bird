@@ -117,6 +117,7 @@ def test_set_think_mode_without_file_is_session_only():
 def test_builtin_models_json_loads():
     # aliases are user-editable config: assert they resolve, not where they point
     reg = Registry.load()
-    for alias in ("default", "judge", "compactor"):
+    # `judge` went with the arch critic — the user is the critic now
+    for alias in ("default", "architect", "compactor"):
         spec = reg.resolve(alias)
         assert spec.spec and spec.context_window > 0

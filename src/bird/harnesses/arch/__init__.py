@@ -1,7 +1,10 @@
-"""The Architecture harness: structured system design in a browser page.
+"""The Architecture harness: a design conversation with a memory.
 
-The model mutates ArchState via typed tools; the harness renders diagrams,
-the tracker, and the handoff bundle deterministically. See
-docs/arch-state-schema.md (the contract), docs/arch-ui-features.md (the page)
-and docs/arch-remaining-work.md (what is left).
+The model and the user walk the design tree together, one or two questions at a
+time. Structure accretes on a single canvas as they talk — rival approaches
+side by side, boxes deepening as their branch is visited — and the session ends
+when the user says it does, leaving a handoff bundle behind.
+
+`state.py` is the one graph; `derive.py` is everything the harness works out
+for itself (the frontier, what's thin); `tools.py` is the architect's notebook.
 """

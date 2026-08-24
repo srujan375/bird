@@ -16,11 +16,13 @@ class Handlers:
 
     def __init__(self):
         self.inputs = []
+        self.subjects = []
         self.permissions = []
         self.interrupts = 0
 
-    def on_user_input(self, text):
+    def on_user_input(self, text, subjects=()):
         self.inputs.append(text)
+        self.subjects.append(list(subjects))
 
     def on_permission(self, req_id, approved, feedback):
         self.permissions.append((req_id, approved, feedback))
@@ -131,6 +133,34 @@ def test_static_serving_and_traversal_guard(served):
     assert status == 404
     status, _ = request(host, port, "GET", "/missing.html")
     assert status == 404
+
+
+def test_input_carries_what_the_page_had_selected(served):
+    """The selection is the page's — the only way the harness learns it is if
+    the message says so."""
+    transport, handlers, host, port = served
+    status, _ = request(host, port, "POST", "/input", {"text": "why this?", "subjects": ["idx"]})
+    assert status == 200
+    assert handlers.inputs[-1] == "why this?"
+    assert handlers.subjects[-1] == ["idx"]
+
+
+def test_input_without_a_selection_still_works(served):
+    """Most messages point at nothing, and must not have to say so."""
+    transport, handlers, host, port = served
+    status, _ = request(host, port, "POST", "/input", {"text": "hello"})
+    assert status == 200
+    assert handlers.subjects[-1] == []
+
+
+def test_a_malformed_selection_is_not_trusted(served):
+    """It arrives over HTTP; nothing but the route bounds its shape."""
+    transport, handlers, host, port = served
+    status, _ = request(host, port, "POST", "/input", {"text": "hi", "subjects": "idx"})
+    assert status == 200
+    assert handlers.subjects[-1] == [], "a bare string is not a list of ids"
+    status, _ = request(host, port, "POST", "/input", {"text": "hi", "subjects": ["a"] * 40})
+    assert len(handlers.subjects[-1]) == 8, "and the list is capped"
 
 
 def test_post_dispatch(served):
@@ -268,3 +298,19 @@ def test_linger_gives_up_when_nobody_is_reading(tmp_path):
     time.sleep(0.05)
     transport.emit({"type": "arch_state", "phase": "finalized", "state": {}})
     assert done.wait(timeout=5)
+
+
+def test_replayed_arch_state_is_stamped_so_the_page_can_tell(tmp_path):
+    """A late joiner gets the whole design at once. Without a marker the page
+    cannot tell that from a design that just arrived, and animates history."""
+    transport = HttpTransport(static_dir=_static(tmp_path))
+    transport.emit({"type": "ready", "model": "m"})
+    transport.emit({"type": "arch_state", "status": "open", "state": {}})
+
+    _q, replay = transport.subscribe()
+    arch = [e for e in replay if e["type"] == "arch_state"]
+    assert arch and arch[0]["replayed"] is True
+
+    # the live push itself is untouched — it really is new
+    assert "replayed" not in transport._arch_state
+    transport.shutdown()

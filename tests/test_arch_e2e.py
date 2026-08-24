@@ -1,8 +1,15 @@
 """End-to-end: the arch harness over real HTTP — acceptance criteria.
 
-A scripted model walks brief → top level → approval gate → risk-ordered
-expansion → finalize (rejected with feedback, then approved) while the test
-plays the browser page: SSE for events, POSTs for actions.
+A scripted architect has a design conversation — two rival approaches, one
+greyed out with the reason it lost, a box deepened once its branch is reached,
+then a handoff — while the test plays the browser page: SSE for events, POSTs
+for actions.
+
+What this test no longer contains is the point of the rebuild. There is no
+approval gate and no finalize gate, so there are no `permission_request` events
+at all: the session ends because the *user said so* in the conversation, and the
+architect called `handoff`. The one POST the page still makes is `/mutate`, and
+it is the user greying out an approach themselves.
 """
 
 import http.client
@@ -15,9 +22,9 @@ import pytest
 from bird.engine.runner import Runner
 from bird.engine.session import SessionRecorder
 from bird.harnesses.arch import harness as arch_def
-from bird.harnesses.arch.render import TRACKER_PREFIX
+from bird.harnesses.arch.run import HANDED_OFF
 from bird.harnesses.arch.session import ArchSession
-from bird.harnesses.arch.tools import arch_harness_tools
+from bird.harnesses.arch.tools import MUTATING_TOOLS, arch_harness_tools
 from bird.http_transport import HttpTransport
 from bird.llm.registry import ModelSpec, ProviderConfig, Registry
 from bird.llm.types import LLMResponse, Message, ToolCall, Usage
@@ -56,37 +63,37 @@ class FakeClient:
 
 
 SCRIPT = [
-    # turn A: brief -> top level -> request approval -> expand -> finalize rejected
-    assistant(calls=[tc("brief", {"goal": "shorten urls", "actors": ["visitor"],
-                                  "scope": "internal"})]),
+    # turn A: put two rival shapes up, then ask the one question that decides them
     assistant(calls=[
-        tc("component", {"id": "gw", "kind": "gateway", "responsibility": "http entry",
-                         "trace": ["shorten urls"]}),
-        tc("component", {"id": "db", "kind": "store", "responsibility": "url mappings",
-                         "trace": ["shorten urls"], "data_owned": "short->long map"}),
-        tc("connect", {"src": "gw", "dst": "db", "label": "lookup", "kind": "sync"}),
-        tc("flow", {"id": "shorten", "name": "shorten", "kind": "happy",
-                    "steps": [{"src": "gw", "dst": "db", "action": "INSERT mapping"}]}),
-        tc("decide", {"topic": "Storage", "category": "storage",
-                      "options": [{"name": "sqlite"}, {"name": "postgres"}],
-                      "choice": "sqlite", "rationale": "single box"}),
+        tc("brief", {"goal": "shorten urls", "actors": ["visitor"]}),
+        tc("approach", {"name": "single box", "summary": "sqlite on one host"}),
+        tc("approach", {"name": "managed", "summary": "postgres + a load balancer"}),
+        tc("canvas", {
+            "nodes": [
+                {"id": "gw", "label": "HTTP entry", "kind": "api",
+                 "responsibility": "takes the long url, hands back a short one"},
+                {"id": "db", "label": "URL mappings", "kind": "store"},
+                {"id": "lb", "label": "Load balancer", "kind": "infra",
+                 "approaches": ["managed"]},
+            ],
+            "edges": [{"src": "gw", "dst": "db", "label": "lookup"}],
+        }),
     ]),
-    assistant(content="Requesting approval.", calls=[tc("done", {"summary": "top level ready"})]),
-    assistant(calls=[tc("expand", {"component_id": "db",
-                                   "entities": [{"name": "urls", "keys": "short"}],
-                                   "access_patterns": ["short -> long"],
-                                   "retention": "forever"})]),
-    assistant(calls=[tc("expand", {"component_id": "gw",
-                                   "endpoints": [{"route": "/s", "method": "POST",
-                                                  "request": "{url}", "response": "{short}",
-                                                  "auth": "none"}]})]),
-    assistant(calls=[tc("done", {"summary": "expanded; finalize?"})]),
-    assistant(content="Noted — I'll record the rate limit decision. Anything else?"),
-    # turn B: address feedback, finalize approved
-    assistant(calls=[tc("decide", {"topic": "Rate limiting", "category": "integration",
-                                   "options": [{"name": "token bucket"}, {"name": "none"}],
-                                   "choice": "token bucket", "rationale": "abuse control"})]),
-    assistant(calls=[tc("done", {"summary": "final"})]),
+    assistant(content="Single box or managed? I'd take the single box — it's a "
+                      "weekend of work and you can move later. Your call."),
+    # turn B: the user greyed 'managed' from the page; record the call and go deeper
+    assistant(calls=[
+        tc("decide", {"topic": "storage", "choice": "sqlite",
+                      "against": [{"name": "postgres", "cons": ["a box to operate"]}],
+                      "why": "one host is enough at this volume",
+                      "pragmatic": "no failover; you restore from backup and lose minutes"}),
+        tc("canvas", {"nodes": [{"id": "db", "depth": "sketch",
+                                 "detail": "urls(short primary key, long); kept forever"}]}),
+    ]),
+    assistant(content="Storage settled. The mappings table is the only state — "
+                      "anything else you want to walk through?"),
+    # turn C: the user says they're done
+    assistant(calls=[tc("handoff", {"summary": "single box, sqlite, managed kept as not-taken"})]),
 ]
 
 
@@ -149,23 +156,22 @@ def build_stack(tmp_path, script):
         spec=SPEC, client=FakeClient(script), registry=registry,
         tools=arch_harness_tools(with_kg=False, with_web=False), ctx=ctx,
         instructions_path=arch_def.INSTRUCTIONS_PATH,
-        mutating_tools=arch_def.MUTATING_TOOLS,
+        mutating_tools=MUTATING_TOOLS,
         tracker=arch_def.arch_tracker,
-        tracker_prefix=TRACKER_PREFIX,
+        tracker_prefix=arch_def.TRACKER_PREFIX,
         explore_nudge=arch_def.EXPLORE_NUDGE,
+        done_tool="handoff",
     )
     repl = Repl(runner, registry, kg=None, recorder=recorder, run_id="arch-t")
-    transport = HttpTransport(
-        static_dir=arch_def.STATIC_DIR,
-        stop_when=lambda e: e.get("type") == "arch_state" and e.get("phase") == "finalized",
-    )
+    transport = HttpTransport(static_dir=arch_def.STATIC_DIR, stop_when=HANDED_OFF)
     server = Server(repl, transport=transport)
-    arch = ArchSession(run_dir=run_dir, broker=server.broker, on_state=transport.emit)
+    # no broker: this harness has no gates to block on
+    arch = ArchSession(run_dir=run_dir, on_state=transport.emit)
     ctx.arch = arch
     return server, transport, arch, run_dir
 
 
-def test_full_arch_session_over_http(tmp_path):
+def test_a_whole_design_conversation_over_http(tmp_path):
     server, transport, arch, run_dir = build_stack(tmp_path, SCRIPT)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -178,64 +184,67 @@ def test_full_arch_session_over_http(tmp_path):
     assert b"bird arch" in conn.getresponse().read()
     conn.close()
 
+    # ---- turn A: two rivals go up, and the turn ends as a question ----
     page.post("/input", {"text": "design a url shortener"})
-
-    # arch_state streams mid-turn with changed markers
     e = page.wait_for(
-        lambda e: e["type"] == "arch_state" and (e.get("changed") or {}).get("id") == "db",
-        "db arch_state",
+        lambda e: e["type"] == "arch_state" and (e.get("changed") or {}).get("kind") == "canvas",
+        "the board",
     )
-    assert e["state"]["components"]["db"]["kind"] == "store"
-    assert "flowchart TD" in e["renders"]["toplevel"]
-    assert e["tracker"].startswith(TRACKER_PREFIX)
+    assert e["state"]["nodes"]["db"]["kind"] == "store"
+    assert e["state"]["nodes"]["lb"]["approaches"] == ["managed"]
+    assert e["state"]["nodes"]["db"]["approaches"] == [], "the store is shared, drawn once"
+    assert "flowchart LR" in e["renders"]["board"]
 
-    # gate 1: top-level approval
-    req = page.wait_for(
-        lambda e: e["type"] == "permission_request" and e.get("kind") == "toplevel_approval",
-        "toplevel_approval",
-    )
-    page.post("/permission", {"id": req["id"], "approved": True})
-
-    # gate 2: finalize — reject with feedback; the turn continues and ends as a reply
-    req = page.wait_for(
-        lambda e: e["type"] == "permission_request" and e.get("kind") == "finalize",
-        "finalize request",
-    )
-    assert req["artifacts"]
-    page.post("/permission", {"id": req["id"], "approved": False,
-                              "feedback": "record a rate limiting decision first"})
     end = page.wait_for(lambda e: e["type"] == "turn_end", "turn A end")
-    assert end["status"] == "reply"
-    # a rejected finalize drops back into the working phase, not a dead end
-    assert arch.state.phase == "expand"
+    assert end["status"] == "reply", "a question to the user ends the turn; no gate does"
+    assert not [x for x in page.events if x["type"] == "permission_request"], \
+        "the rebuilt harness has no gates"
 
-    # turn B: feedback addressed, finalize approved
-    page.post("/input", {"text": "record it and finalize"})
-    req = page.wait_for(
-        lambda e: e["type"] == "permission_request" and e.get("kind") == "finalize"
-        and e["id"] != req["id"],
-        "second finalize request",
+    # ---- the user rules, from the page ----
+    page.post("/mutate", {"op": "approach", "id": "managed", "status": "greyed",
+                          "rejected_reason": "one host is fine for now"})
+    e = page.wait_for(
+        lambda e: e["type"] == "arch_state"
+        and e["state"]["approaches"].get("managed", {}).get("status") == "greyed",
+        "the greyed approach",
     )
-    page.post("/permission", {"id": req["id"], "approved": True})
+    assert "not taken: one host is fine for now" in e["renders"]["board"]
 
+    # a greying with no reason is refused, and the page is told why
+    page.post("/mutate", {"op": "approach", "id": "single-box", "status": "greyed"}, status=400)
+
+    # ---- turn B: the call gets recorded and the store deepens ----
+    page.post("/input", {"text": "go with the single box"})
     page.wait_for(
-        lambda e: e["type"] == "arch_state" and e["phase"] == "finalized", "finalized state"
+        lambda e: e["type"] == "arch_state"
+        and e["state"]["nodes"].get("db", {}).get("depth") == "sketch",
+        "the deepened store",
     )
-    end = page.wait_for(
-        lambda e: e["type"] == "turn_end" and e["status"] == "done", "turn B end"
+    page.wait_for(lambda e: e["type"] == "turn_end" and e is not end, "turn B end")
+
+    # ---- turn C: the user says they're done ----
+    page.post("/input", {"text": "that's everything, wrap it up"})
+    page.wait_for(
+        lambda e: e["type"] == "arch_state" and e["status"] == "handed_off", "handoff"
     )
+    page.wait_for(lambda e: e["type"] == "turn_end" and e["status"] == "done", "turn C end")
+
     # stop_when shut the transport down; the pump exits and says bye
     thread.join(timeout=10)
     assert not thread.is_alive()
     page.wait_for(lambda e: e["type"] == "bye", "bye")
 
-    # bundle + persisted state on disk
-    assert (run_dir / "bundle" / "architecture.json").is_file()
-    assert (run_dir / "bundle" / "architecture.md").is_file()
+    # ---- what survives ----
     assert (run_dir / "arch_state.json").is_file()
     saved = json.loads((run_dir / "arch_state.json").read_text())
-    assert saved["phase"] == "finalized"
-    assert {d["topic"] for d in saved["decisions"]} == {"Storage", "Rate limiting"}
+    assert saved["handed_off"] is True
+    assert saved["approaches"]["managed"]["rejected_reason"] == "one host is fine for now"
+
+    md = (run_dir / "bundle" / "architecture.md").read_text()
+    assert "## Approaches not taken" in md
+    assert "one host is fine for now" in md
+    assert "Deliberately good enough" in md, "the pragmatic call is on the record"
+    assert "restore from backup" in md
 
 
 def test_interrupt_over_http(tmp_path):
@@ -255,7 +264,7 @@ def test_interrupt_over_http(tmp_path):
                 usage=Usage(1, 1), stop_reason="stop", model=spec.spec,
             )
 
-    server, transport, arch, _ = build_stack(tmp_path, [])
+    server, transport, _arch, _ = build_stack(tmp_path, [])
     server.repl.runner.client = BlockingClient()
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()

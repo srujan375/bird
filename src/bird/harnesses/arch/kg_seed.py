@@ -6,20 +6,21 @@ writes to the orders table", asked eleven turns later about a design that has
 scrolled out of attention. `kg_query` answers that shape of question — but on
 greenfield there is nothing to extract, so it answers nothing at all.
 
-So finalize also writes the design into the graph: a node per component, per
-entity, endpoint, message, module, task and deploy unit, edged by the real
-connections and flows. Turn one of `bird code` can then ask the graph about a
-system that does not exist yet.
+So handoff also writes the design into the graph: a node per box, plus a node
+per decision and per approach that lost, edged by the real connections. Turn one
+of `bird code` can then ask the graph about a system that does not exist yet —
+including the two questions a builder asks most, "why is it like this" and "why
+not the other way".
 
 Two rules the node shapes follow:
 
 - **Labels carry the words someone would search for.** `query()` matches on
-  labels alone, so a component's label is its name *and* its responsibility, and
-  an entity's is its name *and* its fields. A bare id retrieves nothing.
+  labels alone, so a box's label is its name *and* its responsibility, and a
+  decision's is the topic, the choice and the reason. A bare id retrieves
+  nothing.
 - **Every node says where it came from.** `source_file` points at the bundle and
-  `source_location` reads `design:<component-id>` — which is what `kg_query`
-  prints beside a hit, so it lands as "the architecture said this", never as
-  discovered code.
+  `source_location` reads `design:<id>` — which is what `kg_query` prints beside
+  a hit, so it lands as "the architecture said this", never as discovered code.
 """
 
 from __future__ import annotations
@@ -64,119 +65,69 @@ def build_seed(state: ArchState, source: str = "bundle/architecture.md") -> tupl
     """(nodes, edges) for `KG.seed`. Pure — no I/O, no graph library."""
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
-    cid_node = {cid: f"arch_{_slug(cid)}" for cid in state.components}
+    node_id = {nid: f"arch_{_slug(nid)}" for nid in state.nodes}
 
-    for comp in state.components.values():
-        nid = cid_node[comp.id]
-        label = comp.name
-        if comp.responsibility:
-            label = f"{comp.name} — {comp.responsibility}"
+    for box in state.nodes.values():
+        # a box that lost with its approach is still seeded, marked as such:
+        # "we considered this and dropped it" is a real answer to a query
+        greyed = state.is_greyed(box)
+        label = box.label
+        if box.responsibility:
+            label = f"{box.label} — {box.responsibility}"
+        if box.tech:
+            label += f" (on {box.tech})"
+        if greyed:
+            label = f"[not taken] {label}"
         nodes.append(_node(
-            nid, label, f"component:{comp.kind}", source,
-            source_location=f"design:{comp.id}",
-            tech=comp.tech or "",
-            existing=comp.existing,
+            node_id[box.id], label, f"component:{box.kind}", source,
+            source_location=f"design:{box.id}",
+            tech=box.tech,
+            existing=box.existing,
+            greyed=greyed,
         ))
-        if comp.data_owned:
-            owned = f"{nid}_owns"
-            nodes.append(_node(owned, f"{comp.name} owns {comp.data_owned}", "data", source,
-                               source_location=f"design:{comp.id}"))
-            edges.append(_edge(nid, owned, "owns_data", source))
-        nodes.extend(_facet_nodes(comp, nid, source))
-        edges.extend(_facet_edges(comp, nid, source))
+        if box.detail:
+            did = f"{node_id[box.id]}_detail"
+            nodes.append(_node(
+                did, f"Inside {box.label}: {box.detail}", "detail", source,
+                source_location=f"design:{box.id}",
+            ))
+            edges.append(_edge(node_id[box.id], did, "detailed_as", source))
 
-    for conn in state.connections:
-        src, dst = cid_node.get(conn.src), cid_node.get(conn.dst)
+    for edge in state.edges:
+        src, dst = node_id.get(edge.src), node_id.get(edge.dst)
         if not src or not dst:
             continue
-        relation = _slug(conn.label) or conn.kind
-        edges.append(_edge(src, dst, relation, source,
-                           context=f"{conn.kind}" + (f" via {conn.mechanism}" if conn.mechanism else "")))
+        relation = _slug(edge.label) or edge.kind
+        context = edge.kind + (f" — {edge.notes}" if edge.notes else "")
+        edges.append(_edge(src, dst, relation, source, context=context))
 
-    for flow in state.flows:
-        fid = f"arch_flow_{_slug(flow.id)}"
-        steps = " → ".join(f"{s.src} {s.action}" for s in flow.steps)
-        nodes.append(_node(fid, f"{flow.name} ({flow.kind} flow): {steps}", "flow", source,
-                           source_location=f"design:{flow.id}"))
-        for step in flow.steps:
-            for ref in (step.src, step.dst):
-                target = cid_node.get(ref)
-                if target:
-                    edges.append(_edge(fid, target, "step_in_flow", source, context=step.action))
+    for dec in state.decisions:
+        label = f"Decision: {dec.topic} → {dec.choice}"
+        if dec.rationale:
+            label += f" — {dec.rationale}"
+        if dec.pragmatism_note:
+            label += f" (deliberately good enough: {dec.pragmatism_note})"
+        rivals = [o.name for o in dec.options if o.name != dec.choice]
+        if rivals:
+            label += f" [not: {', '.join(rivals)}]"
+        nodes.append(_node(
+            f"arch_decision_{_slug(dec.id)}", label, "decision", source,
+            source_location=f"design:{dec.id}", by=dec.source,
+        ))
+
+    for app in state.greyed_approaches():
+        label = f"Approach not taken: {app.name}"
+        if app.summary:
+            label += f" — {app.summary}"
+        label += f". Why not: {app.rejected_reason}"
+        aid = f"arch_approach_{_slug(app.id)}"
+        nodes.append(_node(aid, label, "approach", source, source_location=f"design:{app.id}"))
+        for box in state.nodes_in(app.id):
+            target = node_id.get(box.id)
+            if target:
+                edges.append(_edge(aid, target, "would_have_used", source))
+
     return nodes, edges
-
-
-def _facet_nodes(comp: Any, parent: str, source: str) -> list[dict[str, Any]]:
-    """One node per thing a builder would look up by name."""
-    facet = comp.facet
-    if facet is None:
-        return []
-    out: list[dict[str, Any]] = []
-    kind = facet.facet_kind
-    if kind == "store":
-        for ent in facet.entities:
-            fields = ", ".join(ent.fields)
-            out.append(_node(
-                f"{parent}_entity_{_slug(ent.name)}",
-                f"{ent.name} (entity in {comp.name}): keys {ent.keys}" + (f"; {fields}" if fields else ""),
-                "entity", source, source_location=f"design:{comp.id}",
-            ))
-    elif kind == "api":
-        for e in facet.endpoints:
-            out.append(_node(
-                f"{parent}_endpoint_{_slug(e.method)}_{_slug(e.route)}",
-                f"{e.method} {e.route} on {comp.name}: {e.request} → {e.response} (auth: {e.auth})",
-                "endpoint", source, source_location=f"design:{comp.id}",
-            ))
-    elif kind == "queue":
-        for m in facet.messages:
-            out.append(_node(
-                f"{parent}_message_{_slug(m.name)}",
-                f"{m.name} (message on {comp.name}): {m.schema}; {m.delivery}, ordering {m.ordering}",
-                "message", source, source_location=f"design:{comp.id}",
-            ))
-    elif kind == "service":
-        for mod in facet.modules or []:
-            out.append(_node(
-                f"{parent}_module_{_slug(mod.name)}",
-                f"{mod.name} (module in {comp.name}): {mod.purpose}",
-                "module", source, source_location=f"design:{comp.id}",
-            ))
-    elif kind == "llm":
-        for t in facet.tasks:
-            out.append(_node(
-                f"{parent}_task_{_slug(t.name)}",
-                f"{t.name} (llm task in {comp.name}): {t.prompt_contract}; fallback {t.fallback}",
-                "llm_task", source, source_location=f"design:{comp.id}",
-            ))
-    elif kind == "infra":
-        for u in facet.units:
-            out.append(_node(
-                f"{parent}_unit_{_slug(u.name)}",
-                f"{u.name} (deploy unit): hosts {', '.join(u.components)}; {u.scaling_policy}",
-                "deploy_unit", source, source_location=f"design:{comp.id}",
-            ))
-    return out
-
-
-_FACET_RELATION = {
-    "store": "defines_entity",
-    "api": "exposes_endpoint",
-    "queue": "carries_message",
-    "service": "has_module",
-    "llm": "runs_task",
-    "infra": "deploys",
-}
-
-
-def _facet_edges(comp: Any, parent: str, source: str) -> list[dict[str, Any]]:
-    if comp.facet is None:
-        return []
-    relation = _FACET_RELATION.get(comp.facet.facet_kind, "contains")
-    return [
-        _edge(parent, child["id"], relation, source)
-        for child in _facet_nodes(comp, parent, source)
-    ]
 
 
 def seed_kg(kg: Any, state: ArchState, source: str = "bundle/architecture.md") -> str:

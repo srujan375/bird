@@ -22,7 +22,7 @@ from .tools import ToolContext
 from .skills import load_skills
 
 
-# How long `bird arch` keeps serving a finalized design so it can be read. It
+# How long `bird arch` keeps serving a handed-off design so it can be read. It
 # gives up sooner the moment the page closes; this is only the backstop for a
 # tab left open and forgotten.
 ARCH_LINGER_SECONDS = 30 * 60
@@ -91,18 +91,14 @@ def main(argv: list[str] | None = None) -> int:
     arch = sub.add_parser("arch", help="architecture session in a browser page")
     arch.add_argument("task", nargs="?", default=None, help="what to design, in natural language")
     arch.add_argument("--no-open", action="store_true", help="don't open the browser (tests/headless)")
+    arch.add_argument("--repl", action="store_true",
+                      help="have the design conversation in the terminal instead of the "
+                           "browser page. Same harness, same board underneath — the canvas "
+                           "just isn't drawn")
     arch.add_argument("--headless", action="store_true",
-                      help="no browser and no human gates: design to a finalized bundle and "
-                           "exit. Both rulings auto-approve, so this is for evals and "
-                           "scripting — the product path is the Workbench")
-    arch.add_argument("--judge-model", default=None, metavar="MODEL",
-                      help="override the model the critic runs on (default: the `judge` "
-                           "alias). Point it at --model to make the whole session one "
-                           "model, which is what a 'small model' claim requires")
-    arch.add_argument("--no-critic", action="store_true",
-                      help="control arm: no second model reviewing the design. The critic is "
-                           "what arch adds over a single-pass planner, so this is the flag "
-                           "that makes that claim falsifiable")
+                      help="no page and nobody in the room: design to a handoff bundle and "
+                           "exit. For evals and scripting — a design conversation with no "
+                           "user is not the product")
     _add_common(arch)
 
     kg_cmd = sub.add_parser("kg", help="knowledge graph maintenance")
@@ -299,6 +295,61 @@ def _code_main(args) -> int:
     return 0 if result.status == "done" else 1
 
 
+def _arch_repl_main(args) -> int:
+    """The design conversation in the terminal.
+
+    The rebuilt arch harness has no gates and no modals — it is a conversation
+    that happens to keep a board — so it runs perfectly well without a page.
+    The canvas simply isn't drawn; `arch_state.json` and the handoff bundle are
+    written exactly as they are in the Workbench.
+    """
+    from .permissions import ConsoleBroker
+    from .repl import Repl
+    from .harnesses.arch.session import ArchSession
+    from .harnesses.arch.state import LegacyStateError
+
+    if args.model == "default":
+        args.model = "architect"
+    setup = _setup(args)
+    if isinstance(setup, int):
+        return setup
+    registry, spec, kg, _build_proc, run_id, run_dir = setup
+
+    with SessionRecorder(run_dir) as recorder:
+        runner = _make_runner(args, registry, spec, kg, recorder, harness="arch",
+                              broker=ConsoleBroker())
+        repl = Repl(runner, registry, kg, recorder, run_id)
+        resumed_dir = None
+        if getattr(args, "resume", None):
+            resumed_dir = _resume_into_repl(repl, args.resume, registry)
+        if resumed_dir is not None:
+            try:
+                arch = ArchSession.load(resumed_dir)
+            except LegacyStateError as e:
+                print(f"cannot resume: {e}", file=sys.stderr)
+                return 2
+            arch.run_dir = run_dir
+        else:
+            arch = ArchSession(run_dir=run_dir)
+        arch.on_state = lambda payload: recorder.event(
+            "arch_state", {"status": payload["status"], "changed": payload.get("changed")}
+        )
+        runner.ctx.arch = arch
+
+        print(f"bird arch --repl | model={spec.spec} | kg={'off' if args.no_kg else 'on'} "
+              f"| session={run_id}")
+        print(f"board: {run_dir / 'arch_state.json'}")
+        rc = repl.run(args.task)
+        if arch.state.handed_off:
+            from .harnesses.arch.bundle import bundle_paths
+
+            print("architecture handed off. bundle:")
+            for path in bundle_paths(run_dir):
+                print(f"  {path}")
+            print("next: bird code")
+        return rc
+
+
 def _repl_session(args, harness: str = "code", tools=None, seed_context=None) -> int:
     """The plain REPL for any interactive harness (chat=code, bare bird=lead)."""
     from .permissions import ConsoleBroker
@@ -355,36 +406,19 @@ def _serve_main(args) -> int:
         return Server(repl, broker=broker).run()
 
 
-def _apply_judge_override(registry, args) -> int | None:
-    """Repoint the `judge` alias for this session only.
-
-    Resolved to a concrete provider:model before it is stored, because an alias
-    whose value is another alias name has no ':' and would fail to resolve on
-    the critic's first pass — mid-run, on a background thread, where it
-    degrades to silence and looks like a critic that simply found nothing.
-    Returns an exit code on failure, None on success.
-    """
-    name = getattr(args, "judge_model", None)
-    if not name:
-        return None
-    try:
-        registry.aliases["judge"] = registry.resolve(name).spec
-    except RegistryError as e:
-        print(f"error: --judge-model {name!r}: {e}", file=sys.stderr)
-        return 2
-    return None
-
-
 def _arch_main(args) -> int:
     import time
     import webbrowser
 
     from .harnesses.arch import harness as arch_def
-    from .harnesses.arch.judge import make_judge
+    from .harnesses.arch.run import HANDED_OFF
     from .harnesses.arch.session import ArchSession
+    from .harnesses.arch.state import LegacyStateError
 
     if args.headless:
         return _arch_headless_main(args)
+    if args.repl:
+        return _arch_repl_main(args)
     from .http_transport import HttpTransport
     from .permissions import PermissionBroker
     from .repl import Repl
@@ -398,14 +432,11 @@ def _arch_main(args) -> int:
     if isinstance(setup, int):
         return setup
     registry, spec, kg, _build_proc, run_id, run_dir = setup
-    rc = _apply_judge_override(registry, args)
-    if rc is not None:
-        return rc
 
     with SessionRecorder(run_dir) as recorder:
-        # arch mounts no gated tools (it designs, it doesn't touch the repo);
-        # the broker is here for its two human phase gates — see
-        # ArchSession.request_gate
+        # arch mounts no gated tools (it designs, it doesn't touch the repo) and
+        # has no gates of its own any more; the broker is here so the Server has
+        # one to hand any sub-session, and stays inert for the whole run
         broker = PermissionBroker()
         runner = _make_runner(args, registry, spec, kg, recorder, harness="arch",
                               broker=broker)
@@ -416,27 +447,29 @@ def _arch_main(args) -> int:
 
         transport = HttpTransport(
             static_dir=arch_def.STATIC_DIR,
-            stop_when=lambda e: e.get("type") == "arch_state" and e.get("phase") == "finalized",
-            # finalize ends the session, not the reading of it: keep serving the
-            # read-only design until the tab is closed (or half an hour passes).
-            # Nothing can change any more — every tool is locked at `finalized`.
+            stop_when=HANDED_OFF,
+            # the handoff ends the session, not the reading of it: keep serving
+            # the read-only design until the tab is closed (or half an hour
+            # passes). Nothing can change any more.
             linger=ARCH_LINGER_SECONDS,
         )
         server = Server(repl, transport=transport, broker=broker)
 
         # the arch session: restored state on resume, persisted to THIS run
         if resumed_dir is not None:
-            arch = ArchSession.load(resumed_dir)
+            try:
+                arch = ArchSession.load(resumed_dir)
+            except LegacyStateError as e:
+                print(f"cannot resume: {e}", file=sys.stderr)
+                return 2
             arch.run_dir = run_dir
         else:
-            arch = ArchSession(run_dir=run_dir)  # opens on the sketch layer
-        arch.broker = server.broker
-        arch.judge = None if args.no_critic else make_judge(registry, OpenAICompatClient())
+            arch = ArchSession(run_dir=run_dir)
 
         def on_state(payload: dict) -> None:
             # slim record (full state lives in arch_state.json); full payload to the page
             recorder.event(
-                "arch_state", {"phase": payload["phase"], "changed": payload.get("changed")}
+                "arch_state", {"status": payload["status"], "changed": payload.get("changed")}
             )
             transport.emit(payload)
 
@@ -457,11 +490,11 @@ def _arch_main(args) -> int:
             transport.shutdown()
             rc = 0
         time.sleep(0.3)  # let SSE clients drain the finalized/bye events
-        if arch.state.phase == "finalized":
+        if arch.state.handed_off:
             # (we are only here once the page closed or the linger ran out)
             from .harnesses.arch.bundle import bundle_paths
 
-            print("architecture finalized. handoff bundle:")
+            print("architecture handed off. bundle:")
             for p in bundle_paths(run_dir):
                 print(f"  {p}")
             print("next: bird code")
@@ -469,13 +502,13 @@ def _arch_main(args) -> int:
 
 
 def _arch_headless_main(args) -> int:
-    """`bird arch --headless`: design to a bundle with no browser and no human.
+    """`bird arch --headless`: design to a bundle with no page and no human.
 
-    Both rulings (top-level approval, finalize) auto-approve, because there is
-    nobody to ask — which is exactly why this is not the product path. It exists
-    so an eval can run the arch harness as a subprocess and read the same
-    artifacts a Workbench session leaves behind: events.jsonl for the metrics,
-    arch_state.json for the design, and the bundle if the session finalized.
+    A design conversation with nobody in the room is not the product — the whole
+    posture of this harness is that the user is in it. It exists so an eval can
+    run the harness as a subprocess and read the same artifacts a real session
+    leaves behind: events.jsonl for the metrics, arch_state.json for the board,
+    and the bundle if the architect handed off.
 
     Prints `session=<run_dir>` on its last line, the same handle `bird code`
     gives, so a harness can find the session without guessing at mtimes.
@@ -491,13 +524,9 @@ def _arch_headless_main(args) -> int:
     if isinstance(setup, int):
         return setup
     registry, spec, kg, _build_proc, run_id, run_dir = setup
-    rc = _apply_judge_override(registry, args)
-    if rc is not None:
-        return rc
 
-    critic = "off" if args.no_critic else registry.aliases.get("judge", "judge")
     print(f"bird arch --headless | model={spec.spec} | kg={'off' if args.no_kg else 'on'} "
-          f"| critic={critic} | session={run_id}")
+          f"| session={run_id}")
     with SessionRecorder(run_dir) as recorder:
         arch = run_arch_headless(
             repo_root=Path(args.repo).resolve(),
@@ -509,17 +538,17 @@ def _arch_headless_main(args) -> int:
             record=recorder.event,
             model=args.model,
             max_turns=args.max_turns,
-            critic=not args.no_critic,
             with_web=not args.no_web,
         )
 
-    phase = arch.state.phase
-    print(f"\n[{phase}] components={len(arch.state.components)} "
-          f"concerns={len(arch.state.concerns)} session={run_dir}")
+    state = arch.state
+    status = "handed_off" if state.handed_off else "open"
+    print(f"\n[{status}] boxes={len(state.nodes)} decisions={len(state.decisions)} "
+          f"open_questions={len(state.open_questions())} session={run_dir}")
     # a session that ran out of turns still leaves a readable design in
     # arch_state.json — it is a weaker result, not a crash, so it is not an
-    # error exit. The caller reads `phase` to tell the two apart.
-    return 0 if phase == "finalized" else 1
+    # error exit. The caller reads the status to tell the two apart.
+    return 0 if state.handed_off else 1
 
 
 def _lead_main(args) -> int:

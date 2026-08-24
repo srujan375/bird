@@ -580,3 +580,153 @@ def test_server_ingests_a_dragged_screenshot_before_it_is_reaped(tmp_path):
     assert rel in user_text
     assert str(src) not in user_text
     assert "read this image?" in user_text
+
+
+# ------------------------------------------ the board as a way of talking
+
+
+def _assistant(text):
+    return Message(role="assistant", content=text, tool_calls=[])
+
+
+def test_submitting_the_board_starts_a_turn_without_the_user_typing(tmp_path):
+    """Drawing is talking. Without this the architect sits idle until you also
+    type something, which makes the board a form beside the conversation
+    rather than part of it."""
+    from bird.harnesses.arch.session import ArchSession
+
+    repl = make_repl(tmp_path, [_assistant("what does it own?")])
+    server = Server(repl)
+    arch = ArchSession(run_dir=tmp_path / "run")
+    repl.runner.ctx.arch = arch
+    arch.note_user_edit('drew a box "Rate limiter" (rate-limiter)')
+
+    server.on_board_submit()
+    server.worker.join(timeout=5)
+
+    asked = [m.content for m in repl.messages if m.role == "user"]
+    assert any("the user changed the board" in (c or "") for c in asked)
+    assert any('drew a box "Rate limiter"' in (c or "") for c in asked)
+
+
+def test_submitting_an_unchanged_board_says_nothing(tmp_path):
+    from bird.harnesses.arch.session import ArchSession
+
+    repl = make_repl(tmp_path, [])
+    server = Server(repl)
+    repl.runner.ctx.arch = ArchSession(run_dir=tmp_path / "run")
+
+    server.on_board_submit()
+    assert server.worker is None, "no edits, no turn"
+
+
+def test_submitting_while_a_turn_runs_does_not_interrupt_it(tmp_path):
+    """The edits reach a running turn through its pinned note; starting a
+    second turn would have the architect answer the same gesture twice."""
+    from bird.harnesses.arch.session import ArchSession
+
+    release = threading.Event()
+
+    class Blocking:
+        def complete(self, *a, **kw):
+            release.wait(timeout=5)
+            return LLMResponse(message=_assistant("done"), usage=Usage(1, 1),
+                               stop_reason="stop", model=SPEC.spec)
+
+    repl = make_repl(tmp_path, [])
+    repl.runner.client = Blocking()
+    server = Server(repl)
+    arch = ArchSession(run_dir=tmp_path / "run")
+    repl.runner.ctx.arch = arch
+
+    server.on_user_input("go")
+    time.sleep(0.2)
+    running = server.worker
+
+    arch.note_user_edit("drew a wire api -> pg")
+    server.on_board_submit()
+    assert server.worker is running, "the running turn was left alone"
+    assert arch.compose_activity_prompt() is not None, "and the edit is not lost"
+
+    release.set()
+    server.worker.join(timeout=5)
+
+
+def test_a_harness_with_no_board_ignores_the_signal(tmp_path):
+    """`bird serve --harness code` has no arch session; the route must not
+    require every harness to grow one."""
+    server = Server(make_repl(tmp_path, []))
+    server.on_board_submit()
+    assert server.worker is None
+
+
+def test_what_was_typed_carries_what_it_pointed_at(tmp_path):
+    """Selecting a box and asking "why this one?" has to arrive as one message
+    that already knows which one. Without it the architect is guessing."""
+    from bird.harnesses.arch.session import ArchSession
+    from bird.harnesses.arch.state import Node
+
+    repl = make_repl(tmp_path, [_assistant("ok")])
+    server = Server(repl)
+    arch = ArchSession(run_dir=tmp_path / "run")
+    arch.state.nodes["idx"] = Node(
+        id="idx", label="Search index", kind="store", responsibility="the vector index",
+    )
+    repl.runner.ctx.arch = arch
+
+    server.on_user_input("why this one?", ["idx"])
+    server.worker.join(timeout=5)
+
+    said = [m.content for m in repl.messages if m.role == "user"]
+    combined = next(c for c in said if "why this one?" in (c or ""))
+    assert "the user is pointing at" in combined
+    assert "- Search index" in combined
+    assert "owns: the vector index" in combined, "the details, not just the id"
+
+
+def test_pointing_at_nothing_adds_nothing(tmp_path):
+    """The overwhelming majority of messages select nothing and must not grow a
+    block saying so."""
+    from bird.harnesses.arch.session import ArchSession
+
+    repl = make_repl(tmp_path, [_assistant("ok")])
+    server = Server(repl)
+    repl.runner.ctx.arch = ArchSession(run_dir=tmp_path / "run")
+
+    server.on_user_input("morning")
+    server.worker.join(timeout=5)
+
+    said = [m.content for m in repl.messages if m.role == "user"]
+    assert any(c == "morning" for c in said), "the message is exactly what was typed"
+
+
+def test_a_harness_with_no_board_ignores_a_selection(tmp_path):
+    """`bird serve --harness code` has no arch session. A stray selection must
+    not make it fail."""
+    repl = make_repl(tmp_path, [_assistant("ok")])
+    server = Server(repl)
+
+    server.on_user_input("hello", ["idx"])
+    server.worker.join(timeout=5)
+
+    said = [m.content for m in repl.messages if m.role == "user"]
+    assert any(c == "hello" for c in said)
+
+
+def test_what_was_typed_carries_what_was_drawn(tmp_path):
+    """One message, one turn. Splitting them would have the architect answer
+    half of what you said at a time."""
+    from bird.harnesses.arch.session import ArchSession
+
+    repl = make_repl(tmp_path, [_assistant("ok")])
+    server = Server(repl)
+    arch = ArchSession(run_dir=tmp_path / "run")
+    repl.runner.ctx.arch = arch
+    arch.note_user_edit('drew a box "Rate limiter" (rate-limiter)')
+
+    server.on_user_input("and what about backpressure?")
+    server.worker.join(timeout=5)
+
+    said = [m.content for m in repl.messages if m.role == "user"]
+    combined = next(c for c in said if "backpressure" in (c or ""))
+    assert 'drew a box "Rate limiter"' in combined, "the drawing rode along"

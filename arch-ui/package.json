@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Architecture Workbench — React canvas for the bird arch harness",
+  "description": "Architecture board \u2014 the React canvas for the bird arch harness",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -12,10 +12,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@xyflow/react": "^12.3.5",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "zustand": "^5.0.1"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

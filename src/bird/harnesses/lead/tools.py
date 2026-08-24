@@ -29,12 +29,13 @@ def _require(ctx: ToolContext) -> None:
 class ArchitectTool(Tool):
     name = "architect"
     description = (
-        "Design the architecture for a feature or system before it is built. Runs an "
-        "architecture session and produces a handoff design (components, contracts, "
-        "decisions). For a new feature, the lead should first ask the user whether "
-        "they want the full Workbench design session or to skip straight to coding; "
-        "call this only when the user wants the Workbench (or is ambiguous and leans "
-        "toward design). The resulting design is passed to `code` automatically."
+        "Design the architecture for a feature or system before it is built. Opens a "
+        "design conversation with the user — they and the architect walk the design "
+        "tree together — and produces a handoff the builder works from. For a new "
+        "feature, the lead should first ask the user whether they want the design "
+        "session or to skip straight to coding; call this only when the user wants it "
+        "(or is ambiguous and leans toward design). The resulting design is passed to "
+        "`code` automatically."
     )
     parameters = {
         "type": "object",
@@ -54,37 +55,36 @@ class ArchitectTool(Tool):
         from ..handoff import bundle_md_path, seed_from_md
 
         run_dir = _sub_run_dir(ctx, "arch")
-        # Architecture ALWAYS opens the browser Workbench and blocks on the two
-        # human gates. There is deliberately no auto-approve path: nothing moves
-        # forward to code until the user explicitly finalizes the design.
+        # Architecture ALWAYS opens the Workbench with the user in the room.
+        # There is deliberately no headless path here: nothing moves forward to
+        # code until the user has said the design is done.
         ctx.emit("dispatch", {"harness": "arch", "task": args["task"], "run_dir": str(run_dir)})
         arch = run_arch_interactive(
             repo_root=ctx.repo_root, task=args["task"], registry=ctx.registry,
             client=ctx.client, run_dir=run_dir, kg=ctx.kg,
             on_status=lambda m: ctx.emit("dispatch_status", {"message": m}),
         )
-        phase = arch.state.phase
-        if phase != "finalized":
+        if not arch.state.handed_off:
             raise ToolError(
-                f"the architecture session ended in phase '{phase}', not finalized — "
-                "the user did not approve the design (they may have closed the page). "
-                "Do NOT proceed to code. Ask the user whether to reopen the "
-                "architecture Workbench to finish it, or how they want to proceed."
+                "the architecture session ended without a handoff — the user did not "
+                "say the design was done (they may have closed the page). Do NOT "
+                "proceed to code. Ask them whether to reopen the design session to "
+                "finish it, or how they want to proceed."
             )
         md_path = bundle_md_path(run_dir)
         ctx.last_bundle = seed_from_md(md_path.read_text(encoding="utf-8"))
-        comps = list(arch.state.components)
+        boxes = list(arch.state.nodes)
         headline = arch.state.brief.goal or args["task"][:60]
         return ToolResult(
             output=(
-                f"Architecture finalized: '{headline}' — {len(comps)} components "
-                f"({', '.join(comps) or 'none'}). Handoff bundle at {md_path.parent}. "
+                f"Design handed off: '{headline}' — {len(boxes)} component(s) "
+                f"({', '.join(boxes) or 'none'}). Bundle at {md_path.parent}. "
                 "Now call `code` to build it."
             ),
             details={
                 "harness": "arch",
-                "phase": "finalized",
-                "components": comps,
+                "handed_off": True,
+                "components": boxes,
                 "run_dir": str(run_dir),
             },
         )

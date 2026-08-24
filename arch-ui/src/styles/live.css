@@ -1,0 +1,27 @@
+/* What the live page needs that the prototype never did.
+   board.css is copied verbatim out of arch-board.html and must stay that way,
+   so anything the harness wiring adds lives here instead. */
+
+/* board.css expects `.app` to be a child of a full-height body; React mounts
+   a #root in between, which has to pass the height through. */
+#root { height: 100%; }
+
+/* the boxes a message was pointing at when it was sent. Ink, not accent — it
+   is a note about the message, not a second thing to look at. */
+.turn.you .about{
+  margin:6px 0 0; font-size:11.5px; line-height:1.45; color:var(--ink-2);
+}
+.turn.you .about b{ font-weight:600; color:var(--fg); }
+
+/* what travelled with a message because it was drawn rather than typed */
+.turn.you .drew{
+  list-style:none; margin:8px 0 0; padding:0; display:grid; gap:4px;
+}
+.turn.you .drew li{
+  font-family:var(--font-mono); font-size:11px; line-height:1.45; color:var(--ink-2);
+  padding-left:13px; position:relative;
+}
+.turn.you .drew li::before{
+  content:''; position:absolute; left:0; top:6px;
+  width:5px; height:5px; border-radius:50%; background:var(--muted);
+}

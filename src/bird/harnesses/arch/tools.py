@@ -1,78 +1,68 @@
-"""The arch toolset — a design conversation with a memory.
+"""The arch toolset: six ways to jot something down, plus the fact-finding.
 
-The tools exist so that thinking survives the session; they are not a form to
-be filled. Three rules follow from that, and they are what separate this from
-the original phase-gated toolset:
+The conversation is the work. These tools are the architect's notebook — they
+exist so a decision made out loud survives the session and reaches whoever
+builds it. None of them is a form, none of them gates anything, and none of
+them is how a turn ends: a plain reply does that.
 
-1. A tool refuses only what is *broken* (an edge to a component that doesn't
-   exist, a session already finalized). Thinness comes back as advice on a
-   successful call, so the model can argue about whether it matters.
-2. No tool is locked by phase. Sketch after promoting, add a component before
-   the brief is complete, expand before approval — all allowed. Post-approval
-   structural edits still record an amendment; the audit trail was the part
-   worth keeping, not the lock.
-3. Disagreement is first-class: `concern` records an objection against the
-   design, a decision, or the user's own instruction, and open blockers are
-   shown to the user at the finalize gate rather than blocking the work.
+Three rules follow:
 
-`done` is the two human gates and nothing else: top-level approval, then
-finalize. It never refuses for an incomplete design — it reports what is thin
-and lets the user decide.
+1. A tool refuses only what is *broken* — an edge to a node that cannot exist,
+   an approach greyed without saying why, a session already handed off.
+   Thinness is never a refusal; it comes back as an observation the architect
+   can raise in its next turn, or ignore because it does not matter here.
+2. Everything batches. Putting a shape on the board is one `canvas` call with
+   six nodes and five edges, not eleven calls. The user is waiting.
+3. Missing edge endpoints auto-create as stubs. You are at a whiteboard.
 """
 
 from __future__ import annotations
 
-import re
+from dataclasses import replace
 from typing import Any
 
 from ...tools import Tool, ToolContext, ToolError, ToolResult
-from ...tools.kg_query import KgQueryTool
 from ...tools.files import LsTool, ReadImageTool, ReadTool
+from ...tools.kg_query import KgQueryTool
 from ...tools.skill import SkillTool
 from ...tools.web import WebFetchTool, WebSearchTool
-from . import render
-from .reverse_seed import (
-    DEFAULT_MAX_DEPTH,
-    DEFAULT_MAX_NODES,
-    SeedResult,
-    Subgraph,
-    reverse_seed,
-    scope_subgraph,
-)
+from . import derive
 from .session import ArchSession
-from .sketch import DEPTHS, SketchLink, SketchNode, Variant
 from .state import (
-    CONCERN_SEVERITIES,
+    DEPTHS,
+    EDGE_KINDS,
     KINDS,
-    CONNECTION_KINDS,
-    DECISION_CATEGORIES,
-    DECISION_SOURCES,
-    FACET_FOR_KIND,
-    FLOW_KINDS,
-    SCOPES,
-    ApiFacet,
-    Amendment,
-    Component,
-    Connection,
+    STATUSES,
+    Approach,
     Decision,
-    DeployUnit,
-    Endpoint,
-    Entity,
-    Flow,
-    FlowStep,
-    InfraFacet,
-    LlmFacet,
-    LlmTask,
-    Module,
-    OpenQuestion,
+    Edge,
+    Node,
     Option,
-    QueueFacet,
-    QueueMessage,
-    ServiceFacet,
-    StoreFacet,
+    Question,
+    slug,
 )
 
-POST_APPROVAL_PHASES = ("expand", "resolved")
+NOTICES_SHOWN = 2
+
+# fields a `canvas` node spec may set directly, all optional, all prose
+_NODE_FIELDS = ("kind", "responsibility", "tech", "depth", "detail", "notes", "status")
+
+
+# ------------------------------------------------------------- plumbing
+
+
+def _session(ctx: ToolContext) -> ArchSession:
+    if ctx.arch is None:
+        raise ToolError("not an architecture session — arch tools are unavailable.")
+    return ctx.arch
+
+
+def _guard_open(session: ArchSession) -> None:
+    """The only hard lock in the harness. Everything the old phase gates
+    refused — deepening before approval, drawing before the brief was
+    complete — is now simply allowed."""
+    if session.state.handed_off:
+        raise ToolError("the design was handed off — the session is closed.")
 
 
 def _check(validate, *args) -> None:
@@ -83,527 +73,518 @@ def _check(validate, *args) -> None:
         raise ToolError(str(e)) from e
 
 
-def _session(ctx: ToolContext) -> ArchSession:
-    if ctx.arch is None:
-        raise ToolError("not an architecture session — arch tools are unavailable.")
-    return ctx.arch
+def _str(val: Any) -> str:
+    return "" if val is None else str(val).strip()
 
 
-def _guard_not_finalized(session: ArchSession) -> None:
-    """The one hard lock left in the harness. Everything the old phase gates
-    refused — sketching after promote, components before a complete brief,
-    expanding before approval — is now allowed and merely noted."""
-    if session.state.phase == "finalized":
-        raise ToolError("the session is finalized — no further changes are possible.")
+def _strlist(val: Any) -> list[str]:
+    if val is None:
+        return []
+    if isinstance(val, str):
+        return [val.strip()] if val.strip() else []
+    return [str(v).strip() for v in val if str(v).strip()]
 
 
-def _toplevel_locked(session: ArchSession) -> bool:
-    """After the user approves the top level, structural edits still go
-    through — they just leave an amendment behind."""
-    return session.state.phase in POST_APPROVAL_PHASES
+def _confirm(message: str, session: ArchSession, subjects: tuple[str, ...] = ()) -> ToolResult:
+    """The confirmation, plus anything the harness noticed *about what was just
+    touched*.
+
+    `subjects` does two jobs. It filters the observations — the pinned note
+    already carries the full picture once a turn, and repeating the same two
+    lines on every unrelated call is how a tracker becomes wallpaper — and it
+    rides along in `details` so the page can offer to show you what just moved.
+    """
+    details: dict[str, Any] = {"ok": True, "summary": message.split("\n")[0]}
+    if subjects:
+        details["subjects"] = list(dict.fromkeys(subjects))
+    if not subjects:
+        return ToolResult(output=message, details=details)
+    notices = [
+        line for line in derive.coverage(session.state)
+        if any(s in line for s in subjects)
+    ]
+    if not notices:
+        return ToolResult(output=message, details=details)
+    shown = notices[:NOTICES_SHOWN]
+    details["noticing"] = notices
+    return ToolResult(
+        output=message + "\n\nnoticing: " + " · ".join(shown),
+        details=details,
+    )
 
 
-def _active_variant(session: ArchSession) -> Variant:
-    """The sketch surface is always available: if nothing is open, open one.
-    Going back to the napkin mid-design is a legitimate move, not an error."""
-    book = session.state.sketchbook
-    v = book.active_variant()
-    if v is not None:
-        return v
-    live = next((x for x in book.variants.values() if x.status != "archived"), None)
-    if live is not None:
-        book.active = live.id
-        return live
-    vid = f"v{len(book.variants) + 1}"
-    v = Variant(id=vid, name="first take", summary="")
-    book.variants[vid] = v
-    book.active = vid
-    return v
+# ------------------------------------------------------------- the canvas
 
 
-def _slug(text: str) -> str:
-    s = re.sub(r"[^a-z0-9]+", "-", str(text).strip().lower()).strip("-")
-    return s or "node"
+def _upsert_node(session: ArchSession, spec: dict[str, Any]) -> tuple[str, bool]:
+    """Add or update one node. Returns (id, was_new). A partial spec updates
+    only the fields it names — the canvas is not re-posted whole every time."""
+    state = session.state
+    if not isinstance(spec, dict):
+        raise ToolError(f"each node must be an object, got {type(spec).__name__}.")
+    label = _str(spec.get("label"))
+    raw_id = _str(spec.get("id"))
+    if not raw_id and not label:
+        raise ToolError("a node needs a label (an id alone is not a name anyone reads).")
+    nid = slug(raw_id) if raw_id else state.next_node_id(label)
+
+    current = state.nodes.get(nid)
+    candidate = replace(current) if current is not None else Node(id=nid, label=label or nid)
+    if label:
+        candidate.label = label
+    for name in _NODE_FIELDS:
+        if spec.get(name) is not None:
+            setattr(candidate, name, _str(spec[name]))
+    if spec.get("approaches") is not None:
+        candidate.approaches = [slug(a) for a in _strlist(spec["approaches"])]
+    _check(state.validate_node, candidate)
+    state.nodes[nid] = candidate
+    return nid, current is None
 
 
-# loose sketch `kind` hint -> strict KIND at promotion; anything else -> service
-_KIND_MAP = {
-    "db": "store", "database": "store", "datastore": "store", "storage": "store",
-    "mq": "queue", "broker": "queue", "bus": "queue", "stream": "queue", "topic": "queue",
-    "frontend": "ui", "web": "ui", "client": "ui", "spa": "ui",
-    "model": "llm", "ai": "llm", "agent": "llm",
-    "worker": "job", "cron": "job", "batch": "job",
-    "endpoint": "api", "rest": "api", "http": "api",
-    "3rd-party": "external", "third-party": "external", "vendor": "external",
-    "component": "service", "module": "service", "idea": "service",
+def _upsert_edge(
+    session: ArchSession, spec: dict[str, Any], auto: list[str]
+) -> tuple[str, bool]:
+    """Add or update one edge, auto-creating either endpoint if it is missing.
+    An edge is identified by (src, dst): re-sending one relabels it rather than
+    stacking a second arrow between the same two boxes."""
+    state = session.state
+    if not isinstance(spec, dict):
+        raise ToolError(f"each edge must be an object, got {type(spec).__name__}.")
+    src, dst = slug(_str(spec.get("src"))), slug(_str(spec.get("dst")))
+    if not _str(spec.get("src")) or not _str(spec.get("dst")):
+        raise ToolError("an edge needs src and dst.")
+    for ref in (src, dst):
+        if ref not in state.nodes:
+            stub = Node(id=ref, label=ref.replace("-", " "))
+            _check(state.validate_node, stub)
+            state.nodes[ref] = stub
+            auto.append(ref)
+
+    idx = state.edge_index(src, dst)
+    current = state.edges[idx] if idx >= 0 else None
+    candidate = replace(current) if current is not None else Edge(src=src, dst=dst)
+    for name in ("label", "kind", "notes"):
+        if spec.get(name) is not None:
+            setattr(candidate, name, _str(spec[name]))
+    _check(state.validate_edge, candidate)
+    if idx >= 0:
+        state.edges[idx] = candidate
+    else:
+        state.edges.append(candidate)
+    return f"{src}->{dst}", idx < 0
+
+
+def _remove(session: ArchSession, ref: str) -> str:
+    """Remove a node (and everything hanging off it) or a single edge.
+
+    Deleting is a real design move — reach for it before adding — so it is
+    plain rather than ceremonial, and it says what went with it.
+    """
+    state = session.state
+    normalized = ref.replace("->", ">")
+    if ">" in normalized:
+        src, _, dst = normalized.partition(">")
+        idx = state.edge_index(slug(src.strip()), slug(dst.strip()))
+        if idx < 0:
+            raise ToolError(f"no edge {ref!r} to remove.")
+        edge = state.edges.pop(idx)
+        return f"edge {edge.src}->{edge.dst}"
+    nid = slug(ref)
+    if nid not in state.nodes:
+        raise ToolError(f"no node {nid!r} to remove.")
+    dropped = state.references_to(nid)
+    state.edges = [e for e in state.edges if nid not in (e.src, e.dst)]
+    del state.nodes[nid]
+    tail = f" (and {len(dropped)} edge(s))" if dropped else ""
+    return f"node {nid}{tail}"
+
+
+_NODE_ITEM = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "description": "kebab-case; omit to derive one from the label"},
+        "label": {"type": "string", "description": "what the box says"},
+        "kind": {"type": "string", "enum": list(KINDS)},
+        "responsibility": {"type": "string", "description": "one sentence on what it does"},
+        "tech": {"type": "string", "description": "the concrete choice, once there is one"},
+        "depth": {
+            "type": "string", "enum": list(DEPTHS),
+            "description": "stub = a name to react to · sketch = it has a job · "
+                           "detailed = you have said what is inside. Lowering it is allowed.",
+        },
+        "detail": {"type": "string", "description": "prose: what's inside, in whatever "
+                                                    "shape fits — schema sketch, endpoints, "
+                                                    "retention, failure behaviour"},
+        "approaches": {
+            "type": "array", "items": {"type": "string"},
+            "description": "approach ids this box belongs to. OMIT for a box every "
+                           "approach shares — that is what gets drawn once.",
+        },
+        "notes": {"type": "string"},
+        "status": {"type": "string", "enum": list(STATUSES)},
+    },
+    "additionalProperties": False,
+}
+
+_EDGE_ITEM = {
+    "type": "object",
+    "properties": {
+        "src": {"type": "string"},
+        "dst": {"type": "string"},
+        "label": {"type": "string", "description": "what crosses it"},
+        "kind": {"type": "string", "enum": list(EDGE_KINDS)},
+        "notes": {"type": "string", "description": "what the caller does when the far "
+                                                   "end is down, or what carries it"},
+    },
+    "required": ["src", "dst"],
+    "additionalProperties": False,
 }
 
 
-def _strict_kind(loose: str) -> str:
-    k = (loose or "").strip().lower()
-    if k in KINDS:
-        return k
-    return _KIND_MAP.get(k, "service")
-
-
-def _drop_components(state: Any, ids: set[str]) -> None:
-    """Remove components and everything that would dangle without them."""
-    for cid in ids:
-        state.components.pop(cid, None)
-    state.connections = [c for c in state.connections if c.src not in ids and c.dst not in ids]
-    kept = []
-    for f in state.flows:
-        f.steps = [s for s in f.steps if s.src not in ids and s.dst not in ids]
-        if f.steps:
-            kept.append(f)
-    state.flows = kept
-    state.obligations = [o for o in state.obligations if o.component_id not in ids]
-
-
-def _promote(session: ArchSession, variant: Variant, replace: bool = False) -> tuple[int, int, int]:
-    """Seed the strict layer from a sketch: nodes -> draft Components, links ->
-    Connections. Deliberately skips the thinness checks — these are drafts.
-
-    Re-runnable and non-destructive. Rivals stay live (archiving is a separate,
-    deliberate move), a node already seeded from this variant is left alone
-    rather than duplicated, and `replace` clears what an *earlier* choice
-    seeded so switching horses doesn't leave two architectures on the canvas.
-    """
-    state = session.state
-    book = state.sketchbook
-    for x in book.variants.values():
-        if x.id == variant.id:
-            x.status = "chosen"
-        elif x.status == "chosen":
-            x.status = "draft"  # the previous choice steps down but stays live
-    book.active = variant.id
-
-    prefix = f"sketch:{variant.id}:"
-    if replace:
-        stale = {
-            c.id for c in state.components.values()
-            if c.origin.startswith("sketch:") and not c.origin.startswith(prefix)
-        }
-        _drop_components(state, stale)
-
-    seeded = {c.origin: c.id for c in state.components.values() if c.origin.startswith(prefix)}
-    idmap: dict[str, str] = {}
-    added_c = kept = 0
-    for nid, node in variant.nodes.items():
-        origin = prefix + nid
-        if origin in seeded:
-            idmap[nid] = seeded[origin]
-            kept += 1
-            continue
-        base = _slug(nid)
-        cid, i = base, 2
-        while cid in state.components:
-            cid, i = f"{base}-{i}", i + 1
-        state.components[cid] = Component(
-            id=cid,
-            name=node.label or cid,
-            kind=_strict_kind(node.kind),
-            responsibility=(node.note or node.detail or "").strip(),
-            trace=[],
-            existing=False,
-            origin=origin,
-        )
-        idmap[nid] = cid
-        added_c += 1
-
-    have = {(c.src, c.dst, c.label) for c in state.connections}
-    added_conn = 0
-    for ln in variant.links:
-        s, d = idmap.get(ln.src), idmap.get(ln.dst)
-        if not s or not d:
-            continue
-        label = ln.label or "calls"
-        if (s, d, label) in have:
-            continue
-        have.add((s, d, label))
-        state.connections.append(Connection(
-            src=s, dst=d,
-            label=label,
-            kind=ln.kind if ln.kind in CONNECTION_KINDS else "sync",
-        ))
-        added_conn += 1
-    if state.phase == "brainstorm":
-        state.phase = "propose"  # never yanks a later phase backwards
-    return added_c, added_conn, kept
-
-
-def _post_approval_amendment(session: ArchSession, description: str, *, structural: bool) -> str:
-    """After the user approves the top level, an edit is not refused — it is
-    recorded. The audit trail was the thing worth protecting; the lock wasn't."""
-    if not _toplevel_locked(session):
-        return ""
-    state = session.state
-    state.amendments.append(Amendment(
-        turn=len(state.amendments) + 1, description=description, structural=structural,
-    ))
-    if structural:
-        state.compute_obligations()
-        return (
-            "this changes the top level the user already approved — recorded as a "
-            "structural amendment and obligations recomputed. Tell them what moved and why."
-        )
-    return "recorded as an amendment against the approved top level."
-
-
-def _confirm(
-    action: str,
-    session: ArchSession,
-    *,
-    gaps: list[str] | None = None,
-    note: str = "",
-) -> ToolResult:
-    """Tool receipt: what happened, what is thin about it, what's worth doing
-    next. `gaps` is advice — the call already succeeded."""
-    parts = [action]
-    if note:
-        parts.append(note)
-    if gaps:
-        parts.append(
-            "thin: " + "; ".join(gaps)
-            + "\n(fill these in when you know them, or say why they don't matter here — "
-            "they are not required)"
-        )
-    parts.append(f"next: {render._next_hint(session.state)}")
-    return ToolResult(output="\n".join(parts))
-
-
-# ============================ the loose sketch layer ============================
-# Brainstorming primitives. No validation — you're sketching on a napkin. Several
-# variants of the same feature can coexist; `promote` commits one into the strict
-# ArchState. See sketch.py for the model these mutate.
-
-
-class VariantTool(Tool):
-    name = "variant"
+class CanvasTool(Tool):
+    name = "canvas"
     description = (
-        "Create, select, or archive a candidate architecture (a variant). Several "
-        "coexist for the same feature; the active one is what node/link/splice edit. "
-        "Offer the user rival shapes early. Archive a loser with a rejected_reason — "
-        "that reasoning is the ADR gold that survives into the handoff doc."
+        "Put boxes and arrows on the board, or change ones that are there. Batch it: "
+        "one call with the whole shape beats six calls building it up.\n"
+        "A node's `depth` is a slider you move both ways — deepen a box when the "
+        "conversation reaches its branch, collapse it back when the detail stopped "
+        "earning its place. A partial spec updates only the fields it names.\n"
+        "Missing edge endpoints are created as stubs, so you can draw the flow first "
+        "and name what is in the boxes after.\n"
+        "`approaches` is what makes rival takes coexist: label the boxes that differ, "
+        "and OMIT the label on the ones both takes share so they are drawn once."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Optional; auto-assigned v1, v2, ..."},
-            "name": {"type": "string", "description": "e.g. 'synchronous', 'event-driven'"},
-            "summary": {"type": "string", "description": "the idea/tradeoff this take explores, one line"},
-            "select": {"type": "boolean", "description": "make it the active variant (default true)"},
-            "archive": {"type": "boolean", "description": "retire it as a rejected alternative"},
-            "rejected_reason": {"type": "string", "description": "why it lost — recorded on archive"},
+            "nodes": {"type": "array", "items": _NODE_ITEM},
+            "edges": {"type": "array", "items": _EDGE_ITEM},
+            "remove": {
+                "type": "array", "items": {"type": "string"},
+                "description": "node ids, or 'src>dst' for a single edge",
+            },
         },
         "additionalProperties": False,
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        _guard_not_finalized(session)
-        book = session.state.sketchbook
-        if args.get("archive"):
-            vid = (args.get("id") or "").strip()
-            v = book.variants.get(vid)
-            if v is None:
-                known = ", ".join(book.variants) or "none"
-                raise ToolError(f"no variant {vid!r} to archive (known: {known}).")
-            v.status = "archived"
-            if args.get("rejected_reason"):
-                v.rejected_reason = args["rejected_reason"]
-            if book.active == vid:
-                book.active = next(
-                    (k for k, x in book.variants.items() if x.status != "archived"), None
-                )
-            session.touched("variant", vid)
-            return _confirm(f"Archived variant {vid} ({v.name}).", session)
-        vid = (args.get("id") or f"v{len(book.variants) + 1}").strip()
-        v = book.variants.get(vid)
-        if v is None:
-            v = Variant(id=vid, name=args.get("name", vid), summary=args.get("summary", ""))
-            book.variants[vid] = v
-            action = f"Started variant {vid}: {v.name}."
-        else:
-            if "name" in args:
-                v.name = args["name"]
-            if "summary" in args:
-                v.summary = args["summary"]
-            v.status = "draft"
-            action = f"Updated variant {vid}."
-        if args.get("select", True) and v.status != "archived":
-            book.active = vid
-        session.touched("variant", vid)
-        return _confirm(action, session)
+        _guard_open(session)
+        nodes = args.get("nodes") or []
+        edges = args.get("edges") or []
+        removals = _strlist(args.get("remove"))
+        if not nodes and not edges and not removals:
+            raise ToolError("nothing to do — pass nodes, edges, or remove.")
+
+        auto: list[str] = []
+        added = updated = 0
+        subjects: list[str] = []
+        for spec in nodes:
+            nid, was_new = _upsert_node(session, spec)
+            subjects.append(nid)
+            added, updated = (added + 1, updated) if was_new else (added, updated + 1)
+        new_edges = same_edges = 0
+        for spec in edges:
+            ref, was_new = _upsert_edge(session, spec, auto)
+            new_edges, same_edges = (
+                (new_edges + 1, same_edges) if was_new else (new_edges, same_edges + 1)
+            )
+        gone = [_remove(session, ref) for ref in removals]
+
+        parts = []
+        if added:
+            parts.append(f"{added} node(s) added")
+        if updated:
+            parts.append(f"{updated} updated")
+        if new_edges:
+            parts.append(f"{new_edges} edge(s) drawn")
+        if same_edges:
+            parts.append(f"{same_edges} edge(s) changed")
+        if auto:
+            parts.append(f"auto-created stubs: {', '.join(auto)}")
+        if gone:
+            parts.append("removed " + "; ".join(gone))
+        session.touched("canvas", subjects[0] if subjects else "board")
+        return _confirm("Board: " + ", ".join(parts) + ".", session, tuple(subjects + auto))
 
 
-class NodeTool(Tool):
-    name = "node"
+# ------------------------------------------------------------ approaches
+
+
+class ApproachTool(Tool):
+    name = "approach"
     description = (
-        "Add, update, or remove a box in the active variant. Loose: `kind` is a free "
-        "hint (service/store/queue/ui/llm/idea/...), nothing is validated — you're "
-        "sketching. remove:true deletes it (and any links touching it)."
+        "Name a take on the board, or grey one out when it loses.\n"
+        "An approach is a label, not a separate design: boxes carry it via "
+        "`canvas`, and boxes with no label are shared by every take. Two takes "
+        "side by side with a real tradeoff between them is worth more than one "
+        "the user will rubber-stamp.\n"
+        "Greying keeps it visible in grey with the reason it lost — that reason is "
+        "the single most useful thing this session leaves behind, and it is required. "
+        "Nothing is ever deleted for losing."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "short, stable handle for the box"},
-            "label": {"type": "string", "description": "display name"},
-            "kind": {"type": "string", "description": "free hint, e.g. 'store', 'queue', 'idea'"},
-            "note": {"type": "string", "description": "what it is / why it's here"},
-            "remove": {"type": "boolean"},
-        },
-        "required": ["id"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        _guard_not_finalized(session)
-        v = _active_variant(session)
-        nid = args["id"].strip()
-        if args.get("remove"):
-            if nid not in v.nodes:
-                raise ToolError(f"node {nid!r} is not in variant {v.id}.")
-            v.nodes.pop(nid)
-            v.links = [ln for ln in v.links if nid not in (ln.src, ln.dst)]
-            action = f"Removed node {nid}."
-        else:
-            node = v.nodes.get(nid)
-            if node is None:
-                node = SketchNode(
-                    id=nid, label=args.get("label", nid),
-                    kind=args.get("kind", "component"), note=args.get("note", ""),
-                )
-                v.nodes[nid] = node
-                action = f"Added node {nid} ({node.kind})."
-            else:
-                for k in ("label", "kind", "note"):
-                    if k in args:
-                        setattr(node, k, args[k])
-                action = f"Updated node {nid}."
-        session.touched("node", nid)
-        return _confirm(action, session)
-
-
-class LinkTool(Tool):
-    name = "link"
-    description = (
-        "Add, update, or remove an edge in the active variant. Missing endpoints are "
-        "auto-created as stub nodes (fast sketching). `kind` is a free hint "
-        "(sync/async/batch). remove:true drops the edge."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "src": {"type": "string"},
-            "dst": {"type": "string"},
-            "label": {"type": "string", "description": "what the edge means, e.g. 'writes', 'emits'"},
-            "kind": {"type": "string", "description": "sync / async / batch (free hint)"},
-            "note": {"type": "string"},
-            "remove": {"type": "boolean"},
-        },
-        "required": ["src", "dst"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        _guard_not_finalized(session)
-        v = _active_variant(session)
-        src, dst = args["src"].strip(), args["dst"].strip()
-        label = args.get("label")
-        idx = v.link_index(src, dst, label)
-        if args.get("remove"):
-            if idx < 0:
-                raise ToolError(f"no edge {src} -> {dst}" + (f" labeled {label!r}" if label else "") + ".")
-            v.links.pop(idx)
-            action = f"Removed edge {src} -> {dst}."
-        elif idx >= 0:
-            ln = v.links[idx]
-            for k in ("label", "kind", "note"):
-                if k in args:
-                    setattr(ln, k, args[k])
-            action = f"Updated edge {src} -> {dst}."
-        else:
-            created = []
-            for ref in (src, dst):
-                if ref not in v.nodes:
-                    v.nodes[ref] = SketchNode(id=ref, label=ref)
-                    created.append(ref)
-            v.links.append(SketchLink(
-                src=src, dst=dst, label=args.get("label", ""),
-                kind=args.get("kind", "sync"), note=args.get("note", ""),
-            ))
-            action = f"Linked {src} -> {dst}."
-            if created:
-                action += f" (created stub node(s): {', '.join(created)})"
-        session.touched("link", f"{src}->{dst}")
-        return _confirm(action, session)
-
-
-class SpliceTool(Tool):
-    name = "splice"
-    description = (
-        "Insert a new node between two existing ones: creates the node and rewires "
-        "src -> new -> dst, dropping the direct src -> dst edge (its kind/label carry "
-        "onto src -> new). The 'add an intermediate step' move — a cache, queue, or "
-        "gateway between two boxes."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "src": {"type": "string", "description": "existing node the edge leaves"},
-            "dst": {"type": "string", "description": "existing node the edge enters"},
-            "id": {"type": "string", "description": "id for the new node in between"},
-            "label": {"type": "string"},
-            "kind": {"type": "string", "description": "free hint for the new node"},
-            "note": {"type": "string"},
-        },
-        "required": ["src", "dst", "id"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        _guard_not_finalized(session)
-        v = _active_variant(session)
-        src, dst, nid = args["src"].strip(), args["dst"].strip(), args["id"].strip()
-        for ref in (src, dst):
-            if ref not in v.nodes:
-                raise ToolError(f"node {ref!r} is not in variant {v.id} — splice needs both ends to exist.")
-        if nid in v.nodes:
-            raise ToolError(f"node {nid!r} already exists; pick a new id for the inserted node.")
-        v.nodes[nid] = SketchNode(
-            id=nid, label=args.get("label", nid),
-            kind=args.get("kind", "component"), note=args.get("note", ""),
-        )
-        idx = v.link_index(src, dst)
-        old = v.links.pop(idx) if idx >= 0 else None
-        carry_kind = old.kind if old else "sync"
-        v.links.append(SketchLink(src=src, dst=nid, label=(old.label if old else ""), kind=carry_kind))
-        v.links.append(SketchLink(src=nid, dst=dst, label="", kind=carry_kind))
-        session.touched("node", nid)
-        return _confirm(f"Spliced {nid} between {src} and {dst}.", session)
-
-
-class DepthTool(Tool):
-    name = "depth"
-    description = (
-        "Set a node's depth — the fidelity slider. RAISE it (stub -> sketch -> "
-        "detailed) to flesh out internals in `detail`, or LOWER it to collapse a node "
-        "back toward a bare box. Reducing depth is a first-class simplification move, "
-        "not an undo — collapsing to stub clears the internal detail."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "node_id": {"type": "string"},
-            "level": {"type": "string", "enum": list(DEPTHS)},
-            "detail": {"type": "string", "description": "the internal sketch at sketch/detailed depth"},
-        },
-        "required": ["node_id", "level"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        _guard_not_finalized(session)
-        v = _active_variant(session)
-        nid = args["node_id"].strip()
-        node = v.nodes.get(nid)
-        if node is None:
-            raise ToolError(f"node {nid!r} is not in variant {v.id}.")
-        level = args["level"]
-        if level not in DEPTHS:
-            raise ToolError(f"level must be one of {', '.join(DEPTHS)}.")
-        node.depth = level
-        if level == "stub":
-            node.detail = ""  # collapsing clears the internal sketch
-        elif "detail" in args:
-            node.detail = args["detail"]
-        session.touched("node", nid)
-        return _confirm(f"{nid} depth -> {level}.", session)
-
-
-class PromoteTool(Tool):
-    name = "promote"
-    description = (
-        "Take a sketch variant forward: mark it chosen and seed the design "
-        "(components + connections) from it. Rivals stay live — you can keep "
-        "sketching, and promoting a different variant later is allowed (pass "
-        "replace:true to clear what the earlier choice seeded). Re-running it on the "
-        "same variant picks up nodes you have added since."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "variant_id": {"type": "string", "description": "which variant (default: the active one)"},
-            "replace": {"type": "boolean",
-                        "description": "drop what a previous variant seeded instead of merging"},
+            "name": {"type": "string", "description": "e.g. 'queue-first'"},
+            "id": {"type": "string", "description": "kebab-case; derived from the name if omitted"},
+            "summary": {"type": "string", "description": "the tradeoff this take explores, one line"},
+            "status": {"type": "string", "enum": list(STATUSES)},
+            "rejected_reason": {
+                "type": "string",
+                "description": "why it lost. Required to grey one out.",
+            },
         },
         "additionalProperties": False,
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
+        _guard_open(session)
         state = session.state
-        _guard_not_finalized(session)
-        book = state.sketchbook
-        vid = (args.get("variant_id") or book.active or "").strip()
-        v = book.variants.get(vid) if vid else None
-        if v is None:
-            known = ", ".join(book.variants) or "none"
-            raise ToolError(
-                f"no variant {vid!r} to promote (known: {known}) — name one with "
-                "`variant` and sketch it first."
+        name = _str(args.get("name"))
+        raw_id = _str(args.get("id"))
+        if not raw_id and not name:
+            raise ToolError("an approach needs a name (or an id).")
+        aid = slug(raw_id or name)
+
+        current = state.approaches.get(aid)
+        candidate = replace(current) if current is not None else Approach(id=aid, name=name or aid)
+        if name:
+            candidate.name = name
+        for field_name in ("summary", "status", "rejected_reason"):
+            if args.get(field_name) is not None:
+                setattr(candidate, field_name, _str(args[field_name]))
+        _check(state.validate_approach, candidate)
+        state.approaches[aid] = candidate
+        session.touched("approach", aid)
+
+        if candidate.status == "greyed":
+            live = [a.name for a in state.live_approaches()]
+            tail = f" Still live: {', '.join(live)}." if live else ""
+            return _confirm(
+                f"'{candidate.name}' greyed out, and the board keeps why: "
+                f"{candidate.rejected_reason}.{tail}",
+                session,
+                tuple(n.id for n in state.nodes_in(aid)) or (aid,),
             )
-        if not v.nodes:
-            raise ToolError(f"variant {v.id} ({v.name}) has no nodes yet — sketch it before promoting.")
-        added_c, added_conn, kept = _promote(session, v, replace=bool(args.get("replace")))
-        session.touched()
-        bits = [f"seeded {added_c} component(s) and {added_conn} connection(s)"]
-        if kept:
-            bits.append(f"{kept} already seeded, left alone")
-        note = ""
-        missing = state.brief.missing()
-        if missing:
-            note = (
-                f"the brief has no {', '.join(missing)} yet — not a blocker, but these are "
-                "load-bearing for the build. Ask the user rather than assuming."
-            )
+        verb = "Named" if current is None else "Updated"
         return _confirm(
-            f"Chose '{v.name}': " + "; ".join(bits) + ".",
-            session,
-            note=note,
-            gaps=state.gaps()[:6],
+            f"{verb} approach '{candidate.name}' ({aid}). Label its boxes with "
+            f"approaches=['{aid}'] and leave the shared ones unlabelled.",
+            session, (aid,),
         )
+
+
+# ------------------------------------------------------------- decisions
+
+
+def _options(choice: str, against: Any) -> list[Option]:
+    """The chosen option first, then what it beat. `against` takes bare strings
+    for a quick note, or objects when the pros and cons are worth keeping."""
+    opts = [Option(name=choice)] if choice else []
+    for item in against or []:
+        if isinstance(item, str):
+            if item.strip():
+                opts.append(Option(name=item.strip()))
+            continue
+        if not isinstance(item, dict):
+            raise ToolError("each `against` entry must be a string or an object with a name.")
+        name = _str(item.get("name"))
+        if not name:
+            raise ToolError("an `against` object needs a name.")
+        opts.append(Option(name=name, pros=_strlist(item.get("pros")), cons=_strlist(item.get("cons"))))
+    return opts
+
+
+class DecideTool(Tool):
+    name = "decide"
+    description = (
+        "Write down a call that was made, and what it was made against. Two lines "
+        "of note, not a form.\n"
+        "`why` is the part that survives: name the tradeoff in the user's terms, not "
+        "the textbook's.\n"
+        "`pragmatic` is first-class and not a confession. 'Less robust, and right, "
+        "because it ships in a week and the rewrite is cheap' is a complete verdict — "
+        "put that there and it is recorded as the reason, not as a compromise.\n"
+        "When the USER named the technology, set source='user' and still put a real "
+        "alternative in `against`. Absorbing their choice without weighing anything is "
+        "the one move to avoid — not because they are wrong, but because they asked "
+        "you to think."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string", "description": "what was being decided, e.g. 'compute'"},
+            "choice": {"type": "string", "description": "what won"},
+            "against": {
+                "type": "array",
+                "items": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "pros": {"type": "array", "items": {"type": "string"}},
+                                "cons": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["name"],
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
+                "description": "what it beat — bare names, or objects when the "
+                               "pros/cons are worth keeping",
+            },
+            "why": {"type": "string", "description": "the reason, in their terms"},
+            "source": {"type": "string", "enum": ["model", "user"]},
+            "pragmatic": {
+                "type": "string",
+                "description": "set when the choice is convenient rather than optimal, "
+                               "and that is the right call — say why it is right",
+            },
+            "id": {"type": "string", "description": "to amend an existing decision"},
+        },
+        "required": ["topic", "choice"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_open(session)
+        state = session.state
+        did = _str(args.get("id"))
+        choice = _str(args["choice"])
+        current = state.decision_by_id(did) if did else None
+        if did and current is None:
+            known = ", ".join(d.id for d in state.decisions) or "none"
+            raise ToolError(f"no decision {did!r} to amend (known: {known}).")
+
+        dec = Decision(
+            id=current.id if current else session.next_decision_id(),
+            topic=_str(args["topic"]),
+            options=_options(choice, args.get("against")),
+            choice=choice,
+            rationale=_str(args.get("why")),
+            source=_str(args.get("source")) or "model",
+            pragmatism_note=_str(args.get("pragmatic")),
+        )
+        _check(state.validate_decision, dec)
+        if current is not None:
+            state.decisions[state.decisions.index(current)] = dec
+        else:
+            state.decisions.append(dec)
+        session.touched("decision", dec.id)
+
+        msg = f"{dec.id}: {dec.topic} -> {dec.choice}."
+        if len(dec.options) < 2:
+            msg += (
+                " Nothing is recorded beside it, so nothing was weighed — add what you"
+                " would have picked instead, even if only to say why it loses."
+                if dec.source == "user"
+                else " No alternative recorded — a choice with no rival is a preference."
+            )
+        return _confirm(msg, session)
+
+
+# ------------------------------------------------------------- questions
+
+
+class QuestionTool(Tool):
+    name = "question"
+    description = (
+        "Park something only the user can settle — a cost tradeoff, a scale "
+        "expectation, a business constraint — so it is not lost while you carry on "
+        "elsewhere. Then actually ask it in your reply; this only records it.\n"
+        "`recommendation` is required in spirit: every question goes to the user with "
+        "the answer you would give, so they are reacting to a proposal instead of "
+        "filling in a blank.\n"
+        "NEVER park anything you could find out yourself. If the repo, the knowledge "
+        "graph or a search would answer it, that is your job, not theirs.\n"
+        "Pass `id` with an `answer` once they say."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string"},
+            "recommendation": {"type": "string", "description": "what you'd do, and why"},
+            "id": {"type": "string", "description": "to answer or defer one already parked"},
+            "answer": {"type": "string"},
+            "status": {"type": "string", "enum": ["open", "answered", "deferred"]},
+        },
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        session = _session(ctx)
+        _guard_open(session)
+        state = session.state
+        qid = _str(args.get("id"))
+        if qid:
+            q = state.question_by_id(qid)
+            if q is None:
+                known = ", ".join(x.id for x in state.questions) or "none"
+                raise ToolError(f"no question {qid!r} (known: {known}).")
+            if args.get("question") is not None:
+                q.question = _str(args["question"])
+            if args.get("recommendation") is not None:
+                q.recommendation = _str(args["recommendation"])
+            if args.get("answer") is not None:
+                q.answer = _str(args["answer"])
+                q.status = "answered"
+            if args.get("status") is not None:
+                q.status = _str(args["status"])
+            session.touched("question", q.id)
+            return _confirm(f"{q.id} {q.status}.", session)
+
+        text = _str(args.get("question"))
+        if not text:
+            raise ToolError("a question needs text (or an id, to answer one already parked).")
+        q = Question(
+            id=session.next_question_id(),
+            question=text,
+            recommendation=_str(args.get("recommendation")),
+        )
+        state.questions.append(q)
+        session.touched("question", q.id)
+        if not q.recommendation:
+            return _confirm(
+                f"Parked {q.id}. It has no recommendation — ask it in your reply WITH the "
+                "answer you'd give, or they are starting from a blank page.",
+                session,
+            )
+        return _confirm(f"Parked {q.id}. Ask it in your reply, with your recommendation.", session)
+
+
+# ----------------------------------------------------------------- brief
 
 
 class BriefTool(Tool):
     name = "brief"
     description = (
-        "Record or update the design brief (intake contract). Merge semantics: only "
-        "the fields you pass change. goal + actors + scope unlock `component`; "
-        "production/high_scale scope additionally requires scale, consistency, "
-        "availability. Ask the user for load-bearing facts instead of assuming."
+        "Record a load-bearing fact about what is being built, as it surfaces. Not a "
+        "form and not a prerequisite — call it when you learn something, with only the "
+        "field you learned.\n"
+        "`scale` is prose: 'a few hundred users, spiky at month end' is worth more than "
+        "five empty numbers. Absent a stated scale, design for the smallest thing that "
+        "could work and say out loud that that is what you are doing."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "goal": {"type": "string", "description": "What the system must achieve, one sentence"},
-            "actors": {"type": "array", "items": {"type": "string"},
-                       "description": "Who/what uses the system"},
-            "scope": {"type": "string", "enum": list(SCOPES)},
-            "users": {"type": "string", "description": "Scale: e.g. '10k MAU', 'internal team'"},
-            "reads_per_sec": {"type": "string"},
-            "writes_per_sec": {"type": "string"},
-            "data_volume": {"type": "string", "description": "e.g. '~50GB, +1GB/mo'"},
-            "growth": {"type": "string"},
-            "latency": {"type": "string", "description": "e.g. 'p95 < 200ms on read path'"},
-            "consistency": {"type": "string", "enum": ["strong", "eventual", "mixed"]},
-            "availability": {"type": "string", "description": "e.g. '99.9'"},
-            "deploy_target": {"type": "string", "description": "cloud / on-prem / serverless / single box"},
+            "goal": {
+                "type": "string",
+                "description": (
+                    "what is being built, as a title — one short line, not a summary. "
+                    "It is the page heading the user reads above the board, so the "
+                    "comparisons, the mechanism and the later phases belong on the "
+                    "board or in the chat, not in here."
+                ),
+            },
+            "actors": {"type": "array", "items": {"type": "string"}},
+            "scale": {"type": "string"},
             "constraints": {"type": "array", "items": {"type": "string"}},
             "non_goals": {"type": "array", "items": {"type": "string"}},
         },
@@ -612,1197 +593,195 @@ class BriefTool(Tool):
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        b = state.brief
-        before_scope = b.scope
-        for key in ("goal", "scope", "latency", "consistency", "availability", "deploy_target"):
-            if key in args:
-                setattr(b, key, args[key])
-        for key in ("actors", "constraints", "non_goals"):
-            if key in args:
-                setattr(b, key, list(args[key]))
-        for key in ("users", "reads_per_sec", "writes_per_sec", "data_volume", "growth"):
-            if key in args:
-                setattr(b.scale, key, args[key])
-        missing = b.missing()
-        note = ""
-        if _toplevel_locked(session) and b.scope != before_scope:
-            state.amendments.append(Amendment(
-                turn=len(state.amendments) + 1,
-                description=f"brief scope {before_scope or '?'} -> {b.scope}", structural=True,
-            ))
-            note = "scope changed after approval — recorded as an amendment; obligations recomputed."
-            state.compute_obligations()
-        session.touched()
-        if missing:
-            return _confirm(
-                f"Brief updated. Still unknown: {', '.join(missing)} — ask the user for "
-                "these rather than assuming them.", session, note=note,
-            )
-        return _confirm("Brief updated.", session, note=note)
+        _guard_open(session)
+        brief = session.state.brief
+        written: list[str] = []
+        for name in ("goal", "scale"):
+            if args.get(name) is not None:
+                setattr(brief, name, _str(args[name]))
+                written.append(name)
+        for name in ("actors", "constraints", "non_goals"):
+            if args.get(name) is not None:
+                setattr(brief, name, _strlist(args[name]))
+                written.append(name)
+        if not written:
+            raise ToolError("nothing to record — pass at least one field.")
+        session.touched("brief", written[0])
+        return _confirm("Brief: " + ", ".join(written) + " recorded.", session)
 
 
-class ComponentTool(Tool):
-    name = "component"
+# --------------------------------------------------------------- handoff
+
+
+class HandoffTool(Tool):
+    name = "handoff"
     description = (
-        "Add, update, or remove a top-level component. Upserts by id (ids are "
-        "immutable and kebab-case; rename via `name`). `remove: true` deletes it — "
-        "connections and flows referencing it must be removed first. Only `id` is "
-        "required: record what you know now, fill the rest in as it settles. After "
-        "top-level approval this still works and records an amendment."
+        "Close the session and write the handoff — the board, the decisions and why "
+        "they went that way, the approaches that lost and why, and everything still "
+        "open — for whoever builds it.\n"
+        "Call this when the USER says they are done. It is not how you end a turn (a "
+        "plain reply does that) and it is not a gate you ask them to pass: nothing here "
+        "checks whether the design is finished, because that judgement is theirs."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "kebab-case, unique, stable"},
-            "name": {"type": "string"},
-            "kind": {"type": "string", "enum": list(KINDS)},
-            "responsibility": {"type": "string", "description": "One sentence; required"},
-            "trace": {"type": "array", "items": {"type": "string"},
-                      "description": "Which brief goals/constraints this serves (YAGNI check)"},
-            "existing": {"type": "boolean", "description": "Brownfield import (feature mode)"},
-            "tech": {"type": "string"},
-            "data_owned": {"type": "string", "description": "Required when kind is store"},
-            "failure_notes": {"type": "string", "description": "Required at production scope"},
-            "remove": {"type": "boolean"},
-        },
-        "required": ["id"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        cid = args["id"].strip()
-        result = _apply_component(session, args, cid)
-        note = _post_approval_amendment(session, result, structural=(
-            bool(args.get("remove")) or "kind" in args
-        ))
-        comp = state.components.get(cid)
-        session.touched("component", cid)
-        return _confirm(
-            result, session, note=note,
-            gaps=state.component_gaps(comp) if comp is not None else None,
-        )
-
-
-def _apply_component(session: ArchSession, args: dict[str, Any], cid: str) -> str:
-    """Shared by ComponentTool and amend_toplevel."""
-    state = session.state
-    if args.get("remove"):
-        if cid not in state.components:
-            raise ToolError(f"component {cid!r} does not exist.")
-        refs = state.references_to(cid)
-        if refs:
-            raise ToolError(
-                f"cannot remove {cid!r}: still referenced by {', '.join(refs)}. "
-                "Remove or rewire those first."
-            )
-        del state.components[cid]
-        return f"Removed component {cid}."
-    current = state.components.get(cid)
-    if current is None:
-        comp = Component(
-            id=cid,
-            name=args.get("name", cid),
-            kind=args.get("kind") or "service",
-            responsibility=args.get("responsibility", ""),
-            trace=list(args.get("trace", [])),
-            existing=bool(args.get("existing", False)),
-            tech=args.get("tech"),
-            data_owned=args.get("data_owned"),
-            failure_notes=args.get("failure_notes"),
-        )
-        _check(state.validate_component, comp, False)
-        state.components[cid] = comp
-        # the design layer has something in it now, so the session is no longer
-        # only sketching. `promote` does the same thing for the other route in.
-        if state.phase == "brainstorm":
-            state.phase = "propose"
-        return f"Added component {cid} ({comp.kind})."
-    for key in ("name", "kind", "responsibility", "tech", "data_owned", "failure_notes"):
-        if key in args:
-            setattr(current, key, args[key])
-    if "trace" in args:
-        current.trace = list(args["trace"])
-    if "existing" in args:
-        current.existing = bool(args["existing"])
-    _check(state.validate_component, current, True)
-    return f"Updated component {cid}."
-
-
-class ConnectTool(Tool):
-    name = "connect"
-    description = (
-        "Add, update, or remove a connection between two components. Upserts by "
-        "(src, dst, label). async connections must name their mechanism (which "
-        "queue/bus carries it). Locked after top-level approval (use amend_toplevel)."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "src": {"type": "string"},
-            "dst": {"type": "string"},
-            "label": {"type": "string", "description": "e.g. 'consume', 'write', 'emit'"},
-            "kind": {"type": "string", "enum": list(CONNECTION_KINDS)},
-            "mechanism": {"type": "string", "description": "Required when async"},
-            "protocol": {"type": "string", "description": "http / grpc / sql / amqp ..."},
-            "data": {"type": "string", "description": "What crosses the edge"},
-            "failure_mode": {"type": "string",
-                             "description": "Required at production scope: behavior when dst is down"},
-            "remove": {"type": "boolean"},
-        },
-        "required": ["src", "dst"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        result = _apply_connection(session, args)
-        note = _post_approval_amendment(session, result, structural=bool(args.get("remove")))
-        src, dst = args["src"].strip(), args["dst"].strip()
-        conn = next((c for c in state.connections if c.src == src and c.dst == dst), None)
-        session.touched("connection", f"{src}->{dst}")
-        return _confirm(
-            result, session, note=note,
-            gaps=state.connection_gaps(conn) if conn is not None else None,
-        )
-
-
-def _apply_connection(session: ArchSession, args: dict[str, Any]) -> str:
-    state = session.state
-    src, dst = args["src"].strip(), args["dst"].strip()
-    label = args.get("label")
-    matches = [
-        c for c in state.connections
-        if c.src == src and c.dst == dst and (label is None or c.label == label)
-    ]
-    if args.get("remove"):
-        if not matches:
-            raise ToolError(f"no connection {src} -> {dst}" + (f" labeled {label!r}" if label else "") + ".")
-        if len(matches) > 1:
-            labels = ", ".join(repr(c.label) for c in matches)
-            raise ToolError(f"multiple connections {src} -> {dst} ({labels}); pass `label` to pick one.")
-        state.connections.remove(matches[0])
-        return f"Removed connection {src} -> {dst}."
-    if matches and label is not None:
-        conn = matches[0]
-        for key in ("kind", "mechanism", "protocol", "data", "failure_mode", "label"):
-            if key in args:
-                setattr(conn, key, args[key])
-        _check(state.validate_connection, conn)
-        return f"Updated connection {src} -> {dst} ({conn.label})."
-    conn = Connection(
-        src=src, dst=dst,
-        label=label or "",
-        kind=args.get("kind", "sync"),
-        mechanism=args.get("mechanism"),
-        protocol=args.get("protocol"),
-        data=args.get("data"),
-        failure_mode=args.get("failure_mode"),
-    )
-    if not conn.label:
-        raise ToolError("a new connection needs a label (what the edge means, e.g. 'consume').")
-    _check(state.validate_connection, conn)
-    state.connections.append(conn)
-    return f"Connected {src} -> {dst} ({conn.label}, {conn.kind})."
-
-
-class FlowTool(Tool):
-    name = "flow"
-    description = (
-        "Record or update a key flow (sequence of steps across components). Upserts "
-        "by id. At least one happy flow covering the primary goal is required before "
-        "top-level review; at production scope every happy flow wants a failure twin."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "description": "kebab-case, e.g. 'place-order'"},
-            "name": {"type": "string", "description": "e.g. 'place order'"},
-            "kind": {"type": "string", "enum": list(FLOW_KINDS)},
-            "steps": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "src": {"type": "string"},
-                        "dst": {"type": "string"},
-                        "action": {"type": "string", "description": "'POST /orders', 'publish OrderPlaced'"},
-                        "note": {"type": "string"},
-                    },
-                    "required": ["src", "dst", "action"],
-                    "additionalProperties": False,
-                },
-            },
-            "remove": {"type": "boolean"},
-        },
-        "required": ["id"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        fid = args["id"].strip()
-        existing = next((f for f in state.flows if f.id == fid), None)
-        if args.get("remove"):
-            if existing is None:
-                raise ToolError(f"flow {fid!r} does not exist.")
-            state.flows.remove(existing)
-            action = f"Removed flow {fid}."
-        else:
-            if not args.get("steps"):
-                raise ToolError("a flow needs steps: [{src, dst, action}, ...].")
-            flow = Flow(
-                id=fid,
-                name=args.get("name", existing.name if existing else fid),
-                kind=args.get("kind", existing.kind if existing else "happy"),
-                steps=[FlowStep(src=s["src"], dst=s["dst"], action=s["action"],
-                                note=s.get("note")) for s in args["steps"]],
-            )
-            _check(state.validate_flow, flow)
-            if existing is not None:
-                state.flows[state.flows.index(existing)] = flow
-                action = f"Updated flow {fid}."
-            else:
-                state.flows.append(flow)
-                action = f"Recorded flow {fid} ({flow.kind}, {len(flow.steps)} steps)."
-        note = _post_approval_amendment(session, action, structural=False)
-        session.touched("flow", fid)
-        return _confirm(action, session, note=note)
-
-
-def _as_str(owner: str, key: str, val: Any) -> str:
-    if not isinstance(val, str):
-        raise ToolError(
-            f"{owner} field {key!r} must be a plain string, not {type(val).__name__}. "
-            f'Describe it as text (e.g. "contactId"), not an object or array.'
-        )
-    return val
-
-
-def _as_str_opt(owner: str, key: str, val: Any) -> str | None:
-    return None if val is None else _as_str(owner, key, val)
-
-
-def _as_str_list(owner: str, key: str, val: Any) -> list[str]:
-    if not isinstance(val, list) or any(not isinstance(x, str) for x in val):
-        found = (
-            next((type(x).__name__ for x in val if not isinstance(x, str)), "ok")
-            if isinstance(val, list) else type(val).__name__
-        )
-        raise ToolError(
-            f"{owner} field {key!r} must be a list of plain strings "
-            f'(e.g. ["firstName", "email"]) — found a {found}. Flatten each item to '
-            f"one string; do not pass objects."
-        )
-    return list(val)
-
-
-_FACET_BUILDERS = {
-    "api": ("endpoints", lambda a: ApiFacet(
-        endpoints=[_build(Endpoint, e, ("route", "method", "request", "response", "auth"))
-                   for e in a.get("endpoints", [])])),
-    "store": ("entities + access_patterns", lambda a: StoreFacet(
-        entities=[_build(Entity, e, ("name", "keys")) for e in a.get("entities", [])],
-        access_patterns=_as_str_list("store facet", "access_patterns", a.get("access_patterns", [])),
-        retention=_as_str_opt("store facet", "retention", a.get("retention")),
-        migration_risk=_as_str_opt("store facet", "migration_risk", a.get("migration_risk")))),
-    "queue": ("messages", lambda a: QueueFacet(
-        messages=[_build(QueueMessage, m, ("name", "schema", "ordering", "delivery"))
-                  for m in a.get("messages", [])])),
-    "service": ("interface", lambda a: ServiceFacet(
-        interface=_as_str_list("service facet", "interface", a.get("interface", [])),
-        modules=[_build(Module, m, ("name", "purpose")) for m in a["modules"]]
-        if a.get("modules") else None)),
-    "llm": ("tasks", lambda a: LlmFacet(
-        tasks=[_build(LlmTask, t, ("name", "model_tier", "prompt_contract",
-                                   "context_strategy", "fallback", "guardrails"))
-               for t in a.get("tasks", [])])),
-    "infra": ("units + state_locality", lambda a: InfraFacet(
-        units=[_build(DeployUnit, u, ("name", "components", "scaling_policy"))
-               for u in a.get("units", [])],
-        state_locality=_as_str_opt("infra facet", "state_locality", a.get("state_locality")) or "")),
-}
-
-# dataclass annotations are strings here (from __future__ import annotations),
-# so we match on the annotation text to type-check tool input
-_STR_ANNS = {"str", "str|None"}
-_STRLIST_ANNS = {"list[str]"}
-
-
-def _build(cls: type, d: dict[str, Any], required: tuple[str, ...]) -> Any:
-    for req in required:
-        if req not in d or d[req] in ("", [], None):
-            raise ToolError(f"{cls.__name__} needs {req!r} (got: {sorted(d)}).")
-    dfields = cls.__dataclass_fields__  # type: ignore[attr-defined]
-    kw: dict[str, Any] = {}
-    for k, v in d.items():
-        if k not in dfields:
-            continue
-        ann = str(dfields[k].type).replace(" ", "")
-        if v is not None and ann in _STR_ANNS:
-            v = _as_str(cls.__name__, k, v)
-        elif ann in _STRLIST_ANNS:
-            v = _as_str_list(cls.__name__, k, v)
-        kw[k] = v
-    return cls(**kw)
-
-
-# Fully-specified item schemas. An underspecified {"type": "object"} was the main
-# cause of repeated expand failures — the model had to guess every field name and
-# only learned the shape from error messages. Each item now states its fields,
-# which are required, and a concrete example.
-_STR_ARR = {"type": "array", "items": {"type": "string"}}
-
-_ENDPOINT_ITEM = {
-    "type": "object",
-    "properties": {
-        "route": {"type": "string", "description": "path, e.g. /contacts/search"},
-        "method": {"type": "string", "description": "HTTP verb: GET/POST/PUT/DELETE"},
-        "request": {"type": "string", "description": "request shape, one line, e.g. '{q, page, agentId?}'"},
-        "response": {"type": "string", "description": "response shape, one line, e.g. '{results[], nextCursor}'"},
-        "auth": {"type": "string", "description": "authorization rule, e.g. 'org admin/owner'"},
-        "errors": {**_STR_ARR, "description": "error cases, e.g. ['403 not admin', '400 bad query']"},
-        "idempotency": {"type": "string"},
-        "pagination": {"type": "string", "description": "e.g. 'cursor (searchAfter)'"},
-    },
-    "required": ["route", "method", "request", "response", "auth"],
-}
-_ENTITY_ITEM = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string", "description": "entity/collection name, e.g. 'CrmContact'"},
-        "keys": {"type": "string", "description": "primary/partition key(s) as text, e.g. 'organisationId + _id'"},
-        "fields": {**_STR_ARR, "description": "field NAMES as plain strings, e.g. ['firstName', 'primaryEmail'] — not objects"},
-        "indexes": {**_STR_ARR, "description": "indexes as text, e.g. ['atlas-search: name,email', 'org+chatbot']"},
-    },
-    "required": ["name", "keys"],
-}
-_MESSAGE_ITEM = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "schema": {"type": "string", "description": "payload shape, one line"},
-        "ordering": {"type": "string", "description": "e.g. 'per-key FIFO' or 'none'"},
-        "delivery": {"type": "string", "description": "e.g. 'at-least-once'"},
-        "dlq_policy": {"type": "string"},
-    },
-    "required": ["name", "schema", "ordering", "delivery"],
-}
-_MODULE_ITEM = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "purpose": {"type": "string", "description": "what this module does, one line"},
-    },
-    "required": ["name", "purpose"],
-}
-_TASK_ITEM = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "model_tier": {"type": "string", "description": "e.g. 'frontier', 'local-8b'"},
-        "prompt_contract": {"type": "string", "description": "inputs -> outputs, one line"},
-        "context_strategy": {"type": "string"},
-        "fallback": {"type": "string", "description": "what happens on failure/timeout"},
-        "guardrails": {"type": "string"},
-        "eval_hook": {"type": "string"},
-        "cost_envelope": {"type": "string"},
-    },
-    "required": ["name", "model_tier", "prompt_contract", "context_strategy", "fallback", "guardrails"],
-}
-_UNIT_ITEM = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string", "description": "deploy unit, e.g. 'search-api pod'"},
-        "components": {**_STR_ARR, "description": "component ids this unit runs"},
-        "scaling_policy": {"type": "string", "description": "e.g. 'HPA on CPU 70%, 2-10 replicas'"},
-        "region": {"type": "string"},
-    },
-    "required": ["name", "components", "scaling_policy"],
-}
-
-
-class ExpandTool(Tool):
-    name = "expand"
-    description = (
-        "Fill one component's facet (its internal contract). Available at any point — "
-        "expand something early if that is what the conversation is about; the tracker "
-        "still suggests a risk order. Pass the field group matching the component's kind: endpoints "
-        "(api/gateway) · entities/access_patterns/retention (store/cache) · messages "
-        "(queue) · interface/modules (service/job/ui) · tasks (llm) · units/"
-        "state_locality (infra)."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "component_id": {"type": "string", "description": "the component to expand (take the next one from the tracker's risk order)"},
-            "endpoints": {"type": "array", "items": _ENDPOINT_ITEM,
-                          "description": "api/gateway: the HTTP contract (one item per endpoint)"},
-            "entities": {"type": "array", "items": _ENTITY_ITEM,
-                         "description": "store/cache: the data entities (one item per entity/collection)"},
-            "access_patterns": {**_STR_ARR,
-                                "description": "store/cache: how the data is queried, e.g. ['search by name prefix within org']"},
-            "retention": {"type": "string", "description": "store/cache: how long the data lives"},
-            "migration_risk": {"type": "string", "description": "store/cache: risk of changing this schema later"},
-            "messages": {"type": "array", "items": _MESSAGE_ITEM,
-                         "description": "queue: the messages carried (one item per message type)"},
-            "interface": {**_STR_ARR,
-                          "description": "service/job/ui: exposed operations, e.g. ['search(q, scope) -> results']"},
-            "modules": {"type": "array", "items": _MODULE_ITEM,
-                        "description": "service/job/ui: internal modules (optional)"},
-            "tasks": {"type": "array", "items": _TASK_ITEM,
-                      "description": "llm: the model tasks (one item per task)"},
-            "units": {"type": "array", "items": _UNIT_ITEM,
-                      "description": "infra: deploy units (one item per unit)"},
-            "state_locality": {"type": "string", "description": "infra: where state lives (stateless / which store)"},
-        },
-        "required": ["component_id"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        cid = args["component_id"].strip()
-        comp = state.components.get(cid)
-        if comp is None:
-            raise ToolError(f"component {cid!r} does not exist.")
-        facet_kind = FACET_FOR_KIND.get(comp.kind)
-        if facet_kind is None:
-            raise ToolError(f"{cid} is kind {comp.kind!r} — not ours to design; no facet applies.")
-        hint, builder = _FACET_BUILDERS[facet_kind]
-        facet = builder(args)
-        primary = getattr(facet, ("endpoints", "entities", "messages", "interface",
-                                  "tasks", "units")[
-            ("api", "store", "queue", "service", "llm", "infra").index(facet_kind)])
-        if not primary:
-            raise ToolError(f"a {facet_kind} facet needs {hint}.")
-        comp.facet = facet
-        queue = render.risk_ordered_pending(state)
-        owed = next((o for o in queue if o.component_id == cid), None)
-        if owed is not None:
-            owed.status = "done"
-        note = ""
-        if queue and owed is not queue[0]:
-            head = queue[0]
-            note = (
-                f"note: {head.component_id} is the riskier one still open ({head.reason}) "
-                "— worth doing next unless you have a reason to leave it."
-            )
-        # depth on something you asked about and never got an answer to: the
-        # facet is built on a guess, and this is the moment that is cheapest to
-        # notice. Advisory — it never refuses; see the module docstring.
-        pending = state.questions_targeting(cid)
-        if pending:
-            asked = "; ".join(f"{q.id}: {q.question}" for q in pending[:3])
-            note = (note + "\n" if note else "") + (
-                f"[!] you asked about {cid} and have no answer yet ({asked}). This facet is "
-                "built on whatever you assumed instead — get the answer, or say in the "
-                "design what you assumed and what changes if it is wrong."
-            )
-        session.touched("component", cid)
-        return _confirm(f"Expanded {cid} ({facet_kind} facet).", session, note=note)
-
-
-class DecideTool(Tool):
-    name = "decide"
-    description = (
-        "Record an architectural decision: the options you weighed with pros/cons, the "
-        "choice (must match one of the option names), and the rationale. Upserts by id. "
-        "Recording a one-option decision is allowed and noted — but if there was never "
-        "an alternative, that is usually worth saying out loud rather than dressing up "
-        "as a decision.\n"
-        "**Set `source: \"user\"` when the user named the technology or approach.** That "
-        "is not bookkeeping: it is what tells the harness a verdict is owed. A "
-        "user-sourced choice recorded with one option is reported back to you every turn "
-        "until you weigh something against it — either endorse it with the reason it is "
-        "right at their scale, or raise a `concern` targeting 'user' with what it costs "
-        "and the cheaper option."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "description": "Optional; auto-assigned d1, d2, ..."},
-            "topic": {"type": "string", "description": "e.g. 'Message queue'"},
-            "category": {"type": "string", "enum": list(DECISION_CATEGORIES)},
-            "options": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "pros": {"type": "array", "items": {"type": "string"}},
-                        "cons": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["name"],
-                    "additionalProperties": False,
-                },
-            },
-            "choice": {"type": "string"},
-            "rationale": {"type": "string"},
-            "status": {"type": "string", "enum": ["decided", "deferred"],
-                       "description": "deferred still records the default taken"},
-            "source": {"type": "string", "enum": list(DECISION_SOURCES),
-                       "description": "who put this choice on the table; 'user' when they "
-                                      "named it — that is what triggers the owed verdict"},
-        },
-        "required": ["topic", "category", "choice", "rationale"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        did = args.get("id") or f"d{len(state.decisions) + 1}"
-        dec = Decision(
-            id=did,
-            topic=args["topic"],
-            category=args["category"],
-            options=[Option(name=o["name"], pros=list(o.get("pros", [])),
-                            cons=list(o.get("cons", []))) for o in args.get("options", [])],
-            choice=args["choice"],
-            rationale=args["rationale"],
-            status=args.get("status", "decided"),
-            source=args.get("source", "model"),
-        )
-        _check(state.validate_decision, dec)
-        existing = next((d for d in state.decisions if d.id == did), None)
-        if existing is not None:
-            state.decisions[state.decisions.index(existing)] = dec
-            action = f"Updated decision {did}: {dec.topic} -> {dec.choice}."
-        else:
-            state.decisions.append(dec)
-            action = f"Recorded decision {did}: {dec.topic} -> {dec.choice}."
-        session.touched("decision", did)
-        note = ""
-        if dec.source == "user" and len(dec.options) < 2:
-            note = (
-                f"[!] {did} is the user's own choice and nothing was weighed against it. "
-                "Name what you would have picked instead and why you are not picking it — "
-                "then either endorse this with that reason, or raise a `concern` targeting "
-                "'user'. Absorbing a choice silently is the one move this harness does not "
-                "make."
-            )
-        return _confirm(action, session, gaps=state.decision_gaps(dec), note=note)
-
-
-# ============================ asking the user ============================
-# `ask` records a question. `offer` *puts it in front of them* with the answers
-# already written, because the load-bearing facts — how many users, how much
-# consistency — are exactly the ones a user will not volunteer and will not stop
-# to compose a paragraph about. A tap is a much lower bar than a sentence, and
-# the whole over-provisioning failure mode is a question nobody asked.
-
-MAX_OFFER_OPTIONS = 4
-
-# brief fields an offer can write straight into, so answering actually moves the
-# design's standard rather than leaving prose in a question log
-BRIEF_TARGETS: dict[str, tuple[str, ...]] = {
-    "brief.scope": ("scope",),
-    "brief.latency": ("latency",),
-    "brief.consistency": ("consistency",),
-    "brief.availability": ("availability",),
-    "brief.deploy_target": ("deploy_target",),
-    "brief.scale.users": ("scale", "users"),
-    "brief.scale.reads_per_sec": ("scale", "reads_per_sec"),
-    "brief.scale.writes_per_sec": ("scale", "writes_per_sec"),
-    "brief.scale.data_volume": ("scale", "data_volume"),
-    "brief.scale.growth": ("scale", "growth"),
-}
-
-
-def _apply_brief_answer(session: ArchSession, target: str, answer: str) -> str:
-    """Write an offer's answer into the brief. Returns the field written, or ""
-    if the target is not a brief field (or the answer is not a legal scope)."""
-    path = BRIEF_TARGETS.get(target)
-    if path is None:
-        return ""
-    brief = session.state.brief
-    if path == ("scope",):
-        if answer not in SCOPES:
-            return ""  # free text that is not one of the four scopes
-        brief.scope = answer
-        return target
-    obj: Any = brief
-    for part in path[:-1]:
-        obj = getattr(obj, part)
-    setattr(obj, path[-1], answer)
-    return target
-
-
-class OfferTool(Tool):
-    name = "offer"
-    description = (
-        "Ask the user something they can answer in one tap: 2-4 concrete options "
-        "instead of a paragraph they have to compose. Blocks until they pick or "
-        "dismiss.\n"
-        "Use it for the facts that decide cost — expected load, consistency, "
-        "availability, deploy target — and for choosing between shapes you have "
-        "drawn. `target` writes the answer straight into the brief when it names a "
-        "brief field (e.g. 'brief.scale.users'), so answering moves the standard the "
-        "design is judged against.\n"
-        "Dismissing is allowed and records the question as deferred: the user is not "
-        "obliged to know. Say what you will assume instead."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string", "description": "e.g. 'Roughly how many users?'"},
-            "options": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "2-4 concrete answers, e.g. ['~1k users', '~100k', '~1M+']",
-            },
-            "target": {
-                "type": "string",
-                "description": "Optional. A brief field ('brief.scope', "
-                               "'brief.scale.users', 'brief.consistency', ...) to write the "
-                               "answer into, or a component/decision id the question hangs on.",
-            },
-        },
-        "required": ["question", "options"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        _guard_not_finalized(session)
-        question = (args.get("question") or "").strip()
-        options = [str(o).strip() for o in args.get("options") or [] if str(o).strip()]
-        target = (args.get("target") or "").strip() or None
-        if not question:
-            raise ToolError("an offer needs a question.")
-        if len(options) < 2:
-            raise ToolError(
-                "an offer needs at least 2 options — with one option you are not asking, "
-                "you are telling. Use `ask` for an open question."
-            )
-        if len(options) > MAX_OFFER_OPTIONS:
-            raise ToolError(
-                f"at most {MAX_OFFER_OPTIONS} options — past that it is a form, not a choice."
-            )
-
-        qid = session.next_qid()
-        q = OpenQuestion(id=qid, question=question, blocking=False, source="model", target=target)
-        session.state.questions.append(q)
-        session.touched("question", qid)
-
-        approved, answer = session.request_gate({
-            "kind": "offer",
-            "question": question,
-            "options": options,
-            "target": target or "",
-        })
-        answer = (answer or "").strip()
-
-        # Dismissed, or nobody there to answer (headless / auto-approving broker
-        # returns approved with no text). Both mean the same thing to the design:
-        # the fact is still unknown, and the model has to say what it assumes.
-        if not approved or not answer:
-            q.resolution = "deferred"
-            session.touched("question", qid)
-            why = "The user dismissed the question" if approved is False else \
-                  "No one answered (no UI attached)"
-            return _confirm(
-                f"{why} — {qid} recorded as deferred. Say what you are assuming instead of "
-                "this fact, and why that assumption is the safe way to be wrong.",
-                session,
-            )
-
-        q.answer = answer
-        q.resolution = "answered"
-        written = _apply_brief_answer(session, target, answer) if target else ""
-        session.touched("question", qid)
-        if written:
-            return _confirm(
-                f"The user chose: {answer}. Written to {written}. "
-                "Design to that number — and if the design already assumed a bigger one, "
-                "say what you are removing now that you know.",
-                session,
-            )
-        return _confirm(f"The user chose: {answer}. Recorded against {qid}.", session)
-
-
-class AskTool(Tool):
-    name = "ask"
-    description = (
-        "Flag an open question for the user. blocking=true prevents finalize until "
-        "it is resolved. Then actually ask it in your reply text — this tool only "
-        "records it.\n"
-        "`target` hangs the question on what it is about (a component or decision id, "
-        "or a brief field). A targeted question is shown on that node and warns you if "
-        "you go deep on it before it is answered.\n"
-        "If the answer is one of a few known possibilities, use `offer` instead — the "
-        "user answers with a tap rather than a paragraph."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string"},
-            "blocking": {"type": "boolean", "description": "Blocks finalize until resolved"},
-            "target": {"type": "string", "description": "Optional component/decision id "
-                       "or brief field this question is about"},
-        },
-        "required": ["question", "blocking"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        _guard_not_finalized(session)
-        qid = f"q{len(session.state.questions) + 1}"
-        session.state.questions.append(
-            OpenQuestion(id=qid, question=args["question"], blocking=bool(args["blocking"]),
-                         source="model", target=(args.get("target") or "").strip() or None)
-        )
-        session.touched("question", qid)
-        return _confirm(f"Recorded open question {qid}. Ask the user in your reply.", session)
-
-
-class AnswerTool(Tool):
-    name = "answer"
-    description = (
-        "Resolve an open question with the answer (usually the user's), or mark it "
-        "deferred/dropped with the reason."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string"},
-            "answer": {"type": "string"},
-            "resolution": {"type": "string", "enum": ["answered", "deferred", "dropped"]},
-        },
-        "required": ["id", "answer"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        _guard_not_finalized(session)
-        qid = args["id"].strip()
-        q = next((q for q in session.state.questions if q.id == qid), None)
-        if q is None:
-            known = ", ".join(x.id for x in session.state.questions) or "none"
-            raise ToolError(f"no question {qid!r} (known: {known}).")
-        q.answer = args["answer"]
-        q.resolution = args.get("resolution", "answered")
-        session.touched("question", qid)
-        return _confirm(f"Question {qid} {q.resolution}.", session)
-
-
-class ConcernTool(Tool):
-    name = "concern"
-    description = (
-        "Put an objection on the record — the design is wrong, a decision will hurt, "
-        "or something is more than it needs to be. Use it against the design, against "
-        "a decision, against your OWN earlier proposal, or against what the user just "
-        "asked for. Say what breaks concretely and name the cheaper option.\n"
-        "severity: blocker (it will not work) · risk (it works but will hurt) · smell "
-        "(more than it needs to be). Open blockers are shown to the user at the "
-        "finalize gate — they never stop you working.\n"
-        "Resolve one with resolve:<id> and a status: `accepted` (the design changed), "
-        "`overruled` (the user or you decided to live with it — the reason is the "
-        "record), or `withdrawn` (you were wrong). Overruled concerns are kept: the "
-        "code harness inherits them.\n"
-        "State it in your reply too — this tool only records it."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "severity": {"type": "string", "enum": list(CONCERN_SEVERITIES)},
-            "target": {"type": "string",
-                       "description": "component/decision id, 'brief', 'user', or what it is about"},
-            "claim": {"type": "string", "description": "what breaks, concretely"},
-            "alternative": {"type": "string", "description": "the cheaper or safer option"},
-            "resolve": {"type": "string", "description": "id of an existing concern to close"},
-            "status": {"type": "string", "enum": ["accepted", "overruled", "withdrawn"]},
-            "resolution": {"type": "string", "description": "why — kept in the handoff"},
-        },
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        rid = (args.get("resolve") or "").strip()
-        if rid:
-            c = next((x for x in state.concerns if x.id == rid), None)
-            if c is None:
-                known = ", ".join(x.id for x in state.concerns) or "none"
-                raise ToolError(f"no concern {rid!r} (known: {known}).")
-            c.status = args.get("status", "accepted")
-            c.resolution = args.get("resolution", "")
-            session.touched("concern", rid)
-            tail = f" — {c.resolution}" if c.resolution else ""
-            return _confirm(f"Concern {rid} {c.status}{tail}.", session)
-        claim = (args.get("claim") or "").strip()
-        if not claim:
-            raise ToolError("a concern needs a `claim`: what breaks, concretely.")
-        severity = args.get("severity", "risk")
-        if severity not in CONCERN_SEVERITIES:
-            raise ToolError(f"severity must be one of {', '.join(CONCERN_SEVERITIES)}.")
-        filed = session.file_concerns([{
-            "severity": severity,
-            "target": args.get("target", "design"),
-            "claim": claim,
-            "alternative": args.get("alternative", ""),
-        }], source="model")
-        if not filed:
-            return _confirm("Already on the record — not filed twice.", session)
-        c = filed[0]
-        session.touched("concern", c.id)
-        return _confirm(
-            f"Recorded {c.id} [{c.severity}] against {c.target}. Say it in your reply — "
-            "and if the user disagrees, resolve it as overruled with their reason.",
-            session,
-        )
-
-
-class AmendTool(Tool):
-    name = "amend_toplevel"
-    description = (
-        "Apply a component or connection change (same fields as those tools, incl. "
-        "remove) together with a written reason. `component`/`connect` also work after "
-        "approval and record an amendment automatically — reach for this one when the "
-        "*why* matters and should be in the audit trail in your words."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "description": {"type": "string", "description": "What is changing and why"},
-            "component": {"type": "object", "description": "component-tool payload"},
-            "connection": {"type": "object", "description": "connect-tool payload"},
-        },
-        "required": ["description"],
-        "additionalProperties": False,
-    }
-
-    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        _guard_not_finalized(session)
-        comp_args = args.get("component")
-        conn_args = args.get("connection")
-        if bool(comp_args) == bool(conn_args):
-            raise ToolError("pass exactly one of `component` or `connection`.")
-        if comp_args:
-            cid = str(comp_args.get("id", "")).strip()
-            if not cid:
-                raise ToolError("component payload needs an id.")
-            structural = bool(comp_args.get("remove")) or cid not in state.components or (
-                "kind" in comp_args and comp_args["kind"] != state.components[cid].kind
-            )
-            action = _apply_component(session, comp_args, cid)
-            changed = ("component", cid)
-        else:
-            structural = bool(conn_args.get("remove")) or not any(
-                c.src == conn_args.get("src") and c.dst == conn_args.get("dst")
-                for c in state.connections
-            )
-            action = _apply_connection(session, conn_args)
-            changed = ("connection", f"{conn_args.get('src')}->{conn_args.get('dst')}")
-        state.amendments.append(
-            Amendment(turn=len(state.amendments) + 1,
-                      description=args["description"], structural=structural)
-        )
-        if structural:
-            state.compute_obligations()
-        session.touched(*changed)
-        note = " (structural — approval re-flagged; obligations recomputed)" if structural else ""
-        return _confirm(f"Amendment recorded: {action}{note}", session)
-
-
-def _concern_payload(concerns: list[Any]) -> list[dict[str, str]]:
-    return [
-        {"id": c.id, "severity": c.severity, "target": c.target,
-         "claim": c.claim, "alternative": c.alternative, "source": c.source}
-        for c in concerns
-    ]
-
-
-class ArchDoneTool(Tool):
-    name = "done"
-    description = (
-        "Take the design to the user. Before their sign-off this requests top-level "
-        "approval; after it, Finalize (writes the handoff bundle and ends the "
-        "session).\n"
-        "It never refuses because the design is unfinished. Whatever is still thin, "
-        "still unanswered, or still objected to travels to the user with the request, "
-        "and they decide. Don't call it to end a turn — a plain reply does that; call "
-        "it when you genuinely want the user's ruling."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string", "description": "Short summary of where the design stands"},
+            "summary": {"type": "string", "description": "where the design landed, in a line or two"},
         },
         "required": ["summary"],
         "additionalProperties": False,
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        session = _session(ctx)
-        state = session.state
-        summary = args["summary"]
-        if state.phase == "finalized":
-            raise ToolError("the session is already finalized.")
-        if not state.components:
-            return _confirm(
-                "Nothing is committed to the design yet, so there is nothing to approve. "
-                "`promote` the sketch you and the user have landed on first — or just keep "
-                "talking; a plain reply ends your turn.",
-                session,
-            )
-        if _toplevel_locked(session):
-            return self._finalize_gate(session, summary, ctx.kg)
-        return self._toplevel_gate(session, summary)
-
-    def _toplevel_gate(self, session: ArchSession, summary: str) -> ToolResult:
-        state = session.state
-        state.phase = "toplevel_review"
-        session.touched()
-        approved, feedback = session.request_gate({
-            "kind": "toplevel_approval",
-            "summary": summary,
-            "thin": state.toplevel_missing(),
-            "gaps": state.gaps(),
-            "concerns": _concern_payload(state.open_concerns()),
-            "questions": [q.question for q in state.blocking_questions()],
-        })
-        if not approved:
-            state.phase = "propose"
-            session.touched()
-            return _confirm(
-                f"The user wants changes before approving: {feedback or '(no details given)'}",
-                session,
-            )
-        state.phase = "expand"
-        state.compute_obligations()
-        session.touched()
-        queue = render.risk_ordered_pending(state)
-        if queue:
-            items = "; ".join(f"{o.component_id} ({o.reason})" for o in queue)
-            return _confirm(
-                f"Top level approved. Worth depth, riskiest first: {items}.", session,
-            )
-        return _confirm("Top level approved.", session)
-
-    def _finalize_gate(self, session: ArchSession, summary: str, kg: Any = None) -> ToolResult:
-        from .bundle import bundle_paths, write_bundle
+        from .bundle import write_bundle
         from .kg_seed import seed_kg
 
+        session = _session(ctx)
+        _guard_open(session)
         state = session.state
-        session.run_audit()  # deterministic pass; the model critic runs on its own
-        blockers = state.open_blockers()
-        state.phase = "resolved"
-        session.touched()
-        artifacts = [str(p) for p in bundle_paths(session.run_dir)] if session.run_dir else []
-        approved, feedback = session.request_gate({
-            "kind": "finalize",
-            "summary": summary,
-            "artifacts": artifacts,
-            # everything the user should weigh before signing it off
-            "blockers": _concern_payload(blockers),
-            "concerns": _concern_payload([c for c in state.open_concerns() if c not in blockers]),
-            "gaps": state.gaps(),
-            "questions": [q.question for q in state.blocking_questions()],
-            "obligations": [f"{o.component_id} ({o.facet})" for o in render.risk_ordered_pending(state)],
-        })
-        if not approved:
-            state.phase = "expand"
-            session.touched()
-            return _confirm(
-                f"The user wants changes instead of finalizing: {feedback or '(no details given)'}",
-                session,
+        if not state.nodes:
+            raise ToolError(
+                "there is nothing on the board to hand off. Draw the shape you have "
+                "been talking about first."
             )
-        # approving with objections open is a decision, and it is recorded as one.
-        # Re-check `open`: the gate is a snapshot, and the user can settle an
-        # objection from the rail while it is up — that ruling is the real one.
-        overruled = [c for c in blockers if c.open]
-        for c in overruled:
-            c.status = "overruled"
-            c.resolution = feedback.strip() or "overruled by the user at the finalize gate"
+        state.handed_off = True
         written = write_bundle(state, session.run_dir) if session.run_dir else []
-        # the other half of the handoff: the markdown is what the builder reads,
-        # the graph is what it can ask questions of eleven turns later
-        seeded = seed_kg(kg, state, str(written[1]) if len(written) > 1 else "architecture.md")
-        state.phase = "finalized"
-        session.touched()
+        seeded = seed_kg(ctx.kg, state, str(written[1]) if len(written) > 1 else "architecture.md")
+        session.touched("handoff", "session")
+
+        still_open = state.open_questions()
         paths = ", ".join(str(p) for p in written) or "(no run dir — nothing written)"
-        tail = f" {len(overruled)} open blocker(s) overruled and recorded." if overruled else ""
+        tail = f" {len(still_open)} question(s) travel with it, unanswered." if still_open else ""
         if seeded:
             tail += f" {seeded}."
         return ToolResult(
-            output=f"Architecture finalized. Handoff bundle: {paths}.{tail} Next step: bird code.",
-            details={"done": True, "artifacts": [str(p) for p in written]},
+            output=f"Handed off: {paths}.{tail} Next step: bird code.",
+            details={"done": True, "artifacts": [str(p) for p in written],
+                     "summary": _str(args["summary"])},
         )
 
 
-class ImportStateTool(Tool):
-    name = "import_state"
+# --------------------------------------------------------- reading the repo
+
+
+class ImportRepoTool(Tool):
+    name = "import_repo"
     description = (
-        "Read the existing code knowledge graph and populate the design with the "
-        "as-is architecture (components, connections, facets) for a feature or "
-        "subsystem, so the render layer can display it and you can propose "
-        "modifications against the loaded state. One-shot at session start: it "
-        "refuses if the design already has components. Returns a transparency "
-        "report of what was inferred and what is uncertain — review the low-"
-        "confidence inferences and correct them with `component`/`connect`."
+        "Load the as-is architecture of an existing feature or subsystem onto the "
+        "board from the code knowledge graph, so you are designing against what is "
+        "actually there instead of against a guess.\n"
+        "Imported boxes are marked as background: they are what exists, not what you "
+        "are proposing. One-shot at the start of a session — it refuses once the board "
+        "has something on it. Review what it inferred and correct it with `canvas`."
     )
     parameters = {
         "type": "object",
         "properties": {
             "scope": {
                 "type": "string",
-                "description": "A feature name, file path, or symbol to scope the "
-                               "import to (not always the whole codebase).",
+                "description": "a feature name, file path, or symbol to scope the import to",
             },
-            "max_nodes": {
-                "type": "integer",
-                "description": f"Cap on subgraph size (default {DEFAULT_MAX_NODES}). "
-                               "A truncation is reported, not an error.",
-            },
-            "max_depth": {
-                "type": "integer",
-                "description": f"BFS depth cap (default {DEFAULT_MAX_DEPTH}).",
-            },
+            "max_nodes": {"type": "integer"},
+            "max_depth": {"type": "integer"},
         },
         "required": ["scope"],
         "additionalProperties": False,
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        from .reverse_seed import (
+            DEFAULT_MAX_DEPTH,
+            DEFAULT_MAX_NODES,
+            reverse_seed,
+            scope_subgraph,
+        )
+
         session = _session(ctx)
-        _guard_not_finalized(session)
+        _guard_open(session)
         state = session.state
-        scope = (args.get("scope") or "").strip()
+        scope = _str(args.get("scope"))
         if not scope:
             raise ToolError("scope is required — a feature name, file path, or symbol.")
-
-        # one-shot: refuse to clobber a design the model already started
-        if state.components:
+        if state.nodes:
             raise ToolError(
-                f"state already has {len(state.components)} component(s); import_state "
-                "is a one-shot at session start. Start a new session to re-scope."
+                f"the board already has {len(state.nodes)} box(es); import_repo is a "
+                "one-shot at session start. Start a new session to re-scope."
             )
-
         kg = ctx.kg
         if kg is None or not kg.is_ready():
             raise ToolError(
                 "the knowledge graph is not ready; run `bird kg build` first, or "
-                "describe the architecture from scratch."
+                "design from what the user tells you."
             )
-
-        max_nodes = int(args.get("max_nodes", DEFAULT_MAX_NODES))
-        max_depth = int(args.get("max_depth", DEFAULT_MAX_DEPTH))
-        subgraph = scope_subgraph(kg, scope, max_nodes=max_nodes, max_depth=max_depth)
+        subgraph = scope_subgraph(
+            kg, scope,
+            max_nodes=int(args.get("max_nodes", DEFAULT_MAX_NODES)),
+            max_depth=int(args.get("max_depth", DEFAULT_MAX_DEPTH)),
+        )
         if not subgraph.nodes:
             raise ToolError(
-                "scope query matched no KG nodes; try a file path, symbol name, "
-                "or broader term."
+                "that scope matched no nodes in the graph; try a file path, a symbol "
+                "name, or a broader term."
             )
-
         result = reverse_seed(subgraph, scope)
-        if not result.components:
+        if not result.nodes:
             raise ToolError(
-                "scope query matched no KG nodes; try a file path, symbol name, "
-                "or broader term."
+                "that scope matched no nodes in the graph; try a file path, a symbol "
+                "name, or a broader term."
             )
+        for node in result.nodes:
+            _check(state.validate_node, node)
+            state.nodes[node.id] = node
+        for edge in result.edges:
+            _check(state.validate_edge, edge)
+            state.edges.append(edge)
+        session.touched("import_repo", scope)
 
-        # import_state is the sole writer to arch-state for this step (the
-        # reverse-seed→arch-state connection was collapsed: reverse_seed is pure).
-        for comp in result.components:
-            _check(state.validate_component, comp, False)
-            state.components[comp.id] = comp
-        for conn in result.connections:
-            _check(state.validate_connection, conn)
-            state.connections.append(conn)
-        # a loaded design is no longer a blank sketch — move to propose so the
-        # model can refine and the user can approve the top level.
-        if state.phase == "brainstorm":
-            state.phase = "propose"
-        session.touched("import_state", scope)
-
-        return _import_report(session, result, scope)
-
-
-def _import_report(session: ArchSession, result: SeedResult, scope: str) -> ToolResult:
-    """The transparency report: what loaded, what was inferred, what's thin."""
-    state = session.state
-    inferences = [
-        {
-            "component_id": i.component_id,
-            "field": i.field,
-            "value": i.value,
-            "confidence": i.confidence,
-            "evidence": i.evidence,
-        }
-        for i in result.inference_log
-    ]
-    gaps = state.gaps()
-    low = [i for i in result.inference_log if i.confidence == "low"]
-    parts = [
-        f"Imported {len(result.components)} component(s) and {len(result.connections)} "
-        f"connection(s) from the knowledge graph (scope: {scope!r}).",
-        f"components: {', '.join(c.id for c in result.components)}",
-    ]
-    if low:
-        parts.append(
-            f"{len(low)} low-confidence inference(s) — review and correct with "
-            "`component`/`connect`:"
+        low = [i for i in result.inference_log if i.confidence == "low"]
+        parts = [
+            f"Loaded {len(result.nodes)} box(es) and {len(result.edges)} edge(s) from the "
+            f"graph (scope: {scope!r}), marked as existing background.",
+            "boxes: " + ", ".join(n.id for n in result.nodes),
+        ]
+        if low:
+            parts.append(f"{len(low)} low-confidence guess(es) — correct them with `canvas`:")
+            parts += [f"  - {i.node_id}.{i.field} = {i.value} ({i.evidence})" for i in low[:12]]
+            if len(low) > 12:
+                parts.append(f"  ... and {len(low) - 12} more (see details).")
+        return ToolResult(
+            output="\n".join(parts),
+            details={
+                "loaded": len(result.nodes),
+                "nodes": [n.id for n in result.nodes],
+                "edges": len(result.edges),
+                "inferences": [
+                    {"node_id": i.node_id, "field": i.field, "value": i.value,
+                     "confidence": i.confidence, "evidence": i.evidence}
+                    for i in result.inference_log
+                ],
+            },
         )
-        for i in low[:12]:
-            parts.append(f"  - {i.component_id}.{i.field} = {i.value} ({i.evidence})")
-        if len(low) > 12:
-            parts.append(f"  ... and {len(low) - 12} more (see details).")
-    if gaps:
-        parts.append(
-            "thin: " + "; ".join(gaps[:12])
-            + (f" ... and {len(gaps) - 12} more" if len(gaps) > 12 else "")
-        )
-    parts.append(
-        "The loaded state is editable: set responsibilities, fix kinds, tighten "
-        "connections, then `done` for top-level approval."
-    )
-    parts.append(f"next: {render._next_hint(state)}")
-    return ToolResult(
-        output="\n".join(parts),
-        details={
-            "loaded": len(result.components),
-            "components": [c.id for c in result.components],
-            "connections": len(result.connections),
-            "inferences": inferences,
-            "gaps": gaps,
-            "concerns": [],
-        },
-    )
+
+
+# ------------------------------------------------------------- the toolset
+
+# what counts as progress for the engine's explore nudge
+MUTATING_TOOLS = frozenset({"canvas", "approach", "decide", "question", "brief"})
 
 
 def arch_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool]:
-    """The arch toolset: state mutation + research. No edit/write/bash —
-    the model designs; it does not touch the repo."""
+    """The arch toolset: six ways to record, plus the fact-finding. No
+    edit/write/bash — the architect designs and argues; it does not touch the
+    repo."""
     tools: list[Tool] = [ReadTool(), ReadImageTool(), LsTool()]
     if with_kg:
         tools.append(KgQueryTool())
     if with_web:
         tools.extend([WebSearchTool(), WebFetchTool()])
     tools.extend([
-        ImportStateTool(),
-        VariantTool(), NodeTool(), LinkTool(), SpliceTool(), DepthTool(), PromoteTool(),
-        BriefTool(), ComponentTool(), ConnectTool(), FlowTool(), ExpandTool(),
-        DecideTool(), ConcernTool(), OfferTool(), AskTool(), AnswerTool(), AmendTool(),
+        ImportRepoTool(),
+        CanvasTool(), ApproachTool(), DecideTool(), QuestionTool(), BriefTool(),
         SkillTool(),
-        ArchDoneTool(),
+        HandoffTool(),
     ])
     return tools

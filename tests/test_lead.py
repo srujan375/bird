@@ -60,7 +60,9 @@ def test_build_runner_applies_def_tuning():
     # arch tuning flowed through: its instructions, its mutating set, its tracker
     assert r.instructions_path == registry.get("arch").instructions_path
     assert "brief" in r.mutating_tools
-    assert {t for t in r.tools} >= {"brief", "component", "done"}
+    assert {t for t in r.tools} >= {"brief", "canvas", "decide", "handoff"}
+    # arch names its own terminal move: handing a design off is not finishing a task
+    assert r.done_tool == "handoff"
 
 
 def test_verification_gate_is_per_harness_and_starts_empty():
@@ -210,20 +212,20 @@ def test_code_tool_triggers_background_kg_update(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------- architect tool
 
-def _fake_arch_session(phase, run_dir=None, comps=("gw", "db")):
+def _fake_arch_session(handed_off, run_dir=None, boxes=("gw", "db")):
     state = SimpleNamespace(
-        phase=phase,
-        components={c: c for c in comps},
+        handed_off=handed_off,
+        nodes={b: b for b in boxes},
         brief=SimpleNamespace(goal="a url shortener"),
     )
     return SimpleNamespace(state=state, run_dir=run_dir)
 
 
-def test_architect_tool_stashes_bundle_on_finalize(tmp_path, monkeypatch):
+def test_architect_tool_stashes_bundle_on_handoff(tmp_path, monkeypatch):
     def fake_interactive(*, run_dir, **kw):
         (run_dir / "bundle").mkdir(parents=True)
         (run_dir / "bundle" / "architecture.md").write_text("# Shortener\n\ndesign")
-        return _fake_arch_session("finalized", run_dir)
+        return _fake_arch_session(True, run_dir)
 
     monkeypatch.setattr("bird.harnesses.arch.run.run_arch_interactive", fake_interactive)
     ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path)
@@ -232,7 +234,7 @@ def test_architect_tool_stashes_bundle_on_finalize(tmp_path, monkeypatch):
     assert ctx.last_bundle is not None
     assert "# Shortener" in ctx.last_bundle
     assert "Architecture handoff" in ctx.last_bundle  # wrapped for the code session
-    assert "finalized" in res.output.lower()
+    assert "handed off" in res.output.lower()
     assert res.details["components"] == ["gw", "db"]
 
 
@@ -244,58 +246,51 @@ def test_architect_always_uses_interactive_workbench(tmp_path, monkeypatch):
             calls.append(kind)
             (run_dir / "bundle").mkdir(parents=True)
             (run_dir / "bundle" / "architecture.md").write_text("# d")
-            return _fake_arch_session("finalized", run_dir)
+            return _fake_arch_session(True, run_dir)
         return fake
 
     monkeypatch.setattr("bird.harnesses.arch.run.run_arch_interactive", make_fake("interactive"))
     monkeypatch.setattr("bird.harnesses.arch.run.run_arch_headless", make_fake("headless"))
 
-    # There is no auto path: architecture must ALWAYS open the interactive
-    # Workbench (browser + human gates), never the headless auto-approve walk.
+    # There is no auto path: architecture must ALWAYS open the Workbench with
+    # the user in the room, never the headless walk with nobody there.
     ArchitectTool().run({"task": "x"}, ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path))
     assert calls == ["interactive"]
 
 
-def test_architect_tool_errors_if_not_finalized(tmp_path, monkeypatch):
+def test_architect_tool_errors_when_the_user_never_said_it_was_done(tmp_path, monkeypatch):
     from bird.tools import ToolError
 
     monkeypatch.setattr(
         "bird.harnesses.arch.run.run_arch_interactive",
-        lambda **kw: _fake_arch_session("expand"),
+        lambda **kw: _fake_arch_session(False),
     )
     ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path)
-    with pytest.raises(ToolError, match="not finalized"):
+    with pytest.raises(ToolError, match="without a handoff"):
         ArchitectTool().run({"task": "x"}, ctx)
-    assert ctx.last_bundle is None  # nothing handed off
+    assert ctx.last_bundle is None  # nothing to hand to the builder
 
 
 # ---------------------------------------------------------- arch headless walk
 
 ARCH_WALK = [
-    assistant(calls=[tc("brief", {"goal": "shorten urls", "actors": ["visitor"],
-                                  "scope": "internal"})]),
     assistant(calls=[
-        tc("component", {"id": "gw", "kind": "gateway", "responsibility": "http entry",
-                         "trace": ["shorten urls"]}),
-        tc("component", {"id": "db", "kind": "store", "responsibility": "url mappings",
-                         "trace": ["shorten urls"], "data_owned": "short->long map"}),
-        tc("connect", {"src": "gw", "dst": "db", "label": "lookup", "kind": "sync"}),
-        tc("flow", {"id": "shorten", "name": "shorten", "kind": "happy",
-                    "steps": [{"src": "gw", "dst": "db", "action": "INSERT"}]}),
-        tc("decide", {"topic": "Storage", "category": "storage",
-                      "options": [{"name": "sqlite"}, {"name": "postgres"}],
-                      "choice": "sqlite", "rationale": "single box"}),
+        tc("brief", {"goal": "shorten urls", "actors": ["visitor"]}),
+        tc("canvas", {
+            "nodes": [
+                {"id": "gw", "label": "HTTP entry", "kind": "api",
+                 "responsibility": "takes a long url, hands back a short one"},
+                {"id": "db", "label": "URL mappings", "kind": "store", "depth": "sketch",
+                 "detail": "urls(short primary key, long); kept forever"},
+            ],
+            "edges": [{"src": "gw", "dst": "db", "label": "lookup",
+                       "notes": "503s if the store is down"}],
+        }),
+        tc("decide", {"topic": "storage", "choice": "sqlite",
+                      "against": ["postgres"], "why": "one box is enough"}),
     ]),
-    assistant(calls=[tc("done", {"summary": "top level ready"})]),
-    assistant(calls=[tc("expand", {"component_id": "db",
-                                   "entities": [{"name": "urls", "keys": "short"}],
-                                   "access_patterns": ["short -> long"],
-                                   "retention": "forever"})]),
-    assistant(calls=[tc("expand", {"component_id": "gw",
-                                   "endpoints": [{"route": "/s", "method": "POST",
-                                                  "request": "{url}", "response": "{short}",
-                                                  "auth": "none"}]})]),
-    assistant(calls=[tc("done", {"summary": "finalize"})]),
+    assistant(content="That's the shape. Anything you want to push on?"),
+    assistant(calls=[tc("handoff", {"summary": "single box, sqlite"})]),
 ]
 
 
@@ -308,7 +303,7 @@ class ScriptClient:
                            stop_reason="stop", model=spec.spec)
 
 
-def test_arch_headless_reaches_finalized(tmp_path):
+def test_arch_headless_reaches_a_handoff(tmp_path):
     from bird.harnesses.arch.run import run_arch_headless
 
     run_dir = tmp_path / ".bird" / "sessions" / "arch-h"
@@ -316,7 +311,7 @@ def test_arch_headless_reaches_finalized(tmp_path):
         repo_root=tmp_path, task="design a url shortener", registry=REG,
         client=ScriptClient(ARCH_WALK), run_dir=run_dir,
     )
-    assert arch.state.phase == "finalized"
+    assert arch.state.handed_off
     assert (run_dir / "bundle" / "architecture.md").is_file()
     assert (run_dir / "bundle" / "architecture.json").is_file()
 
@@ -409,7 +404,7 @@ def test_lead_end_to_end(tmp_path, monkeypatch):
     dispatches = [d for t, d in events if t == "dispatch"]
     kinds = [d["harness"] for d in dispatches]
     assert kinds == ["arch", "code"]                      # order enforced
-    # the arch sub-session actually finalized and wrote a bundle
+    # the arch sub-session actually handed off and wrote a bundle
     arch_dir = Path(dispatches[0]["run_dir"])
     assert (arch_dir / "bundle" / "architecture.md").is_file()
     # and code was dispatched WITH the design seeded in

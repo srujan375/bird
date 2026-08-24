@@ -1,24 +1,26 @@
 """reverse_seed — deterministic KG subgraph → ArchState transform.
 
 The reverse of `kg_seed`: instead of writing a design into the knowledge graph,
-this reads the *as-built* code graph back out as an ArchState so the render
-layer can display the current architecture and the model can propose
-modifications against the loaded state.
+this reads the *as-built* code graph back out as boxes and edges so the board
+can show the current architecture and the architect can propose changes against
+what is actually there rather than against a guess.
 
 It is a **pure transform** — no I/O, no model, no graph library. `scope_subgraph`
 is the one function that touches the KG (it takes the `KG` object), and even
 that only reads; everything downstream (`reverse_seed`) operates on a plain
 `Subgraph` of node dicts + edge dicts and returns a `SeedResult`. That split is
 what makes the transform unit-testable in isolation: hand it a fabricated
-subgraph, assert the components/connections/inferences it produces.
+subgraph, assert the boxes/edges/inferences it produces.
 
 The pipeline is hybrid by design (decision: "deterministic extraction + model
 refinement"): the heuristics here do what is safe and confident — group symbols
 by file, infer a `kind` from path/name signals, map call/import edges to
-component-level connections, collapse mutual edges, extract a thin facet when
-the kind is obvious. Everything uncertain becomes a *gap* in the inference log
-(low confidence), so the model can correct it with the existing tools rather than
-the harness silently producing a wrong diagram.
+box-level edges, collapse mutual ones. Everything uncertain becomes a *gap* in
+the inference log (low confidence), so the architect can correct it with
+`canvas` rather than the harness silently producing a wrong diagram.
+
+Imported boxes land at `depth="stub"` with `existing=True`: they are background,
+not a design anyone did here, and the coverage checks skip them for that reason.
 
 Reuses `kg.py`'s own vocabulary machinery (`tokenize`, `singularize`, `_expand`,
 `_traverse`, `_node_file`, `_norm_path`, `_same_file`) so scoping matches exactly
@@ -33,19 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...context import kg as kgmod
-from .state import (
-    KINDS,
-    ApiFacet,
-    Component,
-    Connection,
-    Endpoint,
-    Entity,
-    InfraFacet,
-    LlmFacet,
-    QueueFacet,
-    ServiceFacet,
-    StoreFacet,
-)
+from .state import Edge, Node
 
 # ---------------------------------------------------------------- dataclasses
 
@@ -67,9 +57,10 @@ class Inference:
     """One heuristic decision, for the transparency report.
 
     `confidence` is 'high' | 'medium' | 'low'. Low-confidence inferences are
-    the gaps the model should review first — the harness guessed, and it says so.
+    the gaps the architect should review first — the harness guessed, and it
+    says so.
     """
-    component_id: str
+    node_id: str
     field: str
     value: str
     confidence: str
@@ -78,9 +69,9 @@ class Inference:
 
 @dataclass
 class SeedResult:
-    """What `reverse_seed` returns: what to write into ArchState + what to report."""
-    components: list[Component] = field(default_factory=list)
-    connections: list[Connection] = field(default_factory=list)
+    """What `reverse_seed` returns: what to put on the board + what to report."""
+    nodes: list[Node] = field(default_factory=list)
+    edges: list[Edge] = field(default_factory=list)
     inference_log: list[Inference] = field(default_factory=list)
 
 
@@ -90,9 +81,9 @@ class SeedResult:
 DEFAULT_MAX_NODES = 200
 DEFAULT_MAX_DEPTH = 3
 
-# Edge relations that represent a real cross-component dependency (a call or
-# an import). `contains`/`rationale_for` are intra-file structure — they never
-# become connections between components.
+# Edge relations that represent a real cross-box dependency (a call or an
+# import). `contains`/`rationale_for` are intra-file structure — they never
+# become edges between boxes.
 DEPENDENCY_RELATIONS = frozenset({"calls", "imports", "imports_from", "references", "uses"})
 
 # Node types/labels that are structural noise, not architecture. File nodes
@@ -218,12 +209,15 @@ def _retraverse(G: Any, starts: list[str], max_depth: int) -> tuple[set[str], li
 # multiple/weak matches drop to medium/low.
 _KIND_SIGNALS: list[tuple[str, tuple[str, ...]]] = [
     # (kind, path/name fragments)
-    ("api", ("api", "endpoint", "route", "handler", "controller", "resource", "view")),
-    ("gateway", ("gateway", "proxy", "ingress", "edge")),
-    ("store", ("store", "repo", "repository", "db", "database", "model", "schema", "migration", "orm", "dao")),
-    ("cache", ("cache", "redis", "memo")),
+    # gateway/cache/job folded into api/store/service when the kind vocabulary
+    # shrank to the eight the board draws — the signals are still worth having,
+    # they just resolve to the surviving neighbour.
+    ("api", ("api", "endpoint", "route", "handler", "controller", "resource",
+             "view", "gateway", "proxy", "ingress")),
+    ("store", ("store", "repo", "repository", "db", "database", "model", "schema",
+               "migration", "orm", "dao", "cache", "redis")),
     ("queue", ("queue", "bus", "stream", "kafka", "pubsub", "topic", "broker", "worker")),
-    ("job", ("job", "cron", "scheduler", "task", "batch", "runner")),
+    ("service", ("job", "cron", "scheduler", "batch", "runner", "service", "worker_pool")),
     ("ui", ("ui", "view", "component", "page", "template", "render", "frontend", "client")),
     ("llm", ("llm", "prompt", "embedding", "rag", "agent", "inference")),
     ("infra", ("infra", "deploy", "terraform", "k8s", "docker", "compose", "config")),
@@ -251,7 +245,8 @@ def _infer_kind(file_path: str, symbols: list[str]) -> tuple[str, str, str]:
         kind, matched = hits[0]
         # 'model' alone is ambiguous (could be a domain model, not a store) —
         # only high if a store-specific term corroborates.
-        store_specific = {"store", "repo", "repository", "db", "database", "schema", "migration", "orm", "dao"}
+        store_specific = {"store", "repo", "repository", "db", "database", "schema",
+                          "migration", "orm", "dao", "cache", "redis"}
         if kind == "store" and not (store_specific & set(matched)):
             return (kind, "medium", f"path/name hints: {', '.join(matched)}")
         return (kind, "high", f"path/name signals: {', '.join(matched)}")
@@ -260,68 +255,6 @@ def _infer_kind(file_path: str, symbols: list[str]) -> tuple[str, str, str]:
     hits.sort(key=lambda kv: -len(kv[1]))
     kind, matched = hits[0]
     return (kind, "medium", f"ambiguous signals ({len(hits)} kinds); picked {kind} from {', '.join(matched)}")
-
-
-# ----------------------------------------------------------- facet extraction
-
-def _extract_facet(kind: str, symbols: list[str], file_path: str) -> tuple[Any, list[Inference]]:
-    """A thin facet when the kind is obvious; None (a gap) otherwise.
-
-    Only `store` and `api` get a facet here — they're the kinds whose shape is
-    inferable from symbol names (an Entity class, a route handler). Service/
-    queue/llm/infra facets need semantic detail the graph doesn't carry, so
-    they stay black boxes and the inference log says why.
-    """
-    cid_evidence = file_path
-    inferences: list[Inference] = []
-    if kind == "store":
-        # entity-like symbols (CamelCase, not all-caps) become Entity stubs.
-        entities = []
-        for sym in symbols:
-            name = _symbol_name(sym)
-            if not name or not name[0].isupper():
-                continue
-            if name.isupper():  # a constant, not an entity
-                continue
-            entities.append(Entity(name=name, keys="unknown"))
-        if entities:
-            inferences.append(Inference(
-                component_id="", field="facet.entities", value=f"{len(entities)} entities",
-                confidence="low", evidence=f"inferred CamelCase classes in {cid_evidence}",
-            ))
-            return StoreFacet(entities=entities), inferences
-        return None, [Inference(
-            component_id="", field="facet", value="none",
-            confidence="low", evidence=f"store with no inferable entities in {cid_evidence}",
-        )]
-    if kind == "api":
-        # route-like symbols (get_/post_/put_/delete_ or names containing a path)
-        endpoints = []
-        # match the HTTP verb as a word, optionally followed by `_` (the common
-        # handler-naming convention, e.g. `get_orders`); a trailing `\b` alone
-        # would miss `get_orders` since `_` is a word character.
-        route_re = re.compile(r"\b(get|post|put|patch|delete|head|options)(?=_|\b|$)", re.I)
-        for sym in symbols:
-            name = _symbol_name(sym)
-            if not name:
-                continue
-            m = route_re.search(name)
-            if m:
-                endpoints.append(Endpoint(
-                    route="?", method=m.group(1).upper(),
-                    request="?", response="?", auth="?",
-                ))
-        if endpoints:
-            inferences.append(Inference(
-                component_id="", field="facet.endpoints", value=f"{len(endpoints)} endpoints",
-                confidence="low", evidence=f"inferred handler names in {cid_evidence}",
-            ))
-            return ApiFacet(endpoints=endpoints), inferences
-        return None, [Inference(
-            component_id="", field="facet", value="none",
-            confidence="low", evidence=f"api with no inferable endpoints in {cid_evidence}",
-        )]
-    return None, []
 
 
 def _symbol_name(label: str) -> str:
@@ -334,14 +267,14 @@ def _symbol_name(label: str) -> str:
 # ----------------------------------------------------------- the transform
 
 def reverse_seed(subgraph: Subgraph, scope: str) -> SeedResult:
-    """Pure transform: scoped KG nodes+edges → ArchState components, connections,
-    facets + an inference log. No I/O, no model.
+    """Pure transform: scoped KG nodes+edges → board boxes, edges and an
+    inference log. No I/O, no model.
 
-    Grouping: one component per source file (the unit a human reads as a
-    "module"). Symbols with no file (bare resolved names like `Path`, `Popen`)
-    are dropped — they're cross-file glue, not components. Edges between symbols
-    in different files become connections between those files' components;
-    intra-file edges (`contains`, `rationale_for`) never do.
+    Grouping: one box per source file (the unit a human reads as a "module").
+    Symbols with no file (bare resolved names like `Path`, `Popen`) are dropped
+    — they're cross-file glue, not boxes. Edges between symbols in different
+    files become edges between those files' boxes; intra-file edges
+    (`contains`, `rationale_for`) never do.
     """
     inferences: list[Inference] = []
 
@@ -350,7 +283,7 @@ def reverse_seed(subgraph: Subgraph, scope: str) -> SeedResult:
     if truncated:
         depth, n = truncated
         inferences.append(Inference(
-            component_id="*", field="scope", value="truncated",
+            node_id="*", field="scope", value="truncated",
             confidence="medium",
             evidence=f"subgraph truncated at depth {depth} ({n} nodes) — re-scope more tightly if this missed something",
         ))
@@ -365,10 +298,10 @@ def reverse_seed(subgraph: Subgraph, scope: str) -> SeedResult:
         # kind signal beyond the path, and grouping their *symbols* is enough.
         by_file[f].append(nd)
 
-    components: list[Component] = []
+    boxes: list[Node] = []
     file_to_cid: dict[str, str] = {}
-    # node id → component id, so edges (which carry node ids) can be lifted to
-    # the component level. A node with no file maps to None and is dropped.
+    # kg node id → box id, so edges (which carry kg node ids) can be lifted to
+    # the box level. A node with no file maps to None and is dropped.
     node_to_cid: dict[str, str | None] = {}
     for f, syms in sorted(by_file.items()):
         cid = _file_to_cid(f)
@@ -379,47 +312,35 @@ def reverse_seed(subgraph: Subgraph, scope: str) -> SeedResult:
         # the file's own label (basename) is noise for kind inference; use symbols
         sym_names = [_symbol_name(l) for l in labels if not _FILE_LABEL_RE.match(l)]
         kind, conf, evidence = _infer_kind(f, sym_names)
-        name = _file_to_name(f)
-        facet, facet_inf = _extract_facet(kind, sym_names, f)
-        comp = Component(
+        boxes.append(Node(
             id=cid,
-            name=name,
+            label=_file_to_name(f),
             kind=kind,
             responsibility="",  # unknown — a gap, not a guess
-            trace=[],
+            depth="stub",
             existing=True,
-            tech=None,
-            facet=facet,
-            origin=f"imported:{scope}",
-        )
-        components.append(comp)
-        inferences.append(Inference(
-            component_id=cid, field="kind", value=kind, confidence=conf, evidence=evidence,
+            notes=f"imported from the repo (scope: {scope}); {f}",
         ))
-        for fi in facet_inf:
-            fi.component_id = cid
-            inferences.append(fi)
-        # responsibility is always a gap for imported components — the graph
-        # doesn't carry "what it does" in one sentence.
         inferences.append(Inference(
-            component_id=cid, field="responsibility", value="(none)",
+            node_id=cid, field="kind", value=kind, confidence=conf, evidence=evidence,
+        ))
+        # responsibility is always a gap for an imported box — the graph doesn't
+        # carry "what it does" in one sentence.
+        inferences.append(Inference(
+            node_id=cid, field="responsibility", value="(none)",
             confidence="low",
-            evidence=f"no responsibility inferred from code symbols in {f}; set it with `component`",
+            evidence=f"no responsibility inferred from code symbols in {f}; set it with `canvas`",
         ))
 
-    # ---- map edges → connections (collapse mutual, dedupe by pair) ----
-    connections, conn_inf = _map_connections(subgraph.edges, node_to_cid)
-    inferences.extend(conn_inf)
+    # ---- map kg edges → board edges (collapse mutual, dedupe by pair) ----
+    board_edges, edge_inf = _map_edges(subgraph.edges, node_to_cid)
+    inferences.extend(edge_inf)
 
-    return SeedResult(
-        components=components,
-        connections=connections,
-        inference_log=inferences,
-    )
+    return SeedResult(nodes=boxes, edges=board_edges, inference_log=inferences)
 
 
 def _file_to_cid(file_path: str) -> str:
-    """A stable kebab-case component id from a file path.
+    """A stable kebab-case box id from a file path.
 
     `src/bird/context/kg.py` → `context-kg`. Drops common top-level dirs
     (src/, lib/, app/, tests/) so the id is the meaningful tail.
@@ -434,7 +355,7 @@ def _file_to_cid(file_path: str) -> str:
     cid = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
     if not cid:
         cid = "comp"
-    # ensure it starts with a letter (state.validate_component requires it)
+    # ensure it starts with a letter (state.validate_node requires it)
     if not cid[0].isalpha():
         cid = "c-" + cid
     return cid
@@ -447,13 +368,13 @@ def _file_to_name(file_path: str) -> str:
     return re.sub(r"\.[^.]+$", "", base) or p
 
 
-def _map_connections(
+def _map_edges(
     edges: list[dict[str, Any]],
     node_to_cid: dict[str, str | None],
-) -> tuple[list[Connection], list[Inference]]:
-    """Collapse KG call/import edges to component-level connections.
+) -> tuple[list[Edge], list[Inference]]:
+    """Collapse KG call/import edges to box-level edges.
 
-    - drop intra-file edges (same component on both ends)
+    - drop intra-file edges (same box on both ends)
     - dedupe by (src, dst) pair, counting the underlying edges
     - detect mutual edges (A→B and B→A) and collapse to one 'mutual dependency'
     """
@@ -478,7 +399,7 @@ def _map_connections(
         if (b, a) in pair_counts and frozenset((a, b)) not in mutual:
             mutual.add(frozenset((a, b)))
 
-    connections: list[Connection] = []
+    board_edges: list[Edge] = []
     inferences: list[Inference] = []
     seen_pairs: set[frozenset[str]] = set()
     for (src, dst), count in sorted(pair_counts.items(), key=lambda kv: (-kv[1], kv[0])):
@@ -487,24 +408,20 @@ def _map_connections(
             continue
         seen_pairs.add(key)
         if key in mutual:
-            # collapse bidirectional into one connection, oriented src→dst
-            connections.append(Connection(
-                src=src, dst=dst, label="mutual dependency", kind="sync",
-            ))
+            # collapse bidirectional into one edge, oriented src→dst
+            board_edges.append(Edge(src=src, dst=dst, label="mutual dependency", kind="sync"))
             inferences.append(Inference(
-                component_id=src, field="connection", value=f"{src}↔{dst}",
+                node_id=src, field="edge", value=f"{src}↔{dst}",
                 confidence="medium",
                 evidence=f"bidirectional call/import between {src} and {dst} collapsed to one mutual dependency",
             ))
         else:
             rels = sorted(pair_relations[(src, dst)])
             label = "calls" if "calls" in rels else rels[0] if rels else "depends on"
-            connections.append(Connection(
-                src=src, dst=dst, label=label, kind="sync",
-            ))
+            board_edges.append(Edge(src=src, dst=dst, label=label, kind="sync"))
             inferences.append(Inference(
-                component_id=src, field="connection", value=f"{src}→{dst}",
+                node_id=src, field="edge", value=f"{src}→{dst}",
                 confidence="medium",
                 evidence=f"{count} {label} edge(s) between {src} and {dst}",
             ))
-    return connections, inferences
+    return board_edges, inferences

@@ -1,15 +1,17 @@
 """Running an arch session.
 
-`run_arch_interactive` is what the lead's `architect` tool ALWAYS uses in the
-product: it opens the browser Workbench with the two human gates (top-level
-approval, finalize) and blocks until the user finalizes — the same experience
-as `bird arch`, but returning the finalized ArchSession to the caller instead of
-exiting. Architecture never advances to code without explicit user approval, so
-there is deliberately no auto-approve dispatch path.
+`run_arch_interactive` is what the lead's `architect` tool uses: it opens the
+browser Workbench and blocks until the user is done — the same experience as
+`bird arch`, but returning the finalized ArchSession to the caller instead of
+exiting. The caller checks `.state.handed_off`.
 
-`run_arch_headless` runs the arch walk with no browser and no broker (both gates
-auto-approve). It exists only as a TEST utility for exercising the arch walk /
-the lead seam without a browser — it is NOT wired into any user-facing command.
+`run_arch_headless` runs the walk with no page and nobody in the room. It is a
+TEST utility for exercising the arch loop and the lead seam; a design
+conversation with no user is not the product.
+
+Neither takes a broker any more. The old harness had two human gates to block
+on (top-level approval, finalize); this one has none — the session ends when
+the user says so, in the conversation, which is not a modal.
 """
 
 from __future__ import annotations
@@ -18,26 +20,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...llm.registry import Registry
-from ...llm.types import Usage
 from ...tools import ToolContext
 from ..registry import build_runner
-from .judge import make_judge
 from .session import ArchSession
 
-
-def _usage_notifier(ctx: ToolContext) -> Callable[[Usage], None]:
-    """The critique's spend, pushed the way a dispatch pushes it: cumulative
-    here (one judge call per notification), and routed through the same
-    record tee every harness event rides — whichever Server is pumping this
-    session folds it into its total; the UI gets a total_usage push."""
-
-    def notify(usage: Usage) -> None:
-        ctx.emit(
-            "usage_notify",
-            {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
-        )
-
-    return notify
+# what tells the transport the session is over
+HANDED_OFF = lambda e: e.get("type") == "arch_state" and e.get("status") == "handed_off"  # noqa: E731
 
 
 def run_arch_interactive(
@@ -52,11 +40,9 @@ def run_arch_interactive(
     no_open: bool = False,
     on_status: Callable[[str], None] | None = None,
 ) -> ArchSession:
-    """Open the browser Workbench, run the arch session with its two human
-    gates, and block until the user finalizes (or closes the page). Returns the
-    ArchSession — the caller checks `.state.phase == "finalized"`. Mirrors
-    cli._arch_main's bring-up; kept separate so `bird arch`'s resume path stays
-    untouched."""
+    """Open the browser Workbench, run the session, and block until the user
+    hands the design off (or closes the page). Mirrors cli._arch_main's
+    bring-up; kept separate so `bird arch`'s resume path stays untouched."""
     import sys
     import time
     import webbrowser
@@ -80,28 +66,26 @@ def run_arch_interactive(
         repl = Repl(runner, registry, kg, recorder, run_dir.name)
         transport = HttpTransport(
             static_dir=arch_def.STATIC_DIR,
-            stop_when=lambda e: e.get("type") == "arch_state" and e.get("phase") == "finalized",
+            stop_when=HANDED_OFF,
             # no linger here, unlike `bird arch`: the lead is blocked on this
-            # call and has a build to start. The page keeps its finalized
-            # read-only view (finalized takes precedence over disconnected).
+            # call and has a build to start.
         )
-        server = Server(repl, transport=transport)  # wires ctx.record -> transport + gates
+        server = Server(repl, transport=transport)
 
-        arch = ArchSession(run_dir=run_dir)  # opens on the sketch layer
-        arch.broker = server.broker
-        # the critic bills the session too; the notifier rides the same
-        # record tee, so the Server's total hears every critique as it lands
-        arch.judge = make_judge(registry, client, _usage_notifier(ctx))
+        arch = ArchSession(run_dir=run_dir)
 
         def on_state(payload: dict) -> None:
-            recorder.event("arch_state", {"phase": payload["phase"], "changed": payload.get("changed")})
+            recorder.event(
+                "arch_state",
+                {"status": payload["status"], "changed": payload.get("changed")},
+            )
             transport.emit(payload)
 
         arch.on_state = on_state
         ctx.arch = arch
 
         url = transport.url
-        banner = f"architecture Workbench — review and approve at {url}"
+        banner = f"architecture Workbench — design with the architect at {url}"
         if on_status is not None:
             on_status(banner)
         # also to stderr: the TUI surfaces `bird serve` stderr as a notice, so the
@@ -115,10 +99,10 @@ def run_arch_interactive(
                       file=sys.stderr, flush=True)
         server.on_user_input(task)
         try:
-            server.run()  # blocks until finalize (stop_when) or the page disconnects
+            server.run()  # blocks until handoff (stop_when) or the page disconnects
         except KeyboardInterrupt:
             transport.shutdown()
-        time.sleep(0.3)  # let SSE clients drain the finalized/bye events
+        time.sleep(0.3)  # let SSE clients drain the closing events
         return arch
 
 
@@ -133,14 +117,11 @@ def run_arch_headless(
     record: Callable[[str, dict], None] | None = None,
     model: str = "architect",
     max_turns: int = 40,
-    critic: bool = True,
     with_web: bool = True,
 ) -> ArchSession:
-    """Design `task` to a finalized bundle. Returns the ArchSession; the caller
-    checks `.state.phase == "finalized"` and reads the bundle from `run_dir`.
+    """Design `task` with nobody in the room. Returns the ArchSession; the
+    caller checks `.state.handed_off` and reads the bundle from `run_dir`.
 
-    `critic=False` is the control arm: the second model that reviews the design
-    is simply absent, so nothing files a Concern the architect didn't think of.
     `with_web=False` drops web_search/web_fetch, so a measured run can't
     substitute a lucky search for design judgement.
     """
@@ -154,11 +135,9 @@ def run_arch_headless(
         run_dir=run_dir,
     )
     arch = ArchSession(run_dir=run_dir)
-    arch.broker = None  # no broker -> request_gate auto-approves both gates
-    arch.judge = make_judge(registry, client) if critic else None
     if record is not None:
         arch.on_state = lambda payload: record(
-            "arch_state", {"phase": payload["phase"], "changed": payload.get("changed")}
+            "arch_state", {"status": payload["status"], "changed": payload.get("changed")}
         )
     ctx.arch = arch
 

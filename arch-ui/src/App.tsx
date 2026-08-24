@@ -1,336 +1,121 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
-import { Canvas, useTidyUp } from "./canvas/Canvas";
-import { ComponentDialog } from "./dialog/ComponentDialog";
-import { Gate } from "./rail/Gate";
-import { Rail } from "./rail/Rail";
-import { useCanvas } from "./store/canvas";
-import { listViews, projectView, resolveView } from "./views";
-import { promoteVariant, useSession } from "./store/session";
-import { useTheme } from "./theme";
-import type { Layer, Variant } from "./types";
+import { useCallback, useEffect, useState } from "react";
+import { setChat, useChat } from "./board/chat";
+import type { Attachment } from "./board/types";
+import { fitNow, nudgeX } from "./board/viewApi";
+import { useSession } from "./wire/session";
+import { AppBar } from "./components/AppBar";
+import { Board } from "./components/Board";
+import { Chat } from "./components/Chat";
+import { Lightbox } from "./components/Lightbox";
+import { readChatClosed, useRail, writeChatOpen } from "./hooks/useRail";
 
-/** `E` opens the selected component's internals — the one keyboard shortcut
- *  the design handover asks for, and the reason a node click only selects. */
-function useOpenShortcut(): void {
+export default function App() {
+  const { arch, conn, handedOff, running } = useSession();
+  const chat = useChat();
+  const { rail, setRail } = useRail();
+
+  const [chatOpen, setChatOpen] = useState(() => !readChatClosed());
+  /* Suppress the width transition for the first frame when we open already
+     closed — restoring a state is not the same as being put away. */
+  const [sizing, setSizing] = useState(() => readChatClosed());
+  const [shot, setShot] = useState<Attachment | null>(null);
+  const [exportLabel, setExportLabel] = useState("Export board");
+  const [tip, setTip] = useState("Select a box to pin your note to it");
+
+  useEffect(() => { setChat({ open: chatOpen }); }, [chatOpen]);
+
+  useEffect(() => {
+    if (!sizing) return;
+    const raf = requestAnimationFrame(() => { setSizing(false); fitNow(64); });
+    return () => cancelAnimationFrame(raf);
+  }, [sizing]);
+
+  const toggleChat = useCallback((next?: boolean) => {
+    setChatOpen((open) => {
+      const want = next === undefined ? !open : next;
+      if (want === open) return open;
+      writeChatOpen(want);
+      if (want) setChat({ unread: false });
+      /* hold your place: the board gains or loses the rail's width, so slide
+         the world half of that and whatever you were reading stays put */
+      nudgeX(want ? -rail / 2 : rail / 2, 430);
+      return want;
+    });
+  }, [rail]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "e" && e.key !== "E") return;
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const el = e.target as HTMLElement | null;
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
-      const { selected, view, openComponentDialog } = useCanvas.getState();
-      const prefix = `${view ?? "design"}:`;
-      if (selected?.startsWith(prefix)) openComponentDialog(selected.slice(prefix.length));
+      if ((e.metaKey || e.ctrlKey) && e.key === "\\") { e.preventDefault(); toggleChat(); }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-}
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  }, [toggleChat]);
 
-/**
- * Which layer to draw. The user's choice wins; otherwise follow the session —
- * the design once something is promoted, the sketch before that. Both layers
- * stay reachable at all times, because the harness keeps both live.
- */
-function useLayer(): { layer: Layer; variant: Variant | null; variants: Variant[] } {
-  const arch = useSession((s) => s.arch);
-  const chosenLayer = useCanvas((s) => s.layer);
-  const chosenVariant = useCanvas((s) => s.variant);
+  /** The appbar's one quiet job: what the board is for, and where the argument
+   *  has got to. Both derived — neither can lag behind the design. */
+  const goal = arch?.brief.goal || "Architecture session";
+  const approaches = Object.values(arch?.approaches ?? {});
+  const live = approaches.filter((a) => a.status === "active");
+  const lost = approaches.filter((a) => a.status === "greyed");
+  const sub = (() => {
+    if (conn === "disconnected") return "the harness disconnected";
+    if (handedOff) return "handed off · read-only";
+    if (!arch || !Object.keys(arch.nodes).length) return running ? "thinking…" : "nothing on the board yet";
+    if (lost.length && live.length === 1) {
+      return `${live[0].name} taken · ${lost.length} on the record as not taken`;
+    }
+    if (approaches.length) return `${live.length} approaches on the board`;
+    return `${Object.keys(arch.nodes).length} boxes`;
+  })();
 
-  return useMemo(() => {
-    const book = arch?.sketchbook;
-    const variants = Object.values(book?.variants ?? {});
-    const hasDesign = Object.keys(arch?.components ?? {}).length > 0;
-    const hasSketch = variants.some((v) => Object.keys(v.nodes).length > 0);
-
-    let layer: Layer = chosenLayer ?? (hasDesign ? "design" : "sketch");
-    if (layer === "sketch" && !hasSketch && hasDesign) layer = "design";
-    if (layer === "design" && !hasDesign && hasSketch) layer = "sketch";
-
-    const wanted =
-      variants.find((v) => v.id === chosenVariant) ??
-      variants.find((v) => v.id === book?.active) ??
-      variants.find((v) => v.status === "chosen") ??
-      variants.find((v) => Object.keys(v.nodes).length > 0) ??
-      null;
-
-    return { layer, variant: wanted, variants };
-  }, [arch, chosenLayer, chosenVariant]);
-}
-
-/**
- * The top bar, handover §2.
- *
- * Five things, and the three that left are as deliberate as the five that
- * stayed. The repo path never changed during a session and the phase chip named
- * a state the tracker already narrates. The connection pill went because it was
- * a light reporting on something you only care about when you try to act on it
- * — the composer now disables itself when the session ends, which is the same
- * information delivered at the moment it matters.
- */
-function TopBar({ layer, variants }: { layer: Layer; variants: Variant[] }) {
-  const arch = useSession((s) => s.arch);
-  const ready = useSession((s) => s.ready);
-  const finalized = useSession((s) => s.finalized);
-  const transcript = useSession((s) => s.transcript);
-  const setLayer = useCanvas((s) => s.setLayer);
-  const theme = useTheme((s) => s.theme);
-  const toggleTheme = useTheme((s) => s.toggle);
-  const { layer: current, variant } = useLayer();
-  const tidy = useTidyUp(current, variant);
-
-  const goal =
-    arch?.brief.goal ||
-    transcript.find((t) => t.t === "user")?.text ||
-    "Architecture session";
-  const hasDesign = Object.keys(arch?.components ?? {}).length > 0;
-  const hasSketch = variants.some((v) => Object.keys(v.nodes).length > 0);
-
-  return (
-    <header className="topbar">
-      <span className="goal" title={goal}>{goal}</span>
-
-      {(hasSketch || hasDesign) && (
-        <div className="segmented" role="group" aria-label="canvas layer">
-          <button data-on={layer === "sketch"} onClick={() => setLayer("sketch")} disabled={!hasSketch}>
-            Sketch
-          </button>
-          <button data-on={layer === "design"} onClick={() => setLayer("design")} disabled={!hasDesign}>
-            Design
-          </button>
-        </div>
-      )}
-
-      <div className="meta">
-        <button
-          className="ghost theme-toggle"
-          onClick={toggleTheme}
-          aria-label={theme === "dark" ? "switch to light" : "switch to dark"}
-          title={theme === "dark" ? "light mode" : "dark mode"}
-        >
-          {theme === "dark" ? "☀" : "☾"}
-        </button>
-        {!finalized && <button className="ghost" onClick={tidy}>Tidy up</button>}
-        {finalized && <span className="chip">read-only</span>}
-        <span className="mono">{ready?.model ?? "—"}</span>
-      </div>
-    </header>
-  );
-}
-
-/**
- * Taking a sketch forward without asking the architect to do it.
- *
- * Promoting over a shape that is already seeded throws that shape away, so
- * that case asks a second time — inline, because a browser modal would freeze
- * the page's own event stream.
- */
-function PromoteVariant({ variant }: { variant: Variant }) {
-  const arch = useSession((s) => s.arch);
-  const finalized = useSession((s) => s.finalized);
-  const conn = useSession((s) => s.conn);
-  const [armed, setArmed] = useState(false);
-  const [busy, setBusy] = useState(false);
-
-  if (!arch || finalized || conn === "disconnected") return null;
-  if (Object.keys(variant.nodes).length === 0) return null;
-
-  const seededElsewhere = Object.values(arch.components).some(
-    (c) => c.origin.startsWith("sketch:") && !c.origin.startsWith(`sketch:${variant.id}:`),
-  );
-  const alreadyMine =
-    variant.status === "chosen" &&
-    Object.values(arch.components).some((c) => c.origin.startsWith(`sketch:${variant.id}:`));
-
-  const go = async () => {
-    if (seededElsewhere && !armed) { setArmed(true); return; }
-    setBusy(true);
-    await promoteVariant(variant.id, seededElsewhere);
-    setBusy(false);
-    setArmed(false);
+  const onExport = () => {
+    if (!arch) return;
+    const payload = JSON.stringify(arch, null, 2);
+    try {
+      const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "arch-board.json";
+      a.click();
+      URL.revokeObjectURL(url);
+      setExportLabel("Exported");
+    } catch {
+      setExportLabel("Export blocked here");
+    }
+    setTimeout(() => setExportLabel("Export board"), 1800);
   };
 
   return (
-    <button className="variant-tab promote" disabled={busy} onClick={go}
-            title="seed the design from this sketch — the same thing `promote` does">
-      {busy ? "promoting…"
-        : armed ? "replace the current design?"
-        : alreadyMine ? "re-promote"
-        : seededElsewhere ? "switch to this shape"
-        : "use this shape"}
-    </button>
-  );
-}
+    <div className="app" data-chat={chatOpen ? "open" : "closed"}>
+      <AppBar
+        goal={goal}
+        sub={sub}
+        chatOpen={chatOpen}
+        unread={chat.unread}
+        exportLabel={exportLabel}
+        onExport={onExport}
+        onToggleChat={() => toggleChat()}
+      />
 
-function VariantTabs({ variants, activeId }: { variants: Variant[]; activeId: string | null }) {
-  const setVariant = useCanvas((s) => s.setVariant);
-  const active = variants.find((v) => v.id === activeId);
-  if (variants.length === 0) return null;
-  return (
-    <div className="variant-tabs">
-      {variants.map((v) => (
-        <button
-          key={v.id}
-          className="variant-tab"
-          data-on={v.id === activeId}
-          data-status={v.status}
-          title={v.rejected_reason ? `not taken: ${v.rejected_reason}` : v.summary}
-          onClick={() => setVariant(v.id)}
-        >
-          {v.status === "chosen" ? "✓ " : ""}{v.name}
-          <span className="count faint"> {Object.keys(v.nodes).length}n</span>
-        </button>
-      ))}
-      {active && <PromoteVariant variant={active} />}
-    </div>
-  );
-}
-
-/**
- * The diagrams this design can be read as, §2.
- *
- * A seventeen-box canvas is not one diagram; it is a context diagram, a flow
- * diagram per flow, and the wiring underneath. All three are already in the
- * state — the switch is what admits that, and the box count on each button is
- * what makes choosing between them a real choice rather than a guess.
- *
- * It hides itself when there is only one view to be in. A switch that cannot
- * switch is furniture.
- */
-function ViewSwitch() {
-  const arch = useSession((s) => s.arch);
-  const chosen = useCanvas((s) => s.view);
-  const setView = useCanvas((s) => s.setView);
-  const views = useMemo(() => listViews(arch), [arch]);
-  const current = resolveView(arch, chosen);
-
-  if (views.length <= 1) {
-    const only = views[0];
-    return only ? <span className="chip">{only.count} component{only.count === 1 ? "" : "s"}</span> : null;
-  }
-
-  return (
-    <div className="view-switch" role="group" aria-label="diagram">
-      {views.map((v) => (
-        <button
-          key={v.id}
-          data-on={v.id === current}
-          data-kind={v.kind}
-          title={v.detail ? `${v.label} — ${v.detail}` : v.label}
-          onClick={() => setView(v.id)}
-        >
-          {v.label}
-          <span className="count faint"> {v.count}</span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function EmptyState({ layer }: { layer: Layer }) {
-  return (
-    <div className="empty-state">
-      <div>
-        <h3>{layer === "sketch" ? "Nothing sketched yet" : "Nothing promoted yet"}</h3>
-        <p>
-          {layer === "sketch"
-            ? "The architect opens with a rough shape you can react to — boxes will appear here as it sketches."
-            : "The sketch becomes a design when a shape is promoted. Until then, the Sketch layer is where the thinking is."}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-export default function App() {
-  const conn = useSession((s) => s.conn);
-  const arch = useSession((s) => s.arch);
-  const finalized = useSession((s) => s.finalized);
-  const runId = useSession((s) => s.ready?.run_id);
-  const restore = useCanvas((s) => s.restore);
-  const railWidth = useCanvas((s) => s.railWidth);
-  const permission = useSession((s) => s.permission);
-  const { layer, variant, variants } = useLayer();
-  /** Lives here because two children spend it: the composer in the rail writes
-   *  it, and the finalize sheet — which is over the canvas, not in the rail —
-   *  records it as the reason attached to a ruling. */
-  const [draft, setDraft] = useState("");
-  useOpenShortcut();
-
-  // the overlay is per run id, so a refresh lands back on the same viewport
-  useEffect(() => {
-    if (runId) restore(runId);
-  }, [runId, restore]);
-
-  const chosenView = useCanvas((s) => s.view);
-  const count =
-    layer === "sketch"
-      ? Object.keys(variant?.nodes ?? {}).length
-      : Object.keys(projectView(arch, resolveView(arch, chosenView)).components).length;
-
-  return (
-    // the grip writes the width here; the grid column reads it
-    <div className="app" style={{ "--rail": `${railWidth}px` } as CSSProperties}>
-      <TopBar layer={layer} variants={variants} />
-
-      <main className="stage">
-        <Canvas layer={layer} variant={variant} />
-
-        <div className="canvas-overlay tl">
-          {layer === "sketch" ? (
-            <VariantTabs variants={variants} activeId={variant?.id ?? null} />
-          ) : (
-            <ViewSwitch />
-          )}
-        </div>
-
-        <div className="canvas-overlay bl">
-          {/* A finalized session refuses every edit, so it must not go on
-              inviting them — "drag to place" under a canvas that will not let
-              you drag reads as a broken page rather than a closed one. */}
-          <span className="hint-strip">
-            {finalized
-              ? <>read-only · <b>E</b> opens a component · a sticky note is an objection on the record</>
-              : <>drag to place · <b>E</b> opens a component · a sticky note is an objection on the record</>}
-          </span>
-        </div>
-
-        {count === 0 && conn !== "disconnected" && <EmptyState layer={layer} />}
-
-        {conn === "connecting" && !arch && (
-          <div className="veil">
-            <div className="box">
-              <h3>Connecting…</h3>
-              <p>The first turn is already running on the server.</p>
-            </div>
-          </div>
-        )}
-
-        {conn === "disconnected" && (
-          <div className="veil">
-            <div className="box">
-              <h3>Disconnected</h3>
-              <p>
-                The session ended or the server went away. The canvas is still here to read —
-                pan and zoom still work.
-              </p>
-            </div>
-          </div>
-        )}
-
-        {/* over the canvas, never in it: opening a component must not reflow
-            the system graph behind it */}
-        <ComponentDialog />
-
-        {/* §9: finalize is a sheet over the dimmed canvas, not a note pinned to
-            the composer — it is now the only place decisions and questions
-            appear, and it outgrew the rail. */}
-        {permission && permission.kind !== "offer" && (
-          <Gate req={permission} reason={draft.trim()} onRespond={() => setDraft("")} />
-        )}
+      <main className={"split" + (sizing ? " sizing" : "")} id="content">
+        <Board setTip={setTip} />
+        <Chat
+          turns={chat.turns}
+          tip={tip}
+          rail={rail}
+          setRail={setRail}
+          onSizingStart={() => setSizing(true)}
+          onSizingEnd={() => setSizing(false)}
+          onCollapse={() => toggleChat(false)}
+          onOpenShot={setShot}
+          readOnly={handedOff || conn === "disconnected"}
+          readOnlyReason={handedOff
+            ? "The design was handed off — this board is read-only."
+            : "The harness is gone — nothing you type here can reach it."}
+        />
       </main>
 
-      <Rail draft={draft} setDraft={setDraft} />
+      {shot ? <Lightbox shot={shot} onClose={() => setShot(null)} /> : null}
     </div>
   );
 }
