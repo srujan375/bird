@@ -97,9 +97,10 @@ def test_reasoning_effort_forwarded_for_ollama(client, httpx_mock):
     assert payload["reasoning_effort"] == "medium"
 
 
-def test_reasoning_effort_not_sent_for_openrouter(client, httpx_mock, monkeypatch):
-    """OpenRouter uses reasoning_effort with different values, so the adapter
-    must NEVER forward it there even if spec.extra has it."""
+def test_reasoning_translated_for_openrouter(client, httpx_mock, monkeypatch):
+    """OpenRouter takes the unified nested `reasoning` object, not a raw
+    top-level reasoning_effort: spec.extra's value must be translated into
+    payload["reasoning"]["effort"], and the raw key must NEVER appear."""
     import json
 
     monkeypatch.setenv("OR_KEY", "sk-or-test")
@@ -112,6 +113,58 @@ def test_reasoning_effort_not_sent_for_openrouter(client, httpx_mock, monkeypatc
     httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
     client.complete(or_spec, [Message(role="user", content="x")])
     payload = json.loads(httpx_mock.get_requests()[0].content)
+    assert payload["reasoning"] == {"effort": "medium"}
+    assert "reasoning_effort" not in payload
+
+
+def test_reasoning_omitted_for_openrouter_when_off(client, httpx_mock, monkeypatch):
+    """`/think off` stores reasoning_effort 'none'; OpenRouter has no off
+    switch, so the adapter must omit the reasoning object entirely (provider
+    defaults apply) rather than send exclude:true (which still spends
+    reasoning tokens)."""
+    import json
+
+    monkeypatch.setenv("OR_KEY", "sk-or-test")
+    or_spec = ModelSpec(
+        spec="openrouter:foo/bar",
+        provider=ProviderConfig(name="openrouter", base_url="https://openrouter.ai/api/v1", api_key_env="OR_KEY"),
+        model="foo/bar",
+        extra={"reasoning_effort": "none"},
+    )
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    client.complete(or_spec, [Message(role="user", content="x")])
+    payload = json.loads(httpx_mock.get_requests()[0].content)
+    assert "reasoning" not in payload
+    assert "reasoning_effort" not in payload
+
+
+@pytest.mark.parametrize(
+    ("internal", "effort"),
+    [
+        ("low", "low"),
+        ("high", "high"),
+        ("max", "high"),  # OpenRouter has no max; clamped to high
+        ("minimal", "low"),  # OpenAI-style vocabulary -> nearest effort
+    ],
+)
+def test_reasoning_vocabulary_mapped_for_openrouter(
+    client, httpx_mock, monkeypatch, internal, effort
+):
+    """Every bird think-mode value maps onto OpenRouter's high|medium|low
+    vocabulary; unknown values fall back to omitting the object."""
+    import json
+
+    monkeypatch.setenv("OR_KEY", "sk-or-test")
+    or_spec = ModelSpec(
+        spec="openrouter:foo/bar",
+        provider=ProviderConfig(name="openrouter", base_url="https://openrouter.ai/api/v1", api_key_env="OR_KEY"),
+        model="foo/bar",
+        extra={"reasoning_effort": internal},
+    )
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    client.complete(or_spec, [Message(role="user", content="x")])
+    payload = json.loads(httpx_mock.get_requests()[0].content)
+    assert payload["reasoning"] == {"effort": effort}
     assert "reasoning_effort" not in payload
 
 

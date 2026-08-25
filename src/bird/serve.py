@@ -464,7 +464,7 @@ class Server:
             self._emit(
                 "think_list",
                 current=self.repl._think_label(),
-                modes=list(self.repl.THINK_MODES),
+                modes=list(self.repl.think_modes()),
             )
             return None
         if line.strip() == "/sessions":

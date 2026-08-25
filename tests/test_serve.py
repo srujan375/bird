@@ -21,6 +21,15 @@ SPEC = ModelSpec(
     context_window=32768,
 )
 
+# OpenRouter's reasoning.effort accepts only high|medium|low, so its thinking
+# picker must not offer "max" (see OPENROUTER_REASONING_EFFORT).
+OPENROUTER_SPEC = ModelSpec(
+    spec="openrouter:anthropic/claude-sonnet-4",
+    provider=ProviderConfig(name="openrouter", base_url="https://openrouter.ai/api/v1"),
+    model="anthropic/claude-sonnet-4",
+    context_window=32768,
+)
+
 
 class FakeClient:
     def __init__(self, script):
@@ -37,13 +46,13 @@ class FakeClient:
         return LLMResponse(message=msg, usage=Usage(10, 5), stop_reason="stop", model=spec.spec)
 
 
-def make_repl(tmp_path, script, skills=None):
+def make_repl(tmp_path, script, skills=None, spec=SPEC):
     (tmp_path / "f.py").write_text("x = 1\n")
     recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
     ctx = ToolContext(repo_root=tmp_path, record=recorder.event, skills=skills)
     registry = Registry(providers={}, models={}, aliases={"default": "fake:model"})
     runner = Runner(
-        spec=SPEC, client=FakeClient(script), registry=registry,
+        spec=spec, client=FakeClient(script), registry=registry,
         tools=code_harness_tools(with_kg=False), ctx=ctx,
     )
     return Repl(runner, registry, kg=None, recorder=recorder, run_id="t")
@@ -161,11 +170,11 @@ class Out:
                 self.cv.wait(remaining)
 
 
-def run_server(monkeypatch, tmp_path, script, skills=None):
+def run_server(monkeypatch, tmp_path, script, skills=None, spec=SPEC):
     feeder, out = Feeder(), Out()
     monkeypatch.setattr("sys.stdin", feeder)
     monkeypatch.setattr("sys.stdout", out)
-    server = Server(make_repl(tmp_path, script, skills))
+    server = Server(make_repl(tmp_path, script, skills, spec=spec))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     return feeder, out, thread
@@ -374,7 +383,8 @@ def test_serve_model_list(monkeypatch, tmp_path):
 def test_serve_think_list(monkeypatch, tmp_path):
     """bare /think emits a think_list event with the modes and current mode,
     mirroring bare /model's model_list — the TUI renders the picker and
-    answers with '/think <mode>'."""
+    answers with '/think <mode>'. The mode list is provider-aware: OpenRouter
+    has no "max" (its reasoning.effort accepts only high|medium|low)."""
     feeder, out, thread = run_server(monkeypatch, tmp_path, [])
     out.wait_for("ready")
     feeder.put({"type": "command", "line": "/think"})
@@ -382,6 +392,20 @@ def test_serve_think_list(monkeypatch, tmp_path):
     # no mode set on a fresh session → None (Ollama's auto/default behavior)
     assert msg["current"] is None
     assert msg["modes"] == ["off", "low", "medium", "high", "max"]
+    feeder.close()
+    thread.join(timeout=5)
+
+
+def test_serve_think_list_openrouter_has_no_max(monkeypatch, tmp_path):
+    """On an openrouter model the emitted modes drop "max" — its effort field
+    accepts only high|medium|low (the adapter clamps max→high), so offering it
+    would let the UI persist a value that silently means high."""
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [], spec=OPENROUTER_SPEC)
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/think"})
+    msg = out.wait_for("think_list")
+    assert msg["modes"] == ["off", "low", "medium", "high"]
+    assert "max" not in msg["modes"]
     feeder.close()
     thread.join(timeout=5)
 

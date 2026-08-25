@@ -21,6 +21,21 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_TRANSPORT_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 1.0
 
+# bird's internal reasoning_effort vocabulary (see repl.THINK_MODES: off/low/
+# medium/high/max, with `off` stored as "none") -> OpenRouter's unified
+# `reasoning` object. OpenRouter only accepts effort high|medium|low there —
+# it has no "max", so bird's `max` clamps to "high". "none" (think off) maps
+# to None: omit the object entirely and leave provider defaults in charge.
+# This is the single place that table lives; keep it that way.
+OPENROUTER_REASONING_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "max": "high",
+    # OpenAI-style vocabulary, mapped to the nearest available effort
+    "minimal": "low",
+}
+
 
 class WireError(Exception):
     """Transport or protocol failure after retries were exhausted."""
@@ -62,10 +77,19 @@ class OpenAICompatClient:
             payload["max_tokens"] = max_tokens
         # Ollama's OpenAI-compatible endpoint controls thinking via
         # `reasoning_effort` (the native `think` flag is ignored there).
-        # OpenRouter uses the same field with different values, so gate this
-        # to the ollama provider only — never forward it elsewhere.
-        if spec.provider.name == "ollama" and "reasoning_effort" in spec.extra:
-            payload["reasoning_effort"] = spec.extra["reasoning_effort"]
+        # OpenRouter instead takes the unified nested `reasoning` object
+        # ({"effort": high|medium|low}) — its providers (Anthropic among them)
+        # can ONLY be enabled that way, and a raw top-level reasoning_effort
+        # must never reach its wire. Translate bird's internal vocabulary via
+        # OPENROUTER_REASONING_EFFORT; "none" (think off) omits the object so
+        # provider defaults apply.
+        if "reasoning_effort" in spec.extra:
+            if spec.provider.name == "ollama":
+                payload["reasoning_effort"] = spec.extra["reasoning_effort"]
+            elif spec.provider.name == "openrouter":
+                effort = OPENROUTER_REASONING_EFFORT.get(spec.extra["reasoning_effort"])
+                if effort is not None:
+                    payload["reasoning"] = {"effort": effort}
 
         headers = {"Content-Type": "application/json"}
         api_key = spec.provider.api_key

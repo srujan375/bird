@@ -60,7 +60,7 @@ function tildify(p: string): string {
 const SLASH_COMMANDS = [
 	{ name: "help", description: "list commands" },
 	{ name: "model", description: "pick from available models (sets default)" },
-	{ name: "think", description: "pick an Ollama thinking mode (off/low/medium/high/max)" },
+	{ name: "think", description: "pick a thinking mode (off/low/medium/high/max)" },
 	{ name: "kg", description: "knowledge graph status / build / query" },
 	{ name: "tools", description: "list available tools" },
 	{ name: "skills", description: "list available skills" },

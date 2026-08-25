@@ -338,12 +338,29 @@ class Repl:
             # not an alias and not provider:model — treat as a picker filter
             self._model_picker(filter_=arg)
 
-    # Ollama thinking modes, in display order. The friendly label is what the
-    # user types and sees; the internal value is what the wire adapter forwards
-    # as `reasoning_effort`. `off` maps to "none" (thinking disabled); the rest
-    # map to themselves. See openai_compat.py for why this is ollama-only.
+    # Thinking modes, in display order. The friendly label is what the
+    # user types and sees; the internal value is what the wire adapter
+    # receives as `reasoning_effort`. `off` maps to "none" (thinking disabled);
+    # the rest map to themselves. The adapter translates it per provider —
+    # ollama forwards it raw, OpenRouter maps it onto its nested `reasoning`
+    # object (see OPENROUTER_REASONING_EFFORT in openai_compat.py).
     THINK_MODES = ("off", "low", "medium", "high", "max")
     _THINK_INTERNAL = {"off": "none"}  # everything else maps to itself
+
+    # Per-provider overrides: OpenRouter's reasoning.effort accepts only
+    # high|medium|low (the adapter clamps max→high — see
+    # OPENROUTER_REASONING_EFFORT in llm/wire/openai_compat.py), so "max"
+    # must not be offered or accepted for it. Any provider not listed here
+    # gets the full THINK_MODES set.
+    _PROVIDER_THINK_MODES = {"openrouter": ("off", "low", "medium", "high")}
+
+    def think_modes_for_provider(self, provider_name: str) -> tuple[str, ...]:
+        """The thinking modes a provider actually supports, in display order."""
+        return self._PROVIDER_THINK_MODES.get(provider_name, self.THINK_MODES)
+
+    def think_modes(self) -> tuple[str, ...]:
+        """Thinking modes for the current model's provider."""
+        return self.think_modes_for_provider(self.runner.spec.provider.name)
 
     def _think_label(self) -> str | None:
         """The friendly mode label for the spec's current reasoning_effort, or
@@ -368,7 +385,7 @@ class Repl:
         current = self._think_label()
         active = current if current is not None else "(auto)"
         print(f"thinking: {active}")
-        for mode in self.THINK_MODES:
+        for mode in self.think_modes():
             marker = "*" if mode == current else " "
             print(f" {marker} {mode}")
         if not getattr(sys.stdin, "isatty", lambda: False)():
@@ -385,8 +402,9 @@ class Repl:
 
     def _set_think_mode(self, label: str) -> None:
         """Validate and apply a thinking mode by its friendly label."""
-        if label not in self.THINK_MODES:
-            print(f"unknown mode {label!r} — valid: {', '.join(self.THINK_MODES)}")
+        modes = self.think_modes()
+        if label not in modes:
+            print(f"unknown mode {label!r} — valid: {', '.join(modes)}")
             return
         internal = self._THINK_INTERNAL.get(label, label)
         self.runner.spec.extra["reasoning_effort"] = internal

@@ -584,9 +584,12 @@ export class SessionPicker implements Component {
 
 /* ---------- thinking-mode picker ---------- */
 
-/** The Ollama thinking-mode picker — mirrors ModelPicker but simpler: a flat
+/** The thinking-mode picker — mirrors ModelPicker but simpler: a flat
  *  list of mode labels (off/low/medium/high/max) with the active one marked.
- *  Arrow keys to navigate, Enter to select, Esc to cancel. No numbers. */
+ *  Arrow keys to navigate, Enter to select, Esc to cancel. No numbers.
+ *  Renders whatever modes the server's think_list message sends, so the list
+ *  is already filtered for the current model's provider (e.g. OpenRouter has
+ *  no "max"). */
 export class ThinkPicker implements Component {
 	invalidate(): void {}
 	onDone?: (mode: string | null) => void;

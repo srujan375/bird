@@ -110,7 +110,7 @@
     }
   },
   "aliases": {
-    "default": "ollama:glm-5.2",
+    "default": "openrouter:stealth/ox-alpha",
     "architect": "ollama:glm-5.2",
     "compactor": "ollama:gemma4:31b",
     "vision": "ollama:kimi-k2.7-code",
