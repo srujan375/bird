@@ -9,6 +9,8 @@ import type { Attachment } from "./types";
 
 export interface AskOption {
   label: string;
+  /** the one-line consequence of taking this row */
+  cost?: string;
   rec?: boolean;
   favor?: "a" | "b";
   act?: string;
@@ -22,6 +24,8 @@ export interface AskBlock {
   opts: AskOption[];
   spent: boolean;
   pickedLabel?: string;
+  /** answered in prose — no row was taken as-is, so none may claim it was */
+  answeredInMessage?: boolean;
   onPick: (o: AskOption) => void;
 }
 
@@ -128,6 +132,24 @@ export function spendAsk(host: number, pickedLabel: string) {
   const turn = state.turns.find((t) => t.id === host);
   if (!turn || turn.t !== "say" || !turn.ask) return;
   patchTurn(host, { ask: { ...turn.ask, spent: true, pickedLabel } } as Partial<Turn>);
+  setChat({ pendingAsk: null });
+}
+
+/** The question still on the table, if any. Global shortcuts answer with this. */
+export function openAsk(): AskBlock | null {
+  for (let i = state.turns.length - 1; i >= 0; i--) {
+    const t = state.turns[i];
+    if (t.t === "say" && t.ask && !t.ask.spent) return t.ask;
+  }
+  return null;
+}
+
+/** A question settled without a pick — typed instead. Rows stay as the record
+ *  of what was offered, but none of them may claim it was taken. */
+export function settleAskInMessage(host: number) {
+  const turn = state.turns.find((t) => t.id === host);
+  if (!turn || turn.t !== "say" || !turn.ask || turn.ask.spent) return;
+  patchTurn(host, { ask: { ...turn.ask, spent: true, answeredInMessage: true } } as Partial<Turn>);
   setChat({ pendingAsk: null });
 }
 

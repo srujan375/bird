@@ -12,6 +12,13 @@ import {
 import { renderMarkdown } from "./markdown.ts";
 import { palette, SPINNER, SPINNER_MS, t } from "./theme.ts";
 
+/* ---------- messages ---------- */
+
+// While streaming, re-parse markdown at most this often; deltas arrive far
+// faster than frames render, so this keeps long messages cheap. Finalization
+// always re-parses regardless of the throttle.
+const STREAM_PARSE_MS = 50;
+
 /* ---------- rounded box helper (Textual `border: round` glyphs) ---------- */
 
 interface BoxOpts {
@@ -128,26 +135,39 @@ export class UserMessage implements Component {
 }
 
 export class AssistantMessage implements Component {
-	invalidate(): void {}
+	// Markdown is rendered identically while streaming and after finalization,
+	// so the line count never changes at finalize and the scroll position
+	// stays put. The cursor is appended to the last rendered line (not fed
+	// through the parser) so partial/unclosed markdown still parses cleanly.
 	private cursor = false;
+	private cachedLines: string[] | null = null;
+	private lastParse = 0;
 
 	constructor(private text: string) {}
+
+	invalidate(): void {
+		// width or theme changed upstream — drop the memo so the next frame re-renders
+		this.cachedLines = null;
+	}
 
 	setText(text: string, cursor = false): void {
 		this.text = text;
 		this.cursor = cursor;
+		if (!cursor) this.lastParse = 0; // finalization must always re-parse exactly
 	}
 
 	render(width: number): string[] {
 		const bodyW = Math.max(20, Math.floor(width * 0.88));
-		if (this.cursor) {
-			// streaming: raw text with cursor — don't render partial markdown
-			const body = this.text + t.accent("▎");
-			const wrapped = wrapTextWithAnsi(body, bodyW);
-			return [" " + t.muted.bold("AGENT"), ...wrapped.map((l) => " " + t.fg(l))];
+		if (this.cursor && this.cachedLines !== null && Date.now() - this.lastParse < STREAM_PARSE_MS) {
+			return [" " + t.muted.bold("AGENT"), ...this.cachedLines.map((l) => " " + l)];
 		}
-		// finalized: render markdown (renderer applies its own colors per element)
+		this.lastParse = Date.now();
 		const lines = renderMarkdown(this.text, bodyW);
+		if (this.cursor) {
+			if (lines.length > 0) lines[lines.length - 1] += t.accent("▎");
+			else lines.push(t.accent("▎"));
+		}
+		this.cachedLines = lines;
 		return [" " + t.muted.bold("AGENT"), ...lines.map((l) => " " + l)];
 	}
 }

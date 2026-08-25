@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { boardLine, dropTurn, getChat, nextTurnId, patchTurn, push, say, setChat, you } from "../board/chat";
+import { boardLine, dropTurn, getChat, nextTurnId, patchTurn, push, say, setChat, settleAskInMessage, spendAsk, you } from "../board/chat";
 import { splitTask } from "./task";
 import { flash } from "../board/ui";
 import type { ArchState, ConnState, Incoming, ReadyEvent } from "./types";
@@ -141,12 +141,22 @@ export function applyEvent(ev: Incoming): void {
           /* A message can be drawn, typed, pointed, or all three — the harness
              sends them as one turn, so the page has to show every half or the
              typed words disappear from the record. */
-          const { drew, about, typed } = splitTask(data.task);
-          if (drew.length || about.length) {
-            const via = !typed && drew.length ? "on the board" : undefined;
+          const { drew, about, picked, typed } = splitTask(data.task);
+          if (drew.length || about.length || picked.length) {
+            const via = !typed && drew.length && !picked.length ? "on the board"
+              : !typed && picked.length ? "picked" : undefined;
             you(typed || undefined, undefined, via, drew, about);
           } else {
             you(data.task);
+          }
+          /* A pick settles the question it answered; a typed reply with no
+             pick means they answered in prose — the rows stay as the record
+             of what was offered, but none of them was taken. */
+          for (const t of getChat().turns) {
+            if (t.t === "say" && t.ask && !t.ask.spent) {
+              if (picked.length) spendAsk(t.id, picked[0]);
+              else settleAskInMessage(t.id);
+            }
           }
         }
         openTurnId = null;
@@ -221,6 +231,21 @@ async function post(path: string, body: unknown): Promise<Response | null> {
  *  pointed at. */
 export function sendInput(text: string, subjects: string[] = []): void {
   void post("/input", subjects.length ? { text, subjects } : { text });
+}
+
+/** Answering with a row of the picker. Sent as its own prefixed block so the
+ *  harness transcript records "picked", never words the user did not type. */
+export function sendPick(label: string): void {
+  spendAskPending(label);
+  sendInput(`${PICK_PREFIX}\n- ${label}`);
+}
+
+/* Optimistically settle every open ask — the run_start echo confirms it, but
+   a pick should read as done the frame it happens. */
+function spendAskPending(label: string) {
+  for (const t of getChat().turns) {
+    if (t.t === "say" && t.ask && !t.ask.spent) spendAsk(t.id, label);
+  }
 }
 
 /**

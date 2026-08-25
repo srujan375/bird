@@ -510,6 +510,27 @@ class QuestionTool(Tool):
         "properties": {
             "question": {"type": "string"},
             "recommendation": {"type": "string", "description": "what you'd do, and why"},
+            "options": {
+                "type": "array",
+                "description": (
+                    "the choices, declared explicitly so the user can pick one. "
+                    "2–3 rows; label is at most five words; cost is the one-line "
+                    "consequence of taking it; rec marks the row you'd pick (at "
+                    "most one); favor names the approach this pick keeps alive."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "at most five words"},
+                        "cost": {"type": "string", "description": "the consequence, in one line"},
+                        "rec": {"type": "boolean", "description": "the row you'd pick — at most one"},
+                        "favor": {"type": "string", "description": "approach id this pick retires the rivals of"},
+                        "stay": {"type": "boolean", "description": "this row re-asks instead of advancing"},
+                    },
+                    "required": ["label"],
+                    "additionalProperties": False,
+                },
+            },
             "id": {"type": "string", "description": "to answer or defer one already parked"},
             "answer": {"type": "string"},
             "status": {"type": "string", "enum": ["open", "answered", "deferred"]},
@@ -531,6 +552,8 @@ class QuestionTool(Tool):
                 q.question = _str(args["question"])
             if args.get("recommendation") is not None:
                 q.recommendation = _str(args["recommendation"])
+            if args.get("options") is not None:
+                q.options = _ask_options(args["options"])
             if args.get("answer") is not None:
                 q.answer = _str(args["answer"])
                 q.status = "answered"

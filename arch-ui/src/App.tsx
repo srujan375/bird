@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { setChat, useChat } from "./board/chat";
+import { openAsk, setChat, useChat } from "./board/chat";
 import type { Attachment } from "./board/types";
 import { fitNow, nudgeX } from "./board/viewApi";
 import { useSession } from "./wire/session";
@@ -45,7 +45,20 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "\\") { e.preventDefault(); toggleChat(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === "\\") { e.preventDefault(); toggleChat(); return; }
+      /* Digits 1–3 answer the open question from anywhere — but only when the
+         user is not typing, and not with a modifier that means something else. */
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      const ask = openAsk();
+      if (!ask) return;
+      const n = Number(e.key);
+      if (Number.isInteger(n) && n >= 1 && n <= Math.min(3, ask.opts.length)) {
+        e.preventDefault();
+        const o = ask.opts[n - 1];
+        if (ask.onPick) ask.onPick(o); else sendPick(o.label);
+      }
     };
     addEventListener("keydown", onKey);
     return () => removeEventListener("keydown", onKey);

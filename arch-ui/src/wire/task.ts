@@ -11,6 +11,9 @@
 
 export const BOARD_EDIT_PREFIX = "[the user changed the board]";
 export const FOCUS_PREFIX = "[the user is pointing at]";
+/** A picker answer travels as its own block, so the transcript can attribute
+ *  it to a gesture ("picked") rather than to words the user never typed. */
+export const PICK_PREFIX = "[the user picked]";
 
 /** The bullets of a context block. The harness writes one `- item` per line; a
  *  focus block hangs indented detail under each, which is for the architect and
@@ -26,6 +29,8 @@ export interface SplitTask {
   drew: string[];
   /** boxes it was pointing at */
   about: string[];
+  /** picker rows taken with the message — "picked", not typed */
+  picked: string[];
   /** the words the user actually typed */
   typed: string;
 }
@@ -34,6 +39,7 @@ export function splitTask(task: string): SplitTask {
   const blocks = task.split("\n\n");
   let drew: string[] = [];
   let about: string[] = [];
+  let picked: string[] = [];
   let i = 0;
   /* Context blocks come first and in no guaranteed order. Stop at the first
      block that is not one — everything from there is what was typed, including
@@ -41,7 +47,8 @@ export function splitTask(task: string): SplitTask {
   for (; i < blocks.length; i++) {
     if (blocks[i].startsWith(BOARD_EDIT_PREFIX)) drew = bullets(blocks[i]);
     else if (blocks[i].startsWith(FOCUS_PREFIX)) about = bullets(blocks[i]);
+    else if (blocks[i].startsWith(PICK_PREFIX)) picked = bullets(blocks[i]);
     else break;
   }
-  return { drew, about, typed: blocks.slice(i).join("\n\n").trim() };
+  return { drew, about, picked, typed: blocks.slice(i).join("\n\n").trim() };
 }
