@@ -33,12 +33,14 @@ def test_editing_prose_on_a_box(session):
     assert session.state.nodes["orders"].responsibility == "holds delivery attempts"
 
 
-def test_the_kind_stays_the_architects_call(session):
-    """Structural changes come from the conversation, not from typing in a
-    panel — so `kind` is simply not in the editable set."""
-    assert "kind" not in EDITABLE_NODE_FIELDS
-    with pytest.raises(MutationError, match="editable fields"):
-        apply_mutation(session, {"op": "node", "id": "orders", "kind": "queue"})
+def test_the_kind_is_the_users_to_change_and_the_architect_hears(session):
+    """Every part of a box is editable on the card, kind included; the change
+    lands in the architect's note like any other user edit."""
+    assert "kind" in EDITABLE_NODE_FIELDS
+    apply_mutation(session, {"op": "node", "id": "orders", "kind": "queue"})
+    assert session.state.nodes["orders"].kind == "queue"
+    with pytest.raises(MutationError, match="unknown kind"):
+        apply_mutation(session, {"op": "node", "id": "orders", "kind": "blob"})
 
 
 def test_editing_a_box_that_is_not_there(session):

@@ -223,3 +223,76 @@ def test_notes_survive_a_roundtrip_and_know_what_they_hang_off():
     back = ArchState.from_dict(s.to_dict())
     assert [a.id for a in back.notes_on("orders")] == ["n1"]
     assert back.annotation_by_id("n2").anchor == ""
+
+
+# ---------------------------------------------------------------- parents
+
+
+def _parented():
+    from bird.harnesses.arch.state import ArchState, Node
+    st = ArchState()
+    st.nodes["ingest"] = Node(id="ingest", label="Ingest", kind="group")
+    st.nodes["parser"] = Node(id="parser", label="Parser", parent="ingest")
+    st.nodes["queue"] = Node(id="queue", label="Queue", kind="queue", parent="ingest")
+    return st
+
+
+def test_parent_must_exist_and_not_loop():
+    import pytest
+    from bird.harnesses.arch.state import Node
+    st = _parented()
+    with pytest.raises(ValueError, match="unknown parent"):
+        st.validate_node(Node(id="x", label="x", parent="nope"))
+    with pytest.raises(ValueError, match="own parent"):
+        st.validate_node(Node(id="x", label="x", parent="x"))
+    # ingest inside parser, while parser is inside ingest
+    with pytest.raises(ValueError, match="loop"):
+        st.validate_node(Node(id="ingest", label="Ingest", kind="group", parent="parser"))
+
+
+def test_children_and_ancestors():
+    st = _parented()
+    assert sorted(n.id for n in st.children_of("ingest")) == ["parser", "queue"]
+    assert st.ancestors_of("parser") == ["ingest"]
+    assert st.ancestors_of("ingest") == []
+
+
+def test_removing_a_container_lifts_its_members():
+    st = _parented()
+    lifted = st.orphan_children("ingest")
+    assert sorted(lifted) == ["parser", "queue"]
+    assert st.nodes["parser"].parent == ""
+
+
+def test_parent_round_trips():
+    from bird.harnesses.arch.state import ArchState
+    st = _parented()
+    back = ArchState.from_dict(st.to_dict())
+    assert back.nodes["parser"].parent == "ingest"
+    assert back.nodes["ingest"].kind == "group"
+
+
+# ------------------------------------------------------------ facts/items
+
+
+def test_facts_follow_the_kinds_vocabulary():
+    import pytest
+    from bird.harnesses.arch.state import ArchState, Item, Node
+    st = ArchState()
+    ok = Node(id="db", label="DB", kind="store", facts={"engine": "sqlite"},
+              items=[Item(v="sessions", k="tbl", d="one row per session")])
+    st.validate_node(ok)
+    with pytest.raises(ValueError, match="no fact 'broker'"):
+        st.validate_node(Node(id="db", label="DB", kind="store", facts={"broker": "x"}))
+    with pytest.raises(ValueError, match="needs a value"):
+        st.validate_node(Node(id="db", label="DB", kind="store", items=[Item(v=" ")]))
+
+
+def test_facts_and_items_round_trip():
+    from bird.harnesses.arch.state import ArchState, Item, Node
+    st = ArchState()
+    st.nodes["q"] = Node(id="q", label="Q", kind="queue", facts={"delivery": "at-least-once"},
+                         items=[Item(v="order.placed", k="msg")])
+    back = ArchState.from_dict(st.to_dict())
+    assert back.nodes["q"].facts == {"delivery": "at-least-once"}
+    assert back.nodes["q"].items[0].k == "msg"

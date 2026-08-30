@@ -1,7 +1,6 @@
 import {
 	CombinedAutocompleteProvider,
 	Container,
-	Editor,
 	Key,
 	matchesKey,
 	ProcessTerminal,
@@ -14,7 +13,9 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Bridge, type ServerMessage } from "./bridge.ts";
 import {
 	AssistantMessage,
+	ChoicePicker,
 	DispatchBanner,
+	GhostEditor,
 	HeaderBar,
 	HintLine,
 	ModelPicker,
@@ -22,6 +23,7 @@ import {
 	PermissionCard,
 	type PermissionMode,
 	type PermissionSpec,
+	PromptInput,
 	SessionPicker,
 	Thinking,
 	ThinkingTrace,
@@ -30,6 +32,7 @@ import {
 	autoApproves,
 } from "./components.ts";
 import { runDemoTurn } from "./demo.ts";
+import { detectBackgroundFromEnv, renderBanner, resolveAccent } from "./branding.ts";
 import { t } from "./theme.ts";
 
 /* ---------- args ---------- */
@@ -62,6 +65,10 @@ const SLASH_COMMANDS = [
 	{ name: "model", description: "pick from available models (sets default)" },
 	{ name: "think", description: "pick a thinking mode (off/low/medium/high/max)" },
 	{ name: "kg", description: "knowledge graph status / build / query" },
+	{ name: "mcp", description: "MCP server status / search / add" },
+	{ name: "setup", description: "first-run walkthrough: keys, model pick, verify" },
+	{ name: "doctor", description: "health check: one line per check" },
+	{ name: "keys", description: "show provider keys · /keys set <NAME> to store one" },
 	{ name: "tools", description: "list available tools" },
 	{ name: "skills", description: "list available skills" },
 	{ name: "compact", description: "compact conversation history" },
@@ -78,19 +85,38 @@ const SLASH_COMMANDS = [
 const terminal = new ProcessTerminal();
 const tui = new TUI(terminal);
 
-const header = new HeaderBar(tildify(repo), DEMO ? "demo" : "connecting…");
+// Accent colour, resolved synchronously at startup from COLORFGBG (when the
+// terminal exports it) and otherwise assumed dark — theme.ts hard-codes a dark
+// charcoal palette, so dark is the honest default rather than a guess.
+//
+// This deliberately does NOT probe the terminal with an OSC 11 background
+// query. `process.stdout` on a TTY is a net.Socket, so attaching a 'data'
+// listener to it puts it in flowing mode and it starts READING fd 1 — the same
+// terminal device as fd 0. It then races process.stdin for keystrokes and wins,
+// which left the TUI rendering fine but deaf to input. The reply arrives on
+// stdin anyway, so listening on stdout could never have worked.
+const accent = resolveAccent({ background: detectBackgroundFromEnv(process.env) ?? "dark" });
+
+const header = new HeaderBar();
 const hint = new HintLine(DEMO ? "demo" : "connecting…");
+hint.setTheme(accent);
+// The one place the model name is shown: bottom-right of the chat bar.
+let currentModel = DEMO ? "demo" : "connecting…";
 const chat = new Container();
-const editor = new Editor(tui, {
-	borderColor: (s) => t.dim(s),
-	selectList: {
-		selectedPrefix: (s) => t.accentBold(s),
-		selectedText: (s) => t.accentBold(s),
-		description: (s) => t.muted(s),
-		scrollInfo: (s) => t.dim(s),
-		noMatch: (s) => t.muted(s),
+const editor = new GhostEditor(
+	tui,
+	{
+		borderColor: (s) => t.dim(s),
+		selectList: {
+			selectedPrefix: (s) => t.accentBold(s),
+			selectedText: (s) => t.accentBold(s),
+			description: (s) => t.muted(s),
+			scrollInfo: (s) => t.dim(s),
+			noMatch: (s) => t.muted(s),
+		},
 	},
-});
+	"/ for commands",
+);
 editor.setAutocompleteProvider(new CombinedAutocompleteProvider(SLASH_COMMANDS, repo));
 
 tui.addChild(header);
@@ -153,7 +179,9 @@ function endTurn(): void {
 }
 
 function setModel(model: string): void {
-	header.setModel(model);
+	// No transcript notice here: the chat bar is the single place the model is
+	// named, and this fired on the first `ready` too, showing it twice.
+	currentModel = model;
 	hint.setModel(model);
 	tui.requestRender();
 }
@@ -254,8 +282,9 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 				hint.resetMode();
 				addToChat(new Notice("approval mode reset — ⇧⇥ to re-enable", "muted"));
 			}
-			const kgNote = msg.kg ? (msg.kg_ready ? "kg ready" : "kg building in background") : "kg off";
-			addToChat(new Notice(`connected · session ${msg.run_id} · ${kgNote}`));
+			// kg state belongs in the chat bar, not the transcript — and the
+			// "connected · session <id>" line said nothing the chrome doesn't.
+			hint.setKg(msg.kg ? (msg.kg_ready ? "ready" : "building") : "off");
 			// Merge skill names from the server into the autocomplete dropdown
 			// so /<skill-name> appears alongside built-in /commands. The
 			// provider's command list is private, so we rebuild the provider
@@ -357,7 +386,7 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 			} else if (event === "attachment_failed") {
 				addToChat(new Notice(`⚠ could not save attachment: ${data.error}`, "danger"));
 			} else if (event === "kg_ready_notice") {
-				addToChat(new Notice("✓ knowledge graph ready — kg_query is live", "success"));
+				hint.setKg("ready");
 			} else if (event === "bash_rejected") {
 				addToChat(new Notice(`✕ bash rejected: ${data.reason}`, "danger"));
 			}
@@ -489,6 +518,45 @@ function onMessage(msg: ServerMessage & { type: string; [k: string]: unknown }):
 		case "command_output":
 			if (msg.text) addToChat(new Notice(msg.text));
 			break;
+		case "setup_start":
+			// first launch: serve runs the walkthrough before it is ready; the
+			// prompts below arrive next, then setup_end and finally ready
+			addToChat(new Notice("first run — setting up", "accent"));
+			break;
+		case "setup_end":
+			busy = false;
+			tui.setFocus(editor);
+			tui.requestRender();
+			break;
+		case "prompt_request": {
+			const id = Number(msg.id);
+			const answer = (value: string | null) => {
+				bridge?.prompt(id, value);
+				tui.setFocus(editor);
+				tui.requestRender();
+			};
+			if (Array.isArray(msg.choices)) {
+				const picker = new ChoicePicker(String(msg.prompt), msg.choices, msg.current ?? null);
+				picker.onDone = (v) => {
+					chat.removeChild(picker);
+					answer(v);
+				};
+				chat.addChild(picker);
+				tui.setFocus(picker);
+			} else {
+				const box = new PromptInput(String(msg.prompt), Boolean(msg.secret), String(msg.default ?? ""));
+				box.onDone = (v) => {
+					chat.removeChild(box);
+					// keep the question in scrollback; never the secret itself
+					addToChat(new Notice(`${msg.prompt}: ${!v ? "skipped" : msg.secret ? "••••" : v}`));
+					answer(v);
+				};
+				chat.addChild(box);
+				tui.setFocus(box);
+			}
+			tui.requestRender();
+			break;
+		}
 		case "reload": {
 			// serve asked us to respawn it fresh from disk, resuming this
 			// session's transcript so code/skill/tool changes take effect
@@ -542,7 +610,7 @@ if (!DEMO) {
 thinking.onAbort = () => {
 	if (DEMO) return; // demo handles its own abort
 	bridge?.interrupt();
-	addToChat(new Notice("interrupt requested — takes effect at the next harness step"));
+	addToChat(new Notice("interrupt requested — cancelling the in-flight request"));
 };
 
 editor.onSubmit = (text) => {
@@ -566,6 +634,9 @@ editor.onSubmit = (text) => {
 		// a /<skill> starts a real turn server-side: echo it, go busy and arm
 		// the per-turn stream guards exactly as typed input does, so the
 		// spinner, the interrupt key and the turn_end dedup all work for it
+		if (cmd === "setup") {
+			busy = true; // released by setup_end
+		}
 		if (skillNames.has(cmd)) {
 			addToChat(new UserMessage(trimmed));
 			busy = true;
@@ -592,6 +663,13 @@ editor.onSubmit = (text) => {
 };
 
 tui.setFocus(editor);
+
+/* ---------- branding: banner ---------- */
+
+// The wordmark prints ONCE at session start into scrollback. It is plain
+// output, not a Component, so resize and Ctrl-L never re-render it.
+// The one place the version and working directory appear.
+for (const line of renderBanner(`bird v0.1.0 · ${tildify(repo)}`, !accent.plain)) console.log(line);
 
 tui.addInputListener((data) => {
 	if (matchesKey(data, Key.ctrl("c"))) shutdown(0);

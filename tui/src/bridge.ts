@@ -32,6 +32,17 @@ export type ServerMessage =
 	| { type: "think_list"; current: string | null; modes: string[] }
 	| { type: "turn_end"; status: string; summary: string; turns: number; input_tokens?: number; output_tokens?: number }
 	| { type: "command_output"; text: string }
+	| { type: "setup_start" }
+	| { type: "setup_end" }
+	| {
+			type: "prompt_request";
+			id: number;
+			prompt: string;
+			secret?: boolean;
+			default?: string;
+			choices?: { value: string; label: string; description?: string }[];
+			current?: string | null;
+	  }
 	| { type: "reload"; run_id: string }
 	| { type: "error"; message: string }
 	| { type: "bye" };
@@ -157,6 +168,12 @@ export class Bridge {
 
 	permission(id: number, approved: boolean): void {
 		this.send({ type: "permission_response", id, approved });
+	}
+
+	/** Answer a prompt_request (setup walkthrough: key entry, model pick).
+	 * null means the user cancelled/skipped. */
+	prompt(id: number, value: string | null): void {
+		this.send({ type: "prompt_response", id, value });
 	}
 
 	interrupt(): void {

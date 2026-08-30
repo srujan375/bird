@@ -14,7 +14,7 @@ from typing import Callable
 
 from ..llm.registry import Registry, RegistryError
 from ..llm.types import Message
-from ..llm.wire.openai_compat import OpenAICompatClient, WireError
+from ..llm.wire.openai_compat import OpenAICompatClient, WireAborted, WireError
 
 TRIGGER_FRACTION = 0.90
 KEEP_RECENT_TOOL_RESULTS = 5
@@ -152,6 +152,8 @@ def compact(
         try:
             messages = summarize_older_half(messages, registry, client)
             stage = "stub+summarize"
+        except WireAborted:
+            raise  # the user interrupted; not a fallback situation
         except (WireError, RegistryError):
             # compactor model unreachable or not configured → trim-stubs fallback
             stage = "stub+trim"

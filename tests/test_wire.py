@@ -294,3 +294,74 @@ def test_stream_drop_after_delta_is_fatal(client, spec, httpx_mock):
         client.complete(spec, [Message(role="user", content="x")], on_delta=deltas.append)
     assert deltas == ["par"]  # partial text was delivered, but never retried/duplicated
     assert len(httpx_mock.get_requests()) == 1
+
+
+def test_abort_wakes_a_silent_stream_and_does_not_retry():
+    """A provider that accepts the request and then never sends a byte leaves
+    the client blocked in a socket read. abort() from another thread must
+    surface as WireAborted promptly, without burning the retry budget."""
+    import socket as _socket
+    import threading
+    import time as _time
+
+    from bird.llm.wire.openai_compat import WireAborted
+
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    accepted = []
+
+    def silent_server():
+        conn, _ = srv.accept()
+        accepted.append(conn)
+        # swallow the request headers+body, then send headers and go quiet
+        conn.settimeout(5)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += conn.recv(65536)
+        head, _, body = buf.partition(b"\r\n\r\n")
+        length = int([l for l in head.split(b"\r\n") if l.lower().startswith(b"content-length")][0].split(b":")[1])
+        while len(body) < length:
+            body += conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+        _time.sleep(30)
+
+    threading.Thread(target=silent_server, daemon=True).start()
+
+    client = OpenAICompatClient(timeout=60.0)
+    spec = ModelSpec(
+        spec="ollama:m", provider=ProviderConfig(name="ollama", base_url=f"http://127.0.0.1:{port}/v1"), model="m",
+    )
+    outcome = {}
+
+    def request():
+        try:
+            client.complete(spec, [Message(role="user", content="hi")], on_delta=lambda c: None)
+        except BaseException as e:  # noqa: BLE001
+            outcome["exc"] = e
+
+    t = threading.Thread(target=request, daemon=True)
+    t.start()
+    deadline = _time.time() + 5
+    while not accepted and _time.time() < deadline:
+        _time.sleep(0.01)
+    _time.sleep(0.3)  # let the request thread reach the blocking read
+    started = _time.time()
+    client.abort()
+    t.join(timeout=5)
+    assert not t.is_alive(), "request thread still blocked after abort()"
+    assert isinstance(outcome.get("exc"), WireAborted), outcome
+    assert _time.time() - started < 2.0
+    client.close()
+
+
+def test_abort_flag_sticks_until_cleared(client, spec, httpx_mock):
+    from bird.llm.wire.openai_compat import WireAborted
+
+    client.abort()  # nothing in flight: the flag is remembered
+    with pytest.raises(WireAborted):
+        client.complete(spec, [Message(role="user", content="hi")], on_delta=lambda c: None)
+    client.clear_abort()
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    assert client.complete(spec, [Message(role="user", content="hi")]).message.content == "ok"

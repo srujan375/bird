@@ -45,7 +45,9 @@ _DURABLE = ("store", "queue")
 
 
 def _text(node: Node) -> str:
-    return " ".join((node.detail, node.notes, node.responsibility)).lower()
+    facts = " ".join(f"{k} {v}" for k, v in node.facts.items())
+    items = " ".join(f"{i.k} {i.v} {i.d}" for i in node.items)
+    return " ".join((node.detail, node.notes, node.responsibility, facts, items)).lower()
 
 
 # ------------------------------------------------------------- the frontier
@@ -102,6 +104,9 @@ def coverage(state: ArchState) -> list[str]:
     # a box nothing in the design uses
     if len(state.nodes) > 1:
         for node in ours:
+            # a container is used through its members; it is not itself wired
+            if node.kind == "group" or state.children_of(node.id):
+                continue
             if not state.edges_touching(node.id):
                 out.append(
                     f"{node.id} is on no edge — nothing in the design uses it. Merge it "

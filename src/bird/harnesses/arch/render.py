@@ -46,17 +46,40 @@ def _node_line(node: Node, indent: str = "  ") -> str:
     return f"{indent}{_ident(node.id)}{open_b}{caption}{tail}{close_b}"
 
 
+def _emit_tree(state: ArchState, nodes: list[Node], indent: str, lines: list[str], placed: set[str]) -> None:
+    """Draw `nodes` at this level; a node with members becomes a subgraph and
+    its members are drawn inside it, recursively."""
+    for node in nodes:
+        if node.id in placed:
+            continue
+        placed.add(node.id)
+        members = [m for m in state.children_of(node.id) if m.id not in placed]
+        if not members:
+            lines.append(_node_line(node, indent))
+            continue
+        caption = _label(node.label or node.id)
+        if node.tech:
+            caption += f"<br/><i>{_label(node.tech)}</i>"
+        lines.append(f'{indent}subgraph {_ident(node.id)}["{caption}"]')
+        _emit_tree(state, members, indent + "  ", lines, placed)
+        lines.append(f"{indent}end")
+
+
 def board_mermaid(state: ArchState) -> str:
     """The whole board: shared structure, every approach beside it, greyed ones
-    included."""
+    included. Boxes with a `parent` are drawn inside it."""
     lines = ["flowchart LR"]
     placed: set[str] = set()
 
-    # each approach gets a box; only its exclusive nodes go inside it
+    def top(n: Node) -> bool:
+        # a member is drawn under its container, wherever the container lands
+        return not n.parent or n.parent not in state.nodes
+
+    # each approach gets a box; only its exclusive top-level nodes go inside it
     for app in state.approaches.values():
         exclusive = [
             n for n in state.nodes.values()
-            if n.approaches == [app.id]
+            if n.approaches == [app.id] and top(n)
         ]
         if not exclusive:
             continue
@@ -64,14 +87,12 @@ def board_mermaid(state: ArchState) -> str:
         if app.status == "greyed" and app.rejected_reason:
             caption += f"<br/><i>not taken: {_label(app.rejected_reason)}</i>"
         lines.append(f'  subgraph {_ident(app.id)}["{caption}"]')
-        for node in exclusive:
-            lines.append(_node_line(node, "    "))
-            placed.add(node.id)
+        _emit_tree(state, exclusive, "    ", lines, placed)
         lines.append("  end")
 
-    for node in state.nodes.values():
-        if node.id not in placed:
-            lines.append(_node_line(node))
+    _emit_tree(state, [n for n in state.nodes.values() if top(n)], "  ", lines, placed)
+    # a member whose container was drawn nowhere (should not happen) still gets a box
+    _emit_tree(state, list(state.nodes.values()), "  ", lines, placed)
 
     for edge in state.edges:
         arrow = _EDGE_ARROWS.get(edge.kind, "-->")

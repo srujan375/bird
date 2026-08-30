@@ -314,7 +314,7 @@ def _no_ambient_kg_config(monkeypatch):
         monkeypatch.setitem(BACKENDS[name], "base_url", BACKENDS[name]["base_url"])
 
 
-def _models_json(tmp_path, spec="ollama:kimi-k3", base_url="https://ollama.com/v1"):
+def _models_json(tmp_path, spec="ollama:kimi-k3:cloud", base_url="https://ollama.com/v1"):
     """A models.json whose `kg` alias resolves to `spec`."""
     provider = spec.split(":", 1)[0]
     path = tmp_path / "models.json"
@@ -518,7 +518,8 @@ def test_unsendable_base_url_disables_extraction(doc_repo, tmp_path, monkeypatch
 
     monkeypatch.setattr("graphify.llm.extract_corpus_parallel", boom)
     monkeypatch.setenv("OLLAMA_API_KEY", "sk-ollama-test")
-    models = _models_json(tmp_path, base_url="ftp://exfil.example/v1")
+    # unmarked spec: a custom provider URL only ever applies to the local route
+    models = _models_json(tmp_path, spec="ollama:kimi-k3", base_url="ftp://exfil.example/v1")
     assert KG(doc_repo, models_json=models).build().nodes > 0
 
 

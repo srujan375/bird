@@ -332,11 +332,85 @@ def reverse_seed(subgraph: Subgraph, scope: str) -> SeedResult:
             evidence=f"no responsibility inferred from code symbols in {f}; set it with `canvas`",
         ))
 
+    # ---- containers: one per directory that holds two or more boxes ----
+    # A big import is unreadable as a flat field of file boxes; the directory
+    # is the grouping the authors already chose, so it becomes a foldable box
+    # around its files. Single-file directories are not worth a container.
+    inferences.extend(_group_by_dir(boxes, file_to_cid))
+
     # ---- map kg edges → board edges (collapse mutual, dedupe by pair) ----
     board_edges, edge_inf = _map_edges(subgraph.edges, node_to_cid)
     inferences.extend(edge_inf)
 
     return SeedResult(nodes=boxes, edges=board_edges, inference_log=inferences)
+
+
+_DROPPED_DIRS = ("src", "lib", "app", "internal")
+
+
+def _file_dir_parts(file_path: str) -> list[str]:
+    p = kgmod._norm_path(file_path)
+    parts = [pt for pt in p.split("/") if pt and pt not in _DROPPED_DIRS]
+    return parts[:-1]
+
+
+def _group_by_dir(boxes: list[Node], file_to_cid: dict[str, str]) -> list[Inference]:
+    """Wrap the boxes of each directory in a `group` box, in place.
+
+    Nested directories nest: `bird/context/kg.py` sits in `bird-context`, which
+    sits in `bird`. A directory with a single file gets no container of its own —
+    its file joins the nearest ancestor that has more than one member.
+    """
+    by_dir: dict[tuple[str, ...], list[str]] = defaultdict(list)
+    for f, cid in file_to_cid.items():
+        parts = tuple(_file_dir_parts(f))
+        for depth in range(1, len(parts) + 1):
+            by_dir[parts[:depth]].append(cid)
+    # a directory is a container when it holds two or more boxes and is not a
+    # pass-through — a directory whose only content is one subdirectory would
+    # draw two rectangles around the same members
+    worth: set[tuple[str, ...]] = set()
+    for d, members in by_dir.items():
+        if len(members) < 2:
+            continue
+        passthrough = any(
+            len(d2) == len(d) + 1 and d2[: len(d)] == d and len(m2) == len(members)
+            for d2, m2 in by_dir.items()
+        )
+        if not passthrough:
+            worth.add(d)
+    if not worth:
+        return []
+    taken = {b.id for b in boxes}
+    gid: dict[tuple[str, ...], str] = {}
+    groups: list[Node] = []
+    inferences: list[Inference] = []
+    for d in sorted(worth, key=len):
+        raw = "-".join(d)
+        cid = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "dir"
+        if not cid[0].isalpha():
+            cid = "d-" + cid
+        while cid in taken:
+            cid += "-group"
+        taken.add(cid)
+        gid[d] = cid
+        parent = next((gid[d[:k]] for k in range(len(d) - 1, 0, -1) if d[:k] in gid), "")
+        groups.append(Node(
+            id=cid, label=d[-1], kind="group", depth="stub", existing=True,
+            parent=parent, notes=f"imported from the repo; directory {'/'.join(d)}",
+        ))
+        inferences.append(Inference(
+            node_id=cid, field="parent", value=parent or "(top)", confidence="high",
+            evidence=f"container for directory {'/'.join(d)}",
+        ))
+    by_id = {b.id: b for b in boxes}
+    for f, cid in file_to_cid.items():
+        parts = tuple(_file_dir_parts(f))
+        home = next((gid[parts[:k]] for k in range(len(parts), 0, -1) if parts[:k] in gid), "")
+        if home and cid in by_id:
+            by_id[cid].parent = home
+    boxes.extend(groups)
+    return inferences
 
 
 def _file_to_cid(file_path: str) -> str:

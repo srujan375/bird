@@ -145,6 +145,14 @@ def _sheet(state: ArchState, node: Node) -> list[str]:
         lines.append("")
     if node.tech:
         lines.append(f"- **built on:** {node.tech}")
+    for k, v in node.facts.items():
+        lines.append(f"- **{k}:** {v}")
+    if node.items:
+        from .state import KIND_LIST
+        lines.append(f"- **{KIND_LIST.get(node.kind, ('items', ''))[0]}:**")
+        for it in node.items:
+            head = f"`{it.k}` {it.v}" if it.k else it.v
+            lines.append(f"  - {head}" + (f" — {it.d}" if it.d else ""))
     if node.notes:
         lines.append(f"- **notes:** {node.notes}")
     out = [e for e in state.edges if e.src == node.id]

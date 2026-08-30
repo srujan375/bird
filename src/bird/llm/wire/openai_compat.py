@@ -9,6 +9,8 @@ tool calls and model misbehavior are the runner's problem (decision #7).
 from __future__ import annotations
 
 import json
+import socket
+import threading
 import time
 from typing import Any, Callable
 
@@ -41,6 +43,11 @@ class WireError(Exception):
     """Transport or protocol failure after retries were exhausted."""
 
 
+class WireAborted(WireError):
+    """The in-flight request was torn down by `abort()` — an interrupt, not a
+    provider failure. Never retried."""
+
+
 # Streaming callback: called with each assistant-text fragment as it arrives,
 # with "" as a cancellation-check heartbeat on chunks that carry no text
 # (thinking/tool-call deltas), then once with None after the message's text
@@ -51,9 +58,60 @@ OnDelta = Callable[[str | None], None]
 class OpenAICompatClient:
     def __init__(self, timeout: float = 300.0):
         self._http = httpx.Client(timeout=timeout)
+        # abort() runs on a different thread than the request it kills: the
+        # lock guards the in-flight response handle, the flag tells the
+        # request thread that whatever error it just saw was self-inflicted
+        self._lock = threading.Lock()
+        self._inflight: httpx.Response | None = None
+        self._aborted = False
 
     def close(self) -> None:
         self._http.close()
+
+    def abort(self) -> None:
+        """Tear down the in-flight streaming request from another thread.
+
+        A cooperative cancel flag is only ever seen when a chunk arrives; a
+        provider that has stopped sending leaves the request thread blocked
+        in the socket read with nothing to check it. Shutting the socket
+        wakes that read immediately, and `_stream_with_retries` reports
+        WireAborted instead of retrying. Idempotent; a no-op when idle (the
+        flag still sticks until `clear_abort`, so an interrupt that lands
+        between requests aborts the next one rather than being lost)."""
+        with self._lock:
+            self._aborted = True
+            resp = self._inflight
+        if resp is None:
+            return
+        try:
+            stream = resp.extensions.get("network_stream")
+            sock = stream.get_extra_info("socket") if stream is not None else None
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass  # already closed, or a transport without a raw socket
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+    def clear_abort(self) -> None:
+        """Arm the client for a new turn after an abort."""
+        with self._lock:
+            self._aborted = False
+
+    @property
+    def aborted(self) -> bool:
+        return self._aborted
+
+    def _set_inflight(self, resp: httpx.Response | None) -> None:
+        with self._lock:
+            self._inflight = resp
+            aborted = self._aborted
+        # abort() raced us: it saw no in-flight response, so it could not
+        # close this one — do it ourselves rather than block on a dead read
+        if aborted and resp is not None:
+            self.abort()
 
     def complete(
         self,
@@ -146,16 +204,33 @@ class OpenAICompatClient:
         hard WireError."""
         last_error = ""
         for attempt in range(MAX_TRANSPORT_ATTEMPTS):
+            if self._aborted:
+                raise WireAborted(f"request to {url} aborted")
             emitted = [False]
             try:
                 with self._http.stream("POST", url, json=payload, headers=headers) as resp:
-                    if resp.status_code == 200:
-                        return self._consume_sse(resp, on_delta, emitted, on_thinking)
-                    resp.read()
+                    self._set_inflight(resp)
+                    try:
+                        if resp.status_code == 200:
+                            return self._consume_sse(resp, on_delta, emitted, on_thinking)
+                        resp.read()
+                    finally:
+                        self._set_inflight(None)
                     last_error = f"HTTP {resp.status_code}: {resp.text[:500]}"
                     if resp.status_code not in RETRYABLE_STATUS:
                         raise WireError(f"{url} -> {last_error}")
-            except httpx.HTTPError as e:
+            except WireError:
+                if self._aborted:
+                    raise WireAborted(f"request to {url} aborted") from None
+                raise
+            except Exception as e:
+                # an aborted socket surfaces as whatever httpx/httpcore was in
+                # the middle of (ReadError, StreamClosed, RemoteProtocolError,
+                # a bare OSError) — none of it is the provider's doing
+                if self._aborted:
+                    raise WireAborted(f"request to {url} aborted") from None
+                if not isinstance(e, httpx.HTTPError):
+                    raise
                 if emitted[0]:
                     raise WireError(f"stream from {url} dropped mid-response: {e}") from e
                 last_error = f"connection error: {e}"

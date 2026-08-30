@@ -188,7 +188,8 @@ describe("columns", () => {
 describe("estimated heights", () => {
   const box = (over: Partial<BoardNode> = {}): BoardNode => ({
     id: "n", lane: "", slot: "", cx: 0, y: 0, kind: "service", depth: "stub",
-    label: "n", resp: "", tech: "", rows: [], approaches: [], existing: false,
+    label: "n", resp: "", tech: "", rows: [], facts: [], listName: "operations", items: [], derived: [],
+    approaches: [], existing: false,
     ...over,
   });
 
@@ -196,8 +197,8 @@ describe("estimated heights", () => {
      it has to be in the right neighbourhood, not exact. The figures come from
      measuring the rendered board. */
   it("lands near what the board actually renders", () => {
-    expect(estimateHeight(box({ label: "permissions" }))).toBeGreaterThan(30);
-    expect(estimateHeight(box({ label: "permissions" }))).toBeLessThan(50);
+    expect(estimateHeight(box({ label: "permissions" }))).toBeGreaterThan(36);
+    expect(estimateHeight(box({ label: "permissions" }))).toBeLessThan(60);
     const detailed = box({
       depth: "detailed",
       label: "MCP config discovery",
@@ -206,8 +207,8 @@ describe("estimated heights", () => {
       tech: "JSON, same precedence semantics as skills.py",
       rows: ["Precedence, first-wins on server-name collisions"],
     });
-    expect(estimateHeight(detailed)).toBeGreaterThan(120);
-    expect(estimateHeight(detailed)).toBeLessThan(190);
+    expect(estimateHeight(detailed)).toBeGreaterThan(150);
+    expect(estimateHeight(detailed)).toBeLessThan(260);
   });
 
   it("grows with the prose rather than the depth alone", () => {

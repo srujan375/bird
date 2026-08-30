@@ -3,7 +3,7 @@ import type { Anno, BoardNode, Lane, Wire } from "./types";
 
 /** A box's width is its fidelity. Widening on deepen is the whole reason
  *  positions are stored as a centre-x. */
-export const W: Record<string, number> = { stub: 176, sketch: 216, detailed: 252 };
+export const W: Record<string, number> = { stub: 208, sketch: 264, detailed: 328 };
 export const STEP = ["stub", "sketch", "detailed"] as const;
 
 export const snap = (v: number) => Math.round(v / 8) * 8;
@@ -25,6 +25,10 @@ export interface Rect { x: number; y: number; w: number; h: number }
 export type Heights = Record<string, number>;
 
 export function rect(n: BoardNode, heights: Heights): Rect {
+  // an open container is as big as what is inside it, not as its depth says
+  if (n.group && !n.group.folded) {
+    return { x: n.cx - n.group.w / 2, y: n.y, w: n.group.w, h: n.group.h };
+  }
   const w = W[n.depth];
   return { x: n.cx - w / 2, y: n.y, w, h: heights[n.id] ?? 44 };
 }
@@ -64,6 +68,8 @@ export function ends(a: Rect, b: Rect) {
 
 export interface WirePath {
   key: string;
+  from: string;
+  to: string;
   d: string;
   out: boolean;
   fresh: boolean;
@@ -104,11 +110,11 @@ export function wirePaths(
   heights: Heights,
   fresh: Set<string> | null,
 ): WirePath[] {
-  const byId = (id: string) => nodes.find((n) => n.id === id);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
   const out: WirePath[] = [];
   for (const wr of wires) {
-    const a = byId(wr.from);
-    const b = byId(wr.to);
+    const a = byId.get(wr.from);
+    const b = byId.get(wr.to);
     if (!a || !b) continue;
     const [p0, c1, c2, p1] = ends(rect(a, heights), rect(b, heights));
     out.push({
@@ -116,7 +122,10 @@ export function wirePaths(
       d: `M${p0.x} ${p0.y} C${c1.x} ${c1.y} ${c2.x} ${c2.y} ${p1.x} ${p1.y}`,
       out: Boolean(wr.out || a.out || b.out),
       fresh: Boolean(fresh && fresh.has(wr.from + ">" + wr.to)),
-      label: wr.label,
+      from: wr.from,
+      to: wr.to,
+      // a bundled wire says how many edges it stands for instead of a label
+      label: (wr.count ?? 1) > 1 ? `×${wr.count}` : wr.label,
       /* the point the curve actually passes through at its middle, which for a
          symmetric cubic is the midpoint of its ends */
       lx: (p0.x + p1.x) / 2,

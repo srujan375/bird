@@ -182,59 +182,177 @@ p{ margin:0; text-wrap:pretty; }
   font-family:var(--font-mono); font-size:10.5px; fill:var(--ink-2);
   paint-order:stroke; stroke:var(--bg); stroke-width:4px; stroke-linejoin:round;
 }
+/* Pointing at a box answers "what is this connected to": its wires come
+   forward and every other wire steps back. On a busy board the labels only
+   come with the pointing — eighteen labels at once is a caption on nothing. */
+.wires[data-focus="1"] g:not([data-lit="1"]) path.wire{ opacity:.14; }
+.wires[data-focus="1"] g:not([data-lit="1"]) text.wire-label{ opacity:0; }
+.wires g[data-lit="1"] text.wire-label{ fill:var(--accent-ink); }
+.wires[data-quiet="1"] g:not([data-lit="1"]) text.wire-label{ opacity:0; }
+.wires path.wire, .wires text.wire-label{ transition:opacity .18s var(--ease-in-out); }
 @keyframes draw{ to{ stroke-dashoffset:0; } }
 .wires path.drawing{ animation:draw .85s var(--ease-out) forwards; }
 
+/* ─── containers ──────────────────────────────────────────────────────── */
+/* An open container is ground, not a card: its members stand on it, and it
+   is drawn under them. Folded, it is a card like any other, with a count. */
+.node[data-group="open"]{
+  background:color-mix(in oklch, var(--lane-tint, var(--surface)) 55%, var(--surface));
+  border:1px solid color-mix(in oklch, var(--lane-line, var(--border)) 55%, var(--border));
+  border-left:3px solid var(--lane-line, var(--border));
+  border-radius:14px; box-shadow:none; padding:11px 14px 0 13px;
+  cursor:grab;
+}
+.node[data-group="open"] .node-head{ height:20px; }
+.node[data-group="open"] .node-label{ font-weight:600; letter-spacing:.01em; }
+.node[data-group="folded"]{ border-style:solid; border-width:1.5px; box-shadow:0 1px 2px color-mix(in oklch, var(--fg) 7%, transparent), 3px 3px 0 -1px var(--surface), 3px 3px 0 0 var(--border); }
+.node-count{ flex:none; margin-left:auto; font-size:10.5px; letter-spacing:.06em; color:var(--ink-2); white-space:nowrap; }
+.node[data-group] .node-label{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.fold{
+  flex:none; width:16px; height:16px; margin-right:-2px; padding:0;
+  border:1px solid var(--fg-hair); border-radius:4px; background:var(--surface);
+  color:var(--ink-2); font:600 12px/1 var(--font-mono); cursor:pointer;
+  align-self:center;
+}
+.fold:hover{ color:var(--fg); border-color:var(--fg); }
+
+/* ─── fields ──────────────────────────────────────────────────────────── */
+/* Selected, the card opens into fields: every section it could carry, framed
+   and labelled, filled or holding a prompt. A field being typed into takes
+   the accent ring; the rest stay quiet. Deselected, the frames fold away and
+   the card is the plain card again. */
+.node[data-fields="1"] [data-field]{
+  position:relative; display:block; padding:4px 7px; margin-left:-7px; margin-right:-7px;
+  border:1px solid color-mix(in oklch, var(--fg) 14%, transparent); border-radius:6px; background:var(--surface);
+  cursor:text; white-space:normal; overflow:visible; text-overflow:clip;
+}
+.node[data-fields="1"] [data-field]:hover{ border-color:color-mix(in oklch, var(--fg) 34%, transparent); }
+.node[data-fields="1"] [data-field][data-tag]::after{
+  content:attr(data-tag); position:absolute; right:6px; top:-7px; padding:0 4px; background:var(--surface);
+  font-family:var(--font-mono); font-size:9px; font-weight:500; letter-spacing:.08em; text-transform:uppercase; color:var(--muted);
+}
+.node[data-fields="1"] .node-label[data-field]{ margin:0 0 0 -7px; }
+.node[data-fields="1"] .node-resp{ margin-top:10px; }
+.node[data-fields="1"] .kv{ row-gap:7px; }
+.node[data-fields="1"] .kv dd[data-field]{ margin-left:-7px; margin-right:0; }
+.node[data-fields="1"] .rows li[data-field]{ display:grid; padding:4px 7px; margin-top:4px; border-top:0; }
+.node[data-fields="1"] .rows li.add .v{ color:var(--muted); font-style:italic; }
+.node[data-fields="1"] .rows .prose[data-field]{ margin-top:2px; }
+.node [data-field][data-empty="1"]{ color:var(--muted); font-style:italic; }
+.node [data-field][contenteditable]{
+  border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); outline:none;
+  user-select:text; font-style:normal; color:var(--fg);
+}
+.node [data-field][contenteditable][data-tag]::after{ color:var(--accent-ink); }
+.node-label[contenteditable="true"]{ border-bottom-width:1px; }
+/* kind: a pick, not typing */
+.node-kind-wrap{ position:relative; flex:none; }
+.node-kind[data-role="kind"]{ border:0; cursor:default; }
+.node[data-fields="1"] .node-kind[data-role="kind"]{
+  cursor:pointer; padding-right:18px; border:1px solid color-mix(in oklch, var(--fg) 14%, transparent); background:var(--surface);
+}
+.node[data-fields="1"] .node-kind[data-role="kind"]::after{
+  content:""; position:absolute; right:7px; top:50%; width:5px; height:5px; margin-top:-4px;
+  border-right:1.2px solid currentColor; border-bottom:1.2px solid currentColor; transform:rotate(45deg);
+}
+.node[data-fields="1"] .node-kind[aria-expanded="true"]{ border-color:var(--accent); color:var(--accent-ink); }
+.kind-menu{
+  position:absolute; right:0; top:calc(100% + 6px); z-index:3; width:150px; margin:0; padding:4px; list-style:none;
+  background:var(--surface); border:1px solid var(--border); border-radius:9px;
+  box-shadow:0 6px 20px color-mix(in oklch, var(--fg) 12%, transparent);
+}
+.kind-menu li{
+  padding:5px 8px; border-radius:6px; font-family:var(--font-mono); font-size:11.5px; letter-spacing:.04em; color:var(--fg); cursor:pointer;
+}
+.kind-menu li:hover{ background:var(--fg-soft); }
+.kind-menu li[data-on="1"]{ background:var(--accent-dim); color:var(--accent-ink); }
+/* the keys strip that sits under a box while a field is live */
+.keys{
+  position:absolute; left:50%; transform:translateX(-50%); bottom:-26px; display:flex; gap:10px; white-space:nowrap;
+  font-family:var(--font-mono); font-size:10.5px; letter-spacing:.02em; color:var(--ink-2);
+}
+.keys b{ font-weight:500; padding:1px 5px; border:1px solid var(--fg-hair); border-bottom-width:2px; border-radius:4px; background:var(--surface); color:var(--fg); }
+
 /* ─── node ────────────────────────────────────────────────────────────── */
+/* The card has four sections, each a different shape: a sentence, a
+   key/value strip, a keyed list, a wire-derived footer. Same kind, same
+   shape — so a reader finds "what talks to this" in the same place on every
+   box. Nothing goes below 11px, and 11px is only for tracked caps labels. */
 .node{
   position:absolute; background:var(--surface);
   border:1px solid var(--border); border-radius:var(--r);
-  padding:9px 12px 10px; cursor:grab; user-select:none;
+  border-left:3px solid var(--lane-line, var(--border));
+  box-shadow:0 1px 2px color-mix(in oklch, var(--fg) 6%, transparent);
+  padding:12px 14px 12px 13px; cursor:grab; user-select:none;
   transition:border-color .2s var(--ease-in-out), box-shadow .2s var(--ease-in-out),
              transform .55s var(--ease-out), opacity .55s var(--ease-out);
 }
 .node:active{ cursor:grabbing; }
-.node[data-depth="stub"]{ border-style:dashed; background:color-mix(in oklch, var(--surface) 55%, transparent); }
-.node[data-depth="detailed"]{ box-shadow:0 1px 2px color-mix(in oklch, var(--fg) 7%, transparent); }
-.node[data-lane]{ border-color:color-mix(in oklch, var(--border) 50%, var(--lane-line, var(--border))); }
-.node:hover{ border-color:color-mix(in oklch, var(--fg) 30%, transparent); }
+.node[data-depth="stub"]{ border-style:dashed; border-left-style:solid; background:color-mix(in oklch, var(--surface) 55%, transparent); box-shadow:none; }
+.node:hover{ border-color:color-mix(in oklch, var(--fg) 30%, transparent); border-left-color:var(--lane-line, var(--border)); }
 .node:focus-visible{ outline:2px solid var(--accent); outline-offset:3px; border-radius:var(--r); }
 .node[data-sel="1"]{ border-color:var(--accent); border-style:solid; box-shadow:0 0 0 3px var(--accent-dim); }
 
-.node-head{ display:flex; align-items:baseline; gap:8px; }
+.node-head{ display:flex; align-items:center; gap:10px; }
 .node-label{
-  font-size:13.5px; font-weight:600; letter-spacing:-.008em; line-height:1.3;
+  font-family:var(--font-display); font-size:15px; font-weight:600; letter-spacing:-.01em; line-height:1.25;
   flex:1; min-width:0; overflow-wrap:anywhere;
 }
 .node-label[contenteditable="true"]{
   outline:none; border-bottom:1.5px solid var(--accent); cursor:text; user-select:text;
 }
 .node-kind{
-  font-family:var(--font-mono); font-size:10px; letter-spacing:.06em;
-  color:var(--ink-2); flex:none;
+  font-family:var(--font-mono); font-size:10.5px; font-weight:600; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--ink-2); background:var(--fg-soft); border-radius:5px; padding:4px 6px; flex:none; line-height:1;
 }
 .node-resp{
-  font-size:12.5px; line-height:1.42; color:var(--ink-2); margin-top:5px;
+  font-size:13.5px; line-height:1.45; color:var(--ink-2); margin:8px 0 0;
 }
-.node-deep{ margin-top:9px; border-top:1px solid var(--border); padding-top:8px; }
-.node-tech{
-  font-family:var(--font-mono); font-size:11px; color:var(--fg); letter-spacing:-.01em;
+/* key/value strip: the kind's fixed vocabulary, same shape on every box */
+.kv{
+  display:grid; grid-template-columns:auto 1fr; column-gap:14px; row-gap:5px;
+  margin:12px 0 0; padding-top:10px; border-top:1px solid var(--border);
 }
-.node-rows{ list-style:none; margin:7px 0 0; padding:0; display:grid; gap:3px; }
-.node-rows li{
-  font-family:var(--font-mono); font-size:11px; color:var(--ink-2);
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+.kv dt{ font-family:var(--font-mono); font-size:11px; font-weight:500; line-height:1.5; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin:0; }
+.kv dd{ margin:0; font-family:var(--font-mono); font-size:12.5px; font-weight:500; line-height:1.5; letter-spacing:-.005em; color:var(--fg); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.kv dd.wrap{ white-space:normal; }
+.kv dd.empty{ color:var(--muted); font-weight:400; }
+.kv .chip{ display:inline-block; background:var(--fg-soft); border-radius:4px; padding:1px 6px; font-size:11.5px; }
+/* the list: endpoints / entities / topics / screens / tools */
+.rows{ margin-top:12px; padding-top:10px; border-top:1px solid var(--border); }
+.rows-head{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px; }
+.rows-head span:first-child{ font-family:var(--font-mono); font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.rows-head span:last-child{ font-family:var(--font-mono); font-size:11px; font-weight:500; color:var(--muted); }
+.rows ul{ list-style:none; margin:0; padding:0; }
+.rows li{
+  display:grid; grid-template-columns:auto 1fr; column-gap:10px; align-items:baseline;
+  font-family:var(--font-mono); font-size:12.5px; line-height:1.45; letter-spacing:-.005em; padding:3px 0;
 }
+.rows li+li{ border-top:1px dashed var(--fg-hair); }
+.rows li .k{ color:var(--accent); font-weight:600; min-width:38px; }
+.rows li .k:empty{ min-width:0; }
+.rows li .v{ color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rows li .d{ color:var(--ink-2); grid-column:2; font-family:var(--font-body); font-size:12px; line-height:1.35; white-space:normal; }
+.rows .prose{ font-family:var(--font-mono); font-size:12.5px; line-height:1.45; color:var(--fg); white-space:pre-line; }
+.rows .more{ font-family:var(--font-mono); font-size:11.5px; font-weight:500; color:var(--muted); padding:6px 0 0; }
+/* derived from wires — never typed */
+.derived{
+  margin-top:12px; padding-top:9px; border-top:1px solid var(--border);
+  display:flex; flex-wrap:wrap; gap:6px 14px; font-family:var(--font-mono); font-size:11.5px; font-weight:500; line-height:1.4; color:var(--ink-2);
+}
+.derived b{ font-weight:600; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; font-size:10.5px; margin-right:4px; }
+.derived i{ font-style:normal; color:var(--fg); }
+.derived .grp{ white-space:nowrap; }
+.derived i+i::before{ content:" · "; color:var(--muted); }
 
 /* retired */
-.node[data-out="1"]{ background:transparent; border-style:dashed; border-color:var(--border); box-shadow:none; }
+.node[data-out="1"]{ background:transparent; border-style:dashed; border-color:var(--border); box-shadow:none; opacity:.72; }
 .node[data-out="1"] .node-label{
   color:var(--ink-2); font-weight:500;
   text-decoration:line-through;
   text-decoration-color:color-mix(in oklch, var(--muted) 55%, transparent);
 }
-.node[data-out="1"] .node-resp,.node[data-out="1"] .node-rows li{ color:var(--muted); }
-.node[data-out="1"] .node-tech{ color:var(--ink-2); }
+.node[data-out="1"] .node-resp,.node[data-out="1"] .rows li{ color:var(--muted); }
 
 /* the just-changed halo */
 @keyframes halo{
@@ -249,8 +367,8 @@ p{ margin:0; text-wrap:pretty; }
 
 /* deepening — the box grows and the new lines rise into it */
 @keyframes grew{ from{ opacity:0; transform:translateY(24px); } to{ opacity:1; transform:none; } }
-.node.grew .node-resp,.node.grew .node-deep{ animation:grew .55s var(--ease-out) both; }
-.node.grew .node-deep{ animation-delay:.09s; }
+.node.grew .node-resp,.node.grew .kv,.node.grew .rows,.node.grew .derived{ animation:grew .55s var(--ease-out) both; }
+.node.grew .rows{ animation-delay:.09s; }
 
 /* port */
 .port{

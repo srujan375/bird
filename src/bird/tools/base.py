@@ -107,6 +107,10 @@ class ToolContext:
     # forked from this ctx inherits the gate. None = ungated (library/test use);
     # every cli.py entry point sets one.
     broker: Any | None = None
+    # live mcp.client.McpClient instances mounted by build_runner (one per
+    # configured MCP server). The REPL reads this for /mcp status; empty when
+    # no mcp.json configured any servers.
+    mcp_clients: list[Any] = field(default_factory=list)
     # --- verification ledger ---
     # "Verify your change" was an instruction, and instructions are the thing
     # the engine is supposed to replace: across 67 logged sessions, 8 of 21

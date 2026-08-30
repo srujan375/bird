@@ -121,3 +121,57 @@ def test_builtin_models_json_loads():
     for alias in ("default", "architect", "compactor"):
         spec = reg.resolve(alias)
         assert spec.spec and spec.context_window > 0
+
+
+# --- ollama routing: the model name decides cloud vs local -------------------
+
+def test_cloud_marker_routes_to_ollama_com(registry):
+    spec = registry.resolve("ollama:glm-5.3-flash:cloud")
+    assert spec.spec == "ollama:glm-5.3-flash:cloud"  # the key stays intact
+    assert spec.model == "glm-5.3-flash"  # the hosted catalog knows no marker
+    assert spec.provider.native_url == "https://ollama.com"
+    assert spec.provider.base_url == "https://ollama.com/v1"
+    assert spec.provider.api_key_env == "OLLAMA_API_KEY"
+
+
+def test_tagged_cloud_marker(registry):
+    spec = registry.resolve("ollama:gpt-oss:120b-cloud")
+    assert spec.model == "gpt-oss:120b"
+    assert spec.provider.native_url == "https://ollama.com"
+
+
+def test_unmarked_model_stays_local_even_if_provider_points_at_cloud(tmp_path):
+    data = {
+        "providers": {"ollama": {"base_url": "https://ollama.com/v1", "native_url": "https://ollama.com"}},
+        "models": {},
+        "aliases": {},
+    }
+    p = tmp_path / "models.json"
+    p.write_text(json.dumps(data))
+    spec = Registry.load(p).resolve("ollama:ornith:35b")
+    assert spec.model == "ornith:35b"
+    assert spec.provider.native_url == "http://localhost:11434"
+    assert spec.provider.base_url == "http://localhost:11434/v1"
+
+
+def test_unmarked_model_honours_a_custom_local_daemon(tmp_path):
+    data = {
+        "providers": {"ollama": {"base_url": "http://gpubox:11434/v1", "native_url": "http://gpubox:11434"}},
+        "models": {},
+        "aliases": {},
+    }
+    p = tmp_path / "models.json"
+    p.write_text(json.dumps(data))
+    spec = Registry.load(p).resolve("ollama:ornith")
+    assert spec.provider.native_url == "http://gpubox:11434"
+
+
+def test_split_and_add_cloud_marker_roundtrip():
+    from bird.llm.registry import add_cloud_marker, split_cloud_marker
+
+    for plain in ("glm-5.3", "gpt-oss:120b", "deepseek-v4-flash:0731"):
+        marked = add_cloud_marker(plain)
+        assert split_cloud_marker(marked) == (plain, True)
+        assert add_cloud_marker(marked) == marked
+    assert split_cloud_marker("ornith:35b") == ("ornith:35b", False)
+    assert split_cloud_marker("cloud") == ("cloud", False)

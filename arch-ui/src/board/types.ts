@@ -42,10 +42,24 @@ export interface BoardNode {
   label: string;
   resp: string;
   tech: string;
+  /** prose detail, one line each — drawn as the list when there are no items */
   rows: string[];
+  /** the kind's facts in vocabulary order; a missing one is [key, ""] */
+  facts: Array<[string, string]>;
+  /** what the list is called for this kind */
+  listName: string;
+  items: Array<{ k: string; v: string; d: string }>;
+  /** who is wired to this box, by side, read off the edges at render */
+  derived: Array<{ side: string; names: string[] }>;
   approaches: string[];
   existing: boolean;
   out?: boolean;
+  /** the container this box sits inside, if any */
+  parent?: string;
+  /** set on a box that holds other boxes. Folded, it is drawn as one card and
+   *  its members are not drawn at all; open, it is a rectangle `w`×`h` with
+   *  the members laid out inside it. */
+  group?: { folded: boolean; count: number; w: number; h: number };
 }
 
 export interface Wire {
@@ -55,6 +69,9 @@ export interface Wire {
   kind?: string;
   notes?: string;
   out?: boolean;
+  /** how many of the design's edges this one wire stands for — more than one
+   *  when both ends of several edges fold into the same two containers */
+  count?: number;
 }
 
 export interface Anno {
@@ -68,6 +85,10 @@ export interface Anno {
 }
 
 export type Selection = { t: "node" | "anno"; id: string };
+
+/** A part of a box a person can type into, right on the card — see
+ *  `FieldId` in NodeCard.tsx for the grammar. */
+export type NodeField = string;
 
 export interface Attachment {
   id: string;

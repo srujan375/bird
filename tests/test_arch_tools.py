@@ -336,3 +336,31 @@ def test_arch_tools_refuse_outside_an_arch_session(tmp_path):
     tools = {t.name: t for t in arch_harness_tools()}
     res = tools["canvas"].execute({"nodes": [{"label": "x"}]}, ctx)
     assert res.is_error and "not an architecture session" in res.output
+
+
+def test_canvas_merges_facts_and_replaces_items(session_and_ctx=None):
+    from bird.harnesses.arch.tools import _upsert_node
+    from bird.harnesses.arch.session import ArchSession
+    import inspect
+    # build a bare session the way the other tool tests do, if a helper exists
+    try:
+        from tests.test_arch_tools import _session as mk  # type: ignore
+        session = mk()
+    except Exception:
+        session = None
+    if session is None:
+        from bird.harnesses.arch.state import ArchState
+        class S:  # minimal stand-in: _upsert_node only touches .state
+            state = ArchState()
+        session = S()
+    auto = []
+    _upsert_node(session, {"id": "api", "label": "API", "kind": "api",
+                           "facts": {"protocol": "http", "auth": "session"},
+                           "items": ["/state", {"k": "POST", "v": "/mutate", "d": "one op"}]}, auto)
+    n = session.state.nodes["api"]
+    assert n.facts == {"protocol": "http", "auth": "session"}
+    assert [i.k for i in n.items] == ["GET", "POST"]
+    _upsert_node(session, {"id": "api", "facts": {"auth": ""}, "items": [{"v": "/events"}]}, auto)
+    n = session.state.nodes["api"]
+    assert n.facts == {"protocol": "http"}
+    assert [i.v for i in n.items] == ["/events"]

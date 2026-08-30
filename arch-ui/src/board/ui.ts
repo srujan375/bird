@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { Selection, Tool } from "./types";
+import type { NodeField, Selection, Tool } from "./types";
 
 /**
  * What the browser owns.
@@ -28,7 +28,13 @@ export interface UiState {
    *  pinned to is no longer what is selected. */
   noteDrafts: Record<string, { x: number; y: number; anchor?: string }>;
   /** a box being renamed or a note being typed into */
-  editing: { t: "node" | "anno"; id: string } | null;
+  editing: { t: "node" | "anno"; id: string; field?: NodeField } | null;
+  /** container id -> whether it is folded shut. Unset means the board's
+   *  default for its size; this is the person's override, and it is theirs
+   *  alone — the harness never hears about it. */
+  folded: Record<string, boolean>;
+  /** the box under the pointer — what the wires light up for */
+  hot: string | null;
 }
 
 let state: UiState = {
@@ -38,6 +44,8 @@ let state: UiState = {
   drafts: {},
   noteDrafts: {},
   editing: null,
+  folded: {},
+  hot: null,
 };
 
 const listeners = new Set<() => void>();
@@ -57,6 +65,9 @@ export function useUi(): UiState {
 export const select = (selected: Selection | null) => setUi({ selected });
 export const setTool = (tool: Tool) => setUi({ tool });
 export const setEditing = (editing: UiState["editing"]) => setUi({ editing });
+export const setHot = (hot: string | null) => { if (hot !== state.hot) setUi({ hot }); };
+export const setFolded = (id: string, folded: boolean) =>
+  setUi({ folded: { ...state.folded, [id]: folded } });
 
 /** Halo a set of boxes. The nonce lets the same set flash twice in a row. */
 export const flash = (ids: string[]) =>

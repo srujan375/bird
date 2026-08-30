@@ -10,7 +10,7 @@ import type { ArchState, WireNode } from "../wire/types";
 
 const node = (id: string, over: Partial<WireNode> = {}): WireNode => ({
   id, label: id, kind: "service", responsibility: "", tech: "", depth: "stub",
-  detail: "", approaches: [], status: "active", notes: "", existing: false,
+  detail: "", facts: {}, items: [], approaches: [], status: "active", notes: "", existing: false, parent: "",
   x: null, y: null, ...over,
 });
 
@@ -210,5 +210,129 @@ describe("detail and notes", () => {
     const s = fork();
     s.annotations = [{ id: "n1", text: "moved", x: 40, y: 900, w: 190, anchor: "db" }];
     expect(toBoard(s).annos[0]).toMatchObject({ x: 40, y: 900 });
+  });
+});
+
+/**
+ * Containers: a box with members is drawn around them when open, as one card
+ * when folded, and the wires fold with it — so a big board reads as a handful
+ * of subsystems before it reads as sixty boxes.
+ */
+const nested = () => state({
+  nodes: {
+    ingest: node("ingest", { kind: "group" }),
+    parser: node("parser", { parent: "ingest" }),
+    queue: node("queue", { kind: "queue", parent: "ingest" }),
+    api: node("api", { kind: "api" }),
+    db: node("db", { kind: "store" }),
+  },
+  edges: [
+    { src: "api", dst: "parser", label: "raw", kind: "sync", notes: "" },
+    { src: "parser", dst: "queue", label: "", kind: "async", notes: "" },
+    { src: "queue", dst: "db", label: "rows", kind: "async", notes: "" },
+    { src: "parser", dst: "db", label: "meta", kind: "sync", notes: "" },
+  ],
+});
+
+describe("containers", () => {
+  it("lays members out inside an open container", () => {
+    const { nodes } = toBoard(nested(), {}, { ingest: false });
+    const g = nodes.find((n) => n.id === "ingest")!;
+    expect(g.group).toMatchObject({ folded: false, count: 2 });
+    expect(g.group!.w).toBeGreaterThan(0);
+    const gx0 = g.cx - g.group!.w / 2, gx1 = g.cx + g.group!.w / 2;
+    for (const id of ["parser", "queue"]) {
+      const m = nodes.find((n) => n.id === id)!;
+      expect(m.parent).toBe("ingest");
+      expect(m.cx).toBeGreaterThan(gx0);
+      expect(m.cx).toBeLessThan(gx1);
+      expect(m.y).toBeGreaterThan(g.y);
+      expect(m.y).toBeLessThan(g.y + g.group!.h);
+    }
+    // the container is drawn before its members, so it sits under them
+    expect(nodes.findIndex((n) => n.id === "ingest")).toBeLessThan(nodes.findIndex((n) => n.id === "parser"));
+  });
+
+  it("stacks members along their own wires", () => {
+    const { nodes } = toBoard(nested(), {}, { ingest: false });
+    const p = nodes.find((n) => n.id === "parser")!;
+    const q = nodes.find((n) => n.id === "queue")!;
+    expect(q.y).toBeGreaterThan(p.y);
+  });
+
+  it("folds members away and lands their wires on the container", () => {
+    const { nodes, wires } = toBoard(nested(), {}, { ingest: true });
+    expect(nodes.map((n) => n.id).sort()).toEqual(["api", "db", "ingest"]);
+    expect(nodes.find((n) => n.id === "ingest")!.group!.folded).toBe(true);
+    const keys = wires.map((w) => `${w.from}>${w.to}`).sort();
+    // parser->queue is internal and gone; queue->db and parser->db bundle
+    expect(keys).toEqual(["api>ingest", "ingest>db"]);
+    const bundled = wires.find((w) => w.from === "ingest")!;
+    expect(bundled.count).toBe(2);
+    expect(bundled.label).toBeUndefined();
+    expect(wires.find((w) => w.to === "ingest")!.label).toBe("raw");
+  });
+
+  it("opens small boards and folds big ones by default", () => {
+    expect(toBoard(nested()).nodes.find((n) => n.id === "ingest")!.group!.folded).toBe(false);
+    const big = nested();
+    for (let i = 0; i < 30; i++) big.nodes["x" + i] = node("x" + i);
+    expect(toBoard(big).nodes.find((n) => n.id === "ingest")!.group!.folded).toBe(true);
+  });
+
+  it("puts a member in its container's column", () => {
+    const s = nested();
+    s.approaches.a = { id: "a", name: "A", summary: "", status: "active", rejected_reason: "" };
+    s.nodes.ingest.approaches = ["a"];
+    const { nodes } = toBoard(s, {}, { ingest: false });
+    expect(nodes.find((n) => n.id === "parser")!.lane).toBe("a");
+  });
+
+  it("nests containers inside containers", () => {
+    const s = nested();
+    s.nodes.parse2 = node("parse2", { kind: "group", parent: "ingest" });
+    s.nodes.lexer = node("lexer", { parent: "parse2" });
+    const { nodes } = toBoard(s, {}, { ingest: false, parse2: false });
+    const outer = nodes.find((n) => n.id === "ingest")!;
+    const inner = nodes.find((n) => n.id === "parse2")!;
+    const leaf = nodes.find((n) => n.id === "lexer")!;
+    expect(inner.group!.folded).toBe(false);
+    expect(leaf.y).toBeGreaterThan(inner.y);
+    expect(inner.y).toBeGreaterThan(outer.y);
+    expect(outer.group!.h).toBeGreaterThan(inner.group!.h);
+  });
+});
+
+describe("dragging inside a container", () => {
+  it("keeps a hand-placed member where it was put and stretches the ground to it", () => {
+    const s = nested();
+    s.nodes.queue.x = 2000;
+    s.nodes.queue.y = 40;
+    const { nodes } = toBoard(s, {}, { ingest: false });
+    const q = nodes.find((n) => n.id === "queue")!;
+    const g = nodes.find((n) => n.id === "ingest")!;
+    expect(q.cx).toBe(2000);
+    expect(q.y).toBe(40);
+    expect(g.cx + g.group!.w / 2).toBeGreaterThan(2000);
+    expect(g.y).toBeLessThanOrEqual(40);
+  });
+});
+
+describe("what a box carries", () => {
+  it("lists the kind's facts in vocabulary order and names its list", () => {
+    const s = state({ nodes: { db: node("db", { kind: "store", facts: { retention: "90d", engine: "pg" } }) } });
+    const b = toBoard(s).nodes[0];
+    expect(b.facts.map(([k]) => k)).toEqual(["engine", "model", "durability", "retention"]);
+    expect(b.facts.find(([k]) => k === "engine")![1]).toBe("pg");
+    expect(b.listName).toBe("entities");
+  });
+
+  it("reads who is on each side of the wires off the edges", () => {
+    const s = nested();
+    const q = toBoard(s, {}, { ingest: false }).nodes.find((n) => n.id === "queue")!;
+    expect(q.derived).toEqual([
+      { side: "producers", names: ["parser"] },
+      { side: "consumers", names: ["db"] },
+    ]);
   });
 });

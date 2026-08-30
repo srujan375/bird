@@ -1,8 +1,9 @@
 """Model discovery: what can /model actually switch to right now?
 
-Three sources, merged and deduped by spec: models.json entries (always
-available), the local Ollama daemon's installed models, and OpenRouter's
-catalog when OPENROUTER_API_KEY is set. Sources that are unreachable or
+Four sources, merged and deduped by spec: models.json entries (always
+available), the local Ollama daemon's installed models, ollama.com's hosted
+catalog when OLLAMA_API_KEY is set (listed with the `:cloud` marker), and
+OpenRouter's catalog when OPENROUTER_API_KEY is set. Sources that are unreachable or
 unconfigured are skipped with a human-readable note instead of an error —
 discovery powers an interactive picker, so partial results beat failure.
 """
@@ -13,8 +14,8 @@ from dataclasses import dataclass
 
 import httpx
 
-from .ollama import DEFAULT_NATIVE_URL, Ollama
-from .registry import Registry
+from .ollama import Ollama
+from .registry import Registry, add_cloud_marker, ollama_provider_for
 
 CATALOG_TIMEOUT = 10.0
 
@@ -22,7 +23,7 @@ CATALOG_TIMEOUT = 10.0
 @dataclass
 class DiscoveredModel:
     spec: str  # full "provider:model"
-    source: str  # "configured" | "ollama" | "openrouter"
+    source: str  # "configured" | "ollama" | "ollama.com" | "openrouter"
     context_window: int | None = None
 
 
@@ -31,6 +32,7 @@ def discover_models(
     *,
     http: httpx.Client | None = None,
     ollama: Ollama | None = None,
+    ollama_cloud: Ollama | None = None,
 ) -> tuple[list[DiscoveredModel], list[str]]:
     """Return (models, notes). Notes explain skipped/unreachable sources."""
     models: list[DiscoveredModel] = []
@@ -47,14 +49,14 @@ def discover_models(
 
     provider = registry.providers.get("ollama")
     if provider is not None:
-        client = ollama or Ollama(
-            provider.native_url or DEFAULT_NATIVE_URL,
-            api_key_env=provider.api_key_env,
-        )
+        local = ollama_provider_for(provider, cloud=False)
+        client = ollama or Ollama(local.native_url, api_key_env=local.api_key_env)
         try:
             if client.is_up():
                 for name in sorted(client.local_models()):
-                    add(DiscoveredModel(spec=f"ollama:{name}", source="ollama"))
+                    # "ornith:latest" is the daemon's spelling of "ornith";
+                    # keep the configured spelling so its entry applies
+                    add(DiscoveredModel(spec=f"ollama:{name.removesuffix(':latest')}", source="ollama"))
             else:
                 notes.append("ollama: not reachable — start it with `ollama serve`")
         except httpx.HTTPError as e:
@@ -62,6 +64,24 @@ def discover_models(
         finally:
             if ollama is None:
                 client.close()
+        # hosted catalog: listed under the cloud marker so picking one routes
+        # to ollama.com (see registry.split_cloud_marker)
+        cloud = ollama_provider_for(provider, cloud=True)
+        if not cloud.api_key:
+            notes.append(f"ollama.com: set {cloud.api_key_env} to list its catalog")
+        elif ollama_cloud is not None or ollama is None:
+            client = ollama_cloud or Ollama(cloud.native_url, api_key_env=cloud.api_key_env)
+            try:
+                if client.is_up():
+                    for name in sorted(client.local_models()):
+                        add(DiscoveredModel(spec=f"ollama:{add_cloud_marker(name)}", source="ollama.com"))
+                else:
+                    notes.append("ollama.com: not reachable")
+            except httpx.HTTPError as e:
+                notes.append(f"ollama.com: catalog fetch failed ({e})")
+            finally:
+                if ollama_cloud is None:
+                    client.close()
 
     provider = registry.providers.get("openrouter")
     if provider is not None:

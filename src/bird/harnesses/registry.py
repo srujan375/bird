@@ -10,6 +10,7 @@ the only place that maps a name to its wiring.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -115,20 +116,47 @@ def build_runner(
     with_web: bool = True,
     seed_context: str | None = None,
     tools: list[Tool] | None = None,
+    mcp_servers: list | None = None,
 ) -> Runner:
     """Construct a Runner tuned for the named harness. `tools` overrides the
     def's factory — used by harnesses (lead) whose tools need injected deps
     the factory can't supply from (with_kg, with_web) alone.
 
-    Every mutating tool is wrapped with ctx.broker here, which is the only
-    place that can cover *all* runners: the CLI's, and the ones the lead's
-    `code` dispatch builds mid-session. Gating in the Server instead meant
-    dispatched sub-sessions were born ungated.
+    `mcp_servers` (list[McpServerSpec]) mounts bridged MCP tools: each server
+    is started, its tools discovered, and one McpTool per tool is appended to
+    the resolved toolset BEFORE gate_tools — so the broker wraps them like
+    everything else. A server that fails to start or times out is logged and
+    skipped (the session continues without its tools — one broken server must
+    not take the session down); a corrupt mcp.json never gets this far, since
+    load_mcp_servers raises before the runner is built. Disabled entries are
+    skipped without a spawn.
     """
+    from ..mcp.bridge import bridge_server_tools
+    from ..mcp.client import McpClient
+    from ..mcp.config import McpError
     from ..permissions import gate_tools
 
     d = get(name)
     resolved = tools if tools is not None else d.tools(with_kg=with_kg, with_web=with_web)
+    mcp_clients: list[McpClient] = []
+    for server_spec in mcp_servers or []:
+        if getattr(server_spec, "disabled", False):
+            continue  # kept in the config, deliberately not launched
+        mcp_client = McpClient(server_spec)
+        try:
+            mcp_client.start()  # raises McpError naming the server on failure
+        except McpError as e:
+            # degrade gracefully: log to stderr and mount nothing. The user
+            # still gets a session with every other server's tools; /mcp
+            # status shows this one as not connected.
+            print(f"[bird mcp] skipping '{server_spec.name}': {e}", file=sys.stderr)
+            continue
+        mcp_clients.append(mcp_client)
+        resolved = [*resolved, *bridge_server_tools(mcp_client)]
+    if mcp_clients:
+        # the REPL/serve read this for /mcp status; close() is best-effort at
+        # process exit (daemon reader threads die with the process)
+        ctx.mcp_clients = mcp_clients
     resolved = gate_tools(resolved, ctx.broker)
     # the ledger is a property of the harness, and starts empty: a ctx forked
     # from a parent session (lead -> code) would otherwise inherit — by

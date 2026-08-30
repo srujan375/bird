@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import json
 import sys
 import threading
 from typing import Any, Callable, Literal, Protocol
@@ -63,10 +64,12 @@ NEXT_MODE: dict[PermissionMode, PermissionMode] = {
 # The payload kinds each mode auto-approves. "offer" is NEVER covered: an
 # offer's answer IS the feedback string, so an auto-approved offer with no
 # feedback is a corrupted answer — offers stay manual in every mode.
+# "mcp" is full_auto-only, next to bash: an MCP tool is arbitrary remote code
+# behind a friendly name, not a repo-local edit, so auto_edits never covers it.
 AUTO_MODES: dict[PermissionMode, frozenset[str]] = {
     "normal": frozenset(),
     "auto_edits": frozenset({"edit", "write", "read_outside_repo"}),
-    "full_auto": frozenset({"edit", "write", "read_outside_repo", "bash"}),
+    "full_auto": frozenset({"edit", "write", "read_outside_repo", "bash", "mcp"}),
 }
 
 
@@ -121,6 +124,19 @@ def permission_payload(name: str, args: dict[str, Any], ctx: ToolContext) -> dic
             "new_file": not old,
             "lines": _diff_lines(old, content),
         }
+    if name.startswith("mcp__"):
+        # mcp__<server>__<tool>: split back apart so the card can show WHICH
+        # server is being asked to run WHAT — the flattened name alone reads
+        # as one opaque token. Args as compact JSON, truncated — enough to
+        # judge the call without dumping a payload the size of a file into
+        # the prompt.
+        parts = name[5:].split("__", 1)
+        server = parts[0] if parts else "?"
+        tool = parts[1] if len(parts) > 1 else "?"
+        compact = json.dumps(args, separators=(",", ":"), default=str)
+        if len(compact) > 500:
+            compact = compact[:500] + "…"
+        return {"kind": "mcp", "server": server, "tool": tool, "args": compact}
     return {"kind": "bash", "cmd": args.get("command") or name}
 
 
@@ -333,6 +349,12 @@ class ConsoleBroker:
         kind = payload.get("kind", "?")
         if kind == "bash":
             print(f"  ✓ ⚠ FULL AUTO ran bash: {payload.get('cmd', '')}", file=self.out)
+        elif kind == "mcp":
+            print(
+                f"  ✓ ⚠ FULL AUTO ran mcp: "
+                f"{payload.get('server', '?')}.{payload.get('tool', '')}",
+                file=self.out,
+            )
         else:
             print(
                 f"  ✓ ⚠ FULL AUTO ran {kind} "
@@ -370,6 +392,11 @@ class ConsoleBroker:
         if kind == "read_outside_repo":
             print(f"\n  ┌ read (outside repo) {payload.get('path', '')}", file=self.out)
             print(f"  │ requested by {payload.get('tool', '?')}", file=self.out)
+            print("  └", file=self.out)
+            return
+        if kind == "mcp":
+            print(f"\n  ┌ mcp call: {payload.get('server', '?')}.{payload.get('tool', '?')}", file=self.out)
+            print(f"  │ args: {payload.get('args', '{}')}", file=self.out)
             print("  └", file=self.out)
             return
         label = "write (new file)" if payload.get("new_file") else kind

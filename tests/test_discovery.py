@@ -41,7 +41,8 @@ def test_configured_models_always_listed():
     assert notes == []
 
 
-def test_ollama_models_listed_and_deduped():
+def test_ollama_models_listed_and_deduped(monkeypatch):
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")  # no cloud fake given: catalog skipped, no note
     reg = make_registry(
         providers={"ollama": OLLAMA},
         models={"ollama:ornith": {"context_window": 262144}},
@@ -103,3 +104,28 @@ def test_openrouter_failure_becomes_note(monkeypatch):
     models, notes = discover_models(reg, http=http)
     assert models == []
     assert any("openrouter" in n for n in notes)
+
+
+def test_cloud_catalog_listed_with_marker(monkeypatch):
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    reg = make_registry(providers={"ollama": OLLAMA})
+    models, notes = discover_models(
+        reg,
+        ollama=FakeOllama(models=["ornith"]),
+        ollama_cloud=FakeOllama(models=["glm-5.3", "gpt-oss:120b"]),
+    )
+    by_spec = {m.spec: m.source for m in models}
+    assert by_spec == {
+        "ollama:ornith": "ollama",
+        "ollama:glm-5.3:cloud": "ollama.com",
+        "ollama:gpt-oss:120b-cloud": "ollama.com",
+    }
+    assert notes == []
+
+
+def test_cloud_catalog_needs_key(monkeypatch):
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    reg = make_registry(providers={"ollama": OLLAMA})
+    models, notes = discover_models(reg, ollama=FakeOllama(models=[]))
+    assert models == []
+    assert any("OLLAMA_API_KEY" in n for n in notes)

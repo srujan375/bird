@@ -13,6 +13,7 @@ import os
 import secrets
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     import readline
@@ -51,6 +52,15 @@ Type a task in plain language, or a command:
   /kg status            graph location, readiness, staleness
   /kg build|update      (re)build or incrementally update the graph
   /kg query <question>  query the graph directly
+  /mcp                  status of configured MCP servers
+  /mcp search <query>   search the official MCP registry
+  /mcp add <name>       install a server from the registry (asks first)
+  /setup                the first-run walkthrough again: probe sources,
+                        enter keys, pick + verify a default model
+  /doctor               health check: one line per check, a fix per failure
+  /keys                 which provider keys are set, and where from
+  /keys set <NAME>      store OLLAMA_API_KEY / OPENROUTER_API_KEY in
+                        ~/.bird/.env (prompts for the value, never echoed)
   /tools                list the harness tools
   /compact              compact the conversation now
   /clear                start a fresh conversation (same session log)
@@ -123,9 +133,10 @@ class Repl:
     # Kept in sync with HELP and _command(); a skill named "model" would be
     # unreachable via /model, so these are reserved.
     BUILTIN_COMMANDS = (
-        "/help", "/model", "/think", "/kg", "/tools", "/skills", "/compact",
-        "/clear", "/reload", "/session", "/sessions", "/continue", "/rename",
-        "/quit", "/exit",
+        "/help", "/model", "/think", "/kg", "/mcp", "/tools", "/skills",
+        "/setup", "/doctor", "/keys",
+        "/compact", "/clear", "/reload", "/session", "/sessions", "/continue",
+        "/rename", "/quit", "/exit",
     )
 
     def _setup_completion(self) -> None:
@@ -209,6 +220,14 @@ class Repl:
             self._cmd_think(arg)
         elif cmd == "/kg":
             self._cmd_kg(arg)
+        elif cmd == "/mcp":
+            self._cmd_mcp(arg)
+        elif cmd == "/setup":
+            self._cmd_setup()
+        elif cmd == "/doctor":
+            self._cmd_doctor()
+        elif cmd == "/keys":
+            self._cmd_keys(arg)
         elif cmd == "/tools":
             for t in self.runner.tools.values():
                 print(f"  {t.name:10s} {t.description.split('.')[0]}.")
@@ -328,6 +347,48 @@ class Repl:
             args += ["--model", self.runner.spec.spec]
         print(f"↻ reloading bird — resuming session {self.run_id} …")
         os.execv(exe, args)
+
+    # ---- onboarding: /setup, /doctor, /keys ----
+
+    def _cmd_setup(self, io=None) -> None:
+        """The first-run walkthrough, on demand. A chosen model is switched to
+        in this session as well as persisted as the default."""
+        from .onboard import ConsoleIO, walkthrough
+
+        chosen = walkthrough(io or ConsoleIO(), self.registry, current_model=self.runner.spec.spec)
+        if chosen and chosen != self.runner.spec.spec:
+            self._switch_model(chosen)
+
+    def _cmd_doctor(self) -> None:
+        from .onboard import doctor_report
+
+        lines, _failed = doctor_report(self.registry, self.runner.ctx.repo_root)
+        print("\n".join(lines))
+
+    def _cmd_keys(self, arg: str, io=None) -> None:
+        from .onboard import ConsoleIO, keys_status, set_key
+
+        parts = arg.split(maxsplit=2)
+        if not parts:
+            for name, where in keys_status():
+                print(f"  {name:20s} {where}")
+            print("  /keys set <NAME> to add or replace one")
+            return
+        if parts[0].lower() != "set" or len(parts) < 2:
+            print("usage: /keys            show which keys are set\n"
+                  "       /keys set <NAME> [value]   store one in ~/.bird/.env")
+            return
+        name = parts[1].upper()
+        value = parts[2] if len(parts) > 2 else (io or ConsoleIO()).ask_secret(f"{name}")
+        if not value:
+            print("no value given; nothing written")
+            return
+        try:
+            path = set_key(name, value)
+        except ValueError as e:
+            print(f"error: {e}")
+            return
+        print(f"{name} → {path} (live in this session too)")
 
     def _cmd_model(self, arg: str) -> None:
         if not arg:
@@ -503,6 +564,115 @@ class Repl:
                 print(f"error: {e}")
         else:
             print("usage: /kg [status|build|update|query <question>]")
+
+    def _cmd_mcp(self, arg: str) -> None:
+        """In-session MCP surface: /mcp shows which configured servers
+        connected and how many tools each exposed (read-only — management
+        stays in `bird mcp`); /mcp search and /mcp add reach the registry,
+        with add always asking first — a registry entry is arbitrary code."""
+        from .mcp.config import McpError, load_mcp_servers
+
+        parts = arg.split(maxsplit=1)
+        action = parts[0].lower() if parts else "status"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if action == "status":
+            clients = {c.spec.name: c for c in self.runner.ctx.mcp_clients}
+            try:
+                specs = load_mcp_servers(self.runner.ctx.repo_root)
+            except McpError as e:
+                print(f"error: {e}")
+                return
+            if not specs:
+                print("no MCP servers configured (.bird/mcp.json, ~/.bird/mcp.json)")
+                return
+            for spec in specs:
+                client = clients.get(spec.name)
+                if spec.disabled:
+                    print(f"  {spec.name:20s} disabled  [{spec.source}]")
+                elif client is None:
+                    print(f"  {spec.name:20s} not connected  [{spec.source}]")
+                else:
+                    alive = "connected" if client._alive() else "died"
+                    print(f"  {spec.name:20s} {alive}, {len(client.tools)} tool(s)  [{spec.source}]")
+        elif action == "search":
+            if not rest:
+                print("usage: /mcp search <query>")
+                return
+            from .mcp.discover import search_registry
+
+            try:
+                hits = search_registry(rest)
+            except McpError as e:
+                print(f"error: {e}")
+                return
+            if not hits:
+                print(f"no registry matches for '{rest}'")
+                return
+            for h in hits:
+                if h.installable:
+                    print(f"  {h.name}  (v{h.version})")
+                    if h.description:
+                        print(f"      {h.description}")
+                else:
+                    print(f"  {h.name}  — {h.reason}")
+        elif action == "add":
+            if not rest:
+                print("usage: /mcp add <registry-name>")
+                return
+            self._mcp_add_from_registry(rest)
+        else:
+            print("usage: /mcp [status|search <query>|add <name>]")
+
+    def _mcp_add_from_registry(self, name: str) -> None:
+        """Install a server from the registry into the project mcp.json.
+
+        The confirmation goes through the session's broker as an 'offer'
+        payload — the answer IS the choice, and offers stay manual in every
+        auto-approve mode by design. No broker (library/test use) falls back
+        to a stdin prompt on a tty, and refuses otherwise: installing
+        arbitrary code must never default to yes."""
+        from .mcp.config import McpError
+        from .mcp.discover import fetch_server, package_to_entry
+        from .mcp.management import cmd_add
+
+        try:
+            server = fetch_server(name)
+            entry, warnings = package_to_entry(server)
+        except McpError as e:
+            print(f"error: {e}")
+            return
+        print(f"registry entry for '{name}':")
+        print(json.dumps({name: entry}, indent=2))
+        for w in warnings:
+            print(f"warning: {w}")
+        broker = self.runner.ctx.broker
+        if broker is not None:
+            approved, feedback = broker.request({
+                "kind": "offer",
+                "question": f"Install MCP server '{name}' from the registry? "
+                            f"It will run as a local subprocess.",
+            })
+            answer = feedback.strip().lower() if approved else ""
+        elif getattr(sys.stdin, "isatty", lambda: False)():
+            try:
+                answer = input("install this server? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+        else:
+            print("no broker and no tty to confirm with — not installed "
+                  "(use `bird mcp add --from-registry` from a terminal)")
+            return
+        if answer not in ("y", "yes"):
+            print("not installed")
+            return
+        args = SimpleNamespace(
+            mcp_command="add", name=name, command=None, args=None, env=None,
+            scope="project", from_registry=False,
+        )
+        # write through the same code path as the CLI — one writer for mcp.json
+        cmd_add(args, self.runner.ctx.repo_root)
 
     def _sessions_dir(self) -> Path:
         """Location of all past session directories: run_dir is

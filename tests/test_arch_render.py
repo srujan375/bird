@@ -98,3 +98,21 @@ def test_an_empty_board_still_renders():
 
 def test_render_all_carries_one_board():
     assert set(render.render_all(_board())) == {"board"}
+
+
+def test_members_are_drawn_inside_their_container():
+    from bird.harnesses.arch.render import board_mermaid
+    from bird.harnesses.arch.state import ArchState, Edge, Node
+    st = ArchState()
+    st.nodes["ingest"] = Node(id="ingest", label="Ingest", kind="group")
+    st.nodes["parser"] = Node(id="parser", label="Parser", parent="ingest")
+    st.nodes["db"] = Node(id="db", label="DB", kind="store")
+    st.edges.append(Edge(src="parser", dst="db"))
+    out = board_mermaid(st)
+    lines = out.splitlines()
+    open_i = next(i for i, l in enumerate(lines) if l.strip().startswith('subgraph ingest'))
+    close_i = next(i for i, l in enumerate(lines) if i > open_i and l.strip() == "end")
+    inside = "\n".join(lines[open_i:close_i])
+    assert "parser" in inside
+    assert 'db[("DB' not in inside
+    assert out.count("parser[") == 1

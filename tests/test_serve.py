@@ -754,3 +754,60 @@ def test_what_was_typed_carries_what_was_drawn(tmp_path):
     said = [m.content for m in repl.messages if m.role == "user"]
     combined = next(c for c in said if "backpressure" in (c or ""))
     assert 'drew a box "Rate limiter"' in combined, "the drawing rode along"
+
+
+# ---- onboarding over the bridge ---------------------------------------------
+
+def test_serve_setup_round_trip(monkeypatch, tmp_path):
+    """`/setup` runs the walkthrough off the reader thread: questions arrive as
+    prompt_request, the UI answers with prompt_response, and the chosen model
+    is switched to before setup_end."""
+    import bird.onboard as onboard_mod
+
+    def fake_walkthrough(io, registry, **kw):
+        key = io.ask_secret("OLLAMA_API_KEY (empty to skip)")
+        io.say(f"key length {len(key)}")
+        return io.choose("default model", [onboard_mod.Choice("fake:model", "fake:model")], current="fake:model")
+
+    monkeypatch.setattr(onboard_mod, "walkthrough", fake_walkthrough)
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [])
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/setup"})
+    req = out.wait_for("prompt_request")
+    assert req["secret"] is True and "OLLAMA_API_KEY" in req["prompt"]
+    feeder.put({"type": "prompt_response", "id": req["id"], "value": "sk-xyz"})
+    while True:
+        reqs = [m for m in out.msgs if m["type"] == "prompt_request" and "choices" in m]
+        if reqs:
+            break
+        time.sleep(0.01)
+    pick = reqs[0]
+    assert pick["choices"][0]["value"] == "fake:model" and pick["current"] == "fake:model"
+    feeder.put({"type": "prompt_response", "id": pick["id"], "value": None})
+    out.wait_for("setup_end")
+    texts = [m["text"] for m in out.msgs if m["type"] == "command_output"]
+    assert "key length 6" in texts
+    assert not any("sk-xyz" in json.dumps(m) for m in out.msgs)  # the secret never comes back out
+    feeder.close()
+    thread.join(timeout=5)
+
+
+def test_serve_interrupt_cancels_a_pending_prompt(monkeypatch, tmp_path):
+    import bird.onboard as onboard_mod
+
+    seen = {}
+
+    def fake_walkthrough(io, registry, **kw):
+        seen["answer"] = io.ask_secret("OLLAMA_API_KEY")
+        return None
+
+    monkeypatch.setattr(onboard_mod, "walkthrough", fake_walkthrough)
+    feeder, out, thread = run_server(monkeypatch, tmp_path, [])
+    out.wait_for("ready")
+    feeder.put({"type": "command", "line": "/setup"})
+    out.wait_for("prompt_request")
+    feeder.put({"type": "interrupt"})
+    out.wait_for("setup_end")
+    assert seen["answer"] == ""
+    feeder.close()
+    thread.join(timeout=5)

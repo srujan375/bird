@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 KINDS: tuple[str, ...] = (
-    "service", "store", "queue", "api", "ui", "llm", "external", "infra",
+    "service", "store", "queue", "api", "ui", "llm", "external", "infra", "group",
 )
 EDGE_KINDS: tuple[str, ...] = ("sync", "async", "batch")
 # a two-way slider on one object, not a one-way expand
@@ -47,6 +47,33 @@ COST_ORDER: dict[str, int] = {
 }
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+
+# The fixed facts a box of each kind carries, in the order they are shown, and
+# the name of its list plus the key each row wears. Same kind, same shape, every
+# box — so a reader learns where "what talks to this" sits once. Values are free
+# text; a one-word value is drawn as a chip.
+KIND_FACTS: dict[str, tuple[str, ...]] = {
+    "service": ("interface", "state", "scaling", "owner"),
+    "api": ("protocol", "auth", "versioning", "owner"),
+    "store": ("engine", "model", "durability", "retention"),
+    "queue": ("broker", "delivery", "ordering", "dlq"),
+    "ui": ("surface", "auth", "owner"),
+    "llm": ("provider", "model", "role", "context", "fallback"),
+    "external": ("vendor", "protocol", "sla"),
+    "infra": ("platform", "region", "scaling"),
+    "group": (),
+}
+KIND_LIST: dict[str, tuple[str, str]] = {  # kind -> (list name, default row key)
+    "service": ("operations", "op"),
+    "api": ("endpoints", "GET"),
+    "store": ("entities", "tbl"),
+    "queue": ("topics", "msg"),
+    "ui": ("screens", "scr"),
+    "llm": ("tools", "fn"),
+    "external": ("calls", "call"),
+    "infra": ("resources", "res"),
+    "group": ("members", ""),
+}
 
 # Keys that only ever appeared in the pre-rebuild state file. A session written
 # by the old two-layer harness cannot be read into this model without inventing
@@ -94,6 +121,17 @@ class Brief:
 
 
 @dataclass
+class Item:
+    """One row of a box's list: an endpoint, a table, a topic, a tool.
+    `k` is the short key drawn in front (GET, tbl, fn), `v` the thing itself,
+    `d` an optional line under it."""
+
+    v: str
+    k: str = ""
+    d: str = ""
+
+
+@dataclass
 class Node:
     """A box on the board.
 
@@ -104,6 +142,11 @@ class Node:
 
     `approaches` is the set of approach ids this node belongs to. Empty means
     shared — drawn once, used by every approach on the board.
+
+    `parent` is the box this one sits inside. A box with children is drawn as a
+    container around them and can be folded shut, so a large design reads as a
+    handful of subsystems first and the wiring inside each one only when you
+    open it. Wires that cross a folded container land on the container.
     """
 
     id: str
@@ -113,10 +156,16 @@ class Node:
     tech: str = ""
     depth: str = "stub"
     detail: str = ""  # prose, not a schema — what is inside, in the words that fit
+    # The fixed facts for this kind (KIND_FACTS) and the keyed list (KIND_LIST).
+    # `detail` stays for prose that fits neither; the board draws it as rows
+    # when there are no items.
+    facts: dict[str, str] = field(default_factory=dict)
+    items: list[Item] = field(default_factory=list)
     approaches: list[str] = field(default_factory=list)
     status: str = "active"  # greyed travels with its approach
     notes: str = ""
     existing: bool = False  # imported from the repo: background, not ours to design
+    parent: str = ""  # id of the box this one sits inside; "" = top level
     # Where the box sits, once somebody has put it somewhere. None means the
     # board has not been arranged by hand and the canvas may lay it out.
     #
@@ -296,6 +345,30 @@ class ArchState:
                 return i
         return -1
 
+    def children_of(self, node_id: str) -> list[Node]:
+        return [n for n in self.nodes.values() if n.parent == node_id]
+
+    def ancestors_of(self, node_id: str) -> list[str]:
+        """Parent, grandparent, ... — stops at the top or at a loop."""
+        out: list[str] = []
+        seen = {node_id}
+        cur = self.nodes.get(node_id)
+        while cur is not None and cur.parent and cur.parent not in seen:
+            out.append(cur.parent)
+            seen.add(cur.parent)
+            cur = self.nodes.get(cur.parent)
+        return out
+
+    def orphan_children(self, node_id: str) -> list[str]:
+        """Lift a box's children to its own level. Used when the box goes."""
+        lifted = []
+        gone = self.nodes.get(node_id)
+        for n in self.nodes.values():
+            if n.parent == node_id:
+                n.parent = gone.parent if gone is not None else ""
+                lifted.append(n.id)
+        return lifted
+
     def references_to(self, node_id: str) -> list[str]:
         """What would dangle if the id vanished."""
         return [f"{e.src} -> {e.dst}" for e in self.edges_touching(node_id)]
@@ -343,12 +416,36 @@ class ArchState:
             raise ValueError(f"depth must be one of {', '.join(DEPTHS)}.")
         if node.status not in STATUSES:
             raise ValueError(f"status must be one of {', '.join(STATUSES)}.")
+        vocab = KIND_FACTS.get(node.kind, ())
+        for key in node.facts:
+            if key not in vocab:
+                raise ValueError(
+                    f"{node.kind!r} boxes have no fact {key!r}; they carry "
+                    f"{', '.join(vocab) or 'no facts'}. Put anything else in `detail`."
+                )
+        for it in node.items:
+            if not str(it.v).strip():
+                raise ValueError(f"every item on {node.id!r} needs a value (`v`).")
         for aid in node.approaches:
             if aid not in self.approaches:
                 raise ValueError(
                     f"node {node.id!r} is labelled with unknown approach {aid!r}; "
                     "name it with `approach` first, or leave the label off to make "
                     "the node shared."
+                )
+        if node.parent:
+            if node.parent == node.id:
+                raise ValueError(f"node {node.id!r} cannot be its own parent.")
+            if node.parent not in self.nodes:
+                raise ValueError(
+                    f"node {node.id!r} names unknown parent {node.parent!r}; put the "
+                    "container box in the same call, before or after — it is created "
+                    "as a stub if it is only named."
+                )
+            if node.id in self.ancestors_of(node.parent):
+                raise ValueError(
+                    f"putting {node.id!r} inside {node.parent!r} would make a loop of "
+                    "containers."
                 )
 
     def validate_edge(self, edge: Edge) -> None:
@@ -424,6 +521,12 @@ class ArchState:
                 status=n.get("status", "active"),
                 notes=n.get("notes", ""),
                 existing=bool(n.get("existing", False)),
+                facts={str(k): str(v) for k, v in (n.get("facts") or {}).items()},
+                items=[
+                    Item(v=str(i.get("v", "")), k=str(i.get("k", "")), d=str(i.get("d", "")))
+                    for i in (n.get("items") or []) if isinstance(i, dict)
+                ],
+                parent=n.get("parent", "") or "",
                 x=n.get("x"),
                 y=n.get("y"),
             )

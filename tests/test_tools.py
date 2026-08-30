@@ -735,14 +735,16 @@ def test_other_harnesses_are_not_gated(ctx):
 
 # The threshold test_skills.py and test_web.py import: three copies of the
 # number had to be edited by hand every time the toolset grew, which is how
-# they drift. 1650 covers the 12-tool toolset including WebSearch + WebFetch +
-# skill + read_image (~100 tokens added when web tools landed; skill is tiny)
-# and done's verification gate (~20: the unverified_reason param and the clause
-# naming the gate — the rest of that rule lives in instructions.md and in the
-# rejection message, which cost nothing per turn).
+# they drift. 2400 covers the 15-tool toolset (measured ≈2170): the 12 tools
+# the old 1650 budget covered (WebSearch + WebFetch + skill + read_image),
+# plus the plan tracker's plan + plan_update (plan's steps array of
+# {title, files} objects is the bulk of the growth) and done's verification
+# gate (~20: the unverified_reason param and the clause naming the gate —
+# the rest of that rule lives in instructions.md and in the rejection
+# message, which cost nothing per turn).
 # The /4 heuristic is loose; the guardrail exists to keep per-turn schema
 # overhead from eating small-model context windows, not as a hard wall.
-SCHEMA_TOKEN_BUDGET = 1650
+SCHEMA_TOKEN_BUDGET = 2400
 
 
 def test_all_schemas_under_token_budget():
@@ -784,7 +786,12 @@ def test_ls_lists_directory(ctx, repo):
     assert not r.is_error, r.output
     # repo-relative path, type, size — one line per entry
     assert "src/app.py  (file)" in r.output
-    assert "src/" not in r.output  # the listed dir itself isn't an entry
+    # the listed dir itself isn't an entry: no line is just "src/" with a
+    # type marker (every entry line is src/<name>, so a whole-output
+    # substring check would always fail on the prefix).
+    assert not any(
+        l.strip().startswith("src/  (") or l.strip() == "src/" for l in r.output.splitlines()
+    )
 
 
 def test_ls_dirs_first_and_suffixed(ctx, repo):

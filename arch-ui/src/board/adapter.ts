@@ -1,7 +1,8 @@
 import type { ArchState, WireNode } from "../wire/types";
 import { W } from "./geometry";
-import { estimateHeight, layoutBoard, type Cell, type Link } from "./layout";
+import { estimateHeight, layoutBoard, PAD, type Cell, type Link } from "./layout";
 import type { Anno, BoardNode, Lane, Wire } from "./types";
+import { KIND_FACTS, KIND_LIST, KIND_SIDES } from "./vocab";
 
 /**
  * The harness's graph, arranged into a board.
@@ -34,6 +35,45 @@ const TOP = 30;
 /** Between the live board and the row of rejected approaches under it. */
 const LOST_GAP = 88;
 const SHARED = " shared"; // not a legal approach id, so it cannot collide
+/** Room at the top of an open container for its own name. */
+export const HEAD_GROUP = 40;
+/** A board bigger than this opens with its containers folded: the point of a
+ *  container is that the reader meets six boxes before sixty. */
+export const FOLD_ABOVE = 24;
+
+/** Which boxes hold others, keyed by container id. Only a parent the board
+ *  actually has counts; a dangling parent is a top-level box. */
+export function membersOf(arch: ArchState): Map<string, WireNode[]> {
+  const kids = new Map<string, WireNode[]>();
+  for (const n of Object.values(arch.nodes)) {
+    if (!n.parent || !arch.nodes[n.parent] || n.parent === n.id) continue;
+    const list = kids.get(n.parent);
+    if (list) list.push(n);
+    else kids.set(n.parent, [n]);
+  }
+  return kids;
+}
+
+/** Container, its container, ... from the box outwards. Stops at a loop. */
+function ancestors(arch: ArchState, id: string): string[] {
+  const out: string[] = [];
+  const seen = new Set([id]);
+  let cur = arch.nodes[id];
+  while (cur && cur.parent && arch.nodes[cur.parent] && !seen.has(cur.parent)) {
+    out.push(cur.parent);
+    seen.add(cur.parent);
+    cur = arch.nodes[cur.parent];
+  }
+  return out;
+}
+
+/** Whether a container is drawn shut. */
+export function foldedOf(
+  arch: ArchState, folded: Record<string, boolean>, kids: Map<string, WireNode[]>,
+): (id: string) => boolean {
+  const byDefault = Object.keys(arch.nodes).length > FOLD_ABOVE;
+  return (id) => kids.has(id) && (folded[id] ?? byDefault);
+}
 
 /** A box is out when it was greyed itself, or when every approach it belonged
  *  to lost. A shared box outlives all of them; a box with one surviving label
@@ -76,6 +116,8 @@ interface Column {
 function columns(arch: ArchState): Column[] {
   const bucket = new Map<string, WireNode[]>();
   for (const n of Object.values(arch.nodes)) {
+    // a member goes where its container goes
+    if (n.parent && arch.nodes[n.parent] && n.parent !== n.id) continue;
     const k = columnOf(arch, n);
     const list = bucket.get(k);
     if (list) list.push(n);
@@ -154,10 +196,30 @@ export interface BoardView {
  *  A box's height does not depend on where it is put, so feeding measurements
  *  into the thing that puts them settles after one pass. Anything unmeasured —
  *  a box on its very first frame — is estimated. */
-export function toBoard(arch: ArchState, heights: Record<string, number> = {}): BoardView {
+export function toBoard(
+  arch: ArchState,
+  heights: Record<string, number> = {},
+  folded: Record<string, boolean> = {},
+): BoardView {
   const cols = columns(arch);
   const lanes: Lane[] = [];
   const nodes: BoardNode[] = [];
+  const kids = membersOf(arch);
+  const isFolded = foldedOf(arch, folded, kids);
+
+  /* Who is on each side of a box's wires, named. Derived at render so it is
+     never typed and never stale. */
+  const sides = (n: WireNode) => {
+    const [inName, outName] = KIND_SIDES[n.kind] ?? KIND_SIDES.service;
+    const name = (id: string) => arch.nodes[id]?.label ?? id;
+    const inc = arch.edges.filter((e) => e.dst === n.id).map((e) => name(e.src));
+    const out = arch.edges.filter((e) => e.src === n.id).map((e) => name(e.dst));
+    const uniq = (xs: string[]) => [...new Set(xs)];
+    return [
+      { side: inName, names: uniq(inc) },
+      { side: outName, names: uniq(out) },
+    ].filter((g) => g.names.length);
+  };
 
   const read = (n: WireNode): BoardNode => ({
     id: n.id,
@@ -173,10 +235,123 @@ export function toBoard(arch: ArchState, heights: Record<string, number> = {}): 
     /* `detail` is prose in the harness and mono lines on the board: one line
        per line, which is how it is written and how it reads */
     rows: n.detail.split("\n").map((r) => r.trim()).filter(Boolean),
+    facts: (KIND_FACTS[n.kind] ?? []).map((k) => [k, n.facts?.[k] ?? ""] as [string, string]),
+    listName: KIND_LIST[n.kind] ?? "items",
+    items: (n.items ?? []).map((i) => ({ k: i.k ?? "", v: i.v ?? "", d: i.d ?? "" })),
+    derived: sides(n),
     approaches: n.approaches,
     existing: n.existing,
     out: isGreyed(arch, n),
+    parent: n.parent && arch.nodes[n.parent] ? n.parent : undefined,
+    group: kids.has(n.id)
+      ? { folded: isFolded(n.id), count: kids.get(n.id)!.length, w: 0, h: 0 }
+      : undefined,
   });
+
+  /** The box an edge end is drawn at: the outermost folded container around
+   *  it, or the box itself when nothing around it is shut. */
+  const shown = (id: string): string => {
+    const chain = ancestors(arch, id);
+    for (let i = chain.length - 1; i >= 0; i--) if (isFolded(chain[i])) return chain[i];
+    return id;
+  };
+
+  /** Which member of `g` an id falls under — itself, or the member that
+   *  contains it — or null when it is outside `g` altogether. */
+  const under = (g: string, id: string): string | null => {
+    if (arch.nodes[id]?.parent === g) return id;
+    const chain = ancestors(arch, id);
+    const i = chain.indexOf(g);
+    return i > 0 ? chain[i - 1] : null;
+  };
+
+  /** Where the top-level box for an id is — itself, or the root container. */
+  const topOf = (id: string): string => {
+    const chain = ancestors(arch, id);
+    return chain.length ? chain[chain.length - 1] : id;
+  };
+
+  /**
+   * One open container, arranged. The members are laid out as a board of
+   * their own — same layering, same shelf — in a single column, and the whole
+   * thing becomes one cell of whatever holds it. Nothing is placed until the
+   * container itself has been: `place` puts the members down relative to
+   * wherever the outer arrangement (or a hand) put the container.
+   *
+   * A member somebody has dragged sits where they put it, same as any box,
+   * and the container stretches to keep it — a member is on its container's
+   * ground wherever that ground has to reach. The rest of the members keep
+   * the arrangement the layout gave them.
+   */
+  interface Sub { w: number; h: number; place: (x0: number, y0: number, self: BoardNode) => void }
+  const subtree = (g: WireNode, slot: string, lane: string): Sub => {
+    const members = kids.get(g.id) ?? [];
+    const built = new Map<string, BoardNode>();
+    const subs = new Map<string, Sub>();
+    const cells: Cell[] = [];
+    for (const m of members) {
+      const b = read(m);
+      b.lane = lane;
+      b.slot = slot;
+      built.set(m.id, b);
+      let w = W[b.depth] ?? W.stub;
+      let h = heights[m.id] ?? estimateHeight(b);
+      if (b.group && !b.group.folded) {
+        const sub = subtree(m, slot, lane);
+        subs.set(m.id, sub);
+        w = sub.w;
+        h = sub.h;
+        b.group.w = w;
+        b.group.h = h;
+      }
+      cells.push({ id: m.id, col: g.id, w, h, fixed: null });
+    }
+    const inner: Link[] = [];
+    const seen = new Set<string>();
+    for (const e of arch.edges) {
+      const a = under(g.id, e.src), b = under(g.id, e.dst);
+      if (!a || !b || a === b || seen.has(a + ">" + b)) continue;
+      seen.add(a + ">" + b);
+      inner.push({ from: a, to: b });
+    }
+    const laid = layoutBoard(cells, inner, [g.id], { x: 0, y: 0 }, () => 0);
+    const ext = laid.cols.get(g.id) ?? { x: 0, y: 0, w: W.sketch, h: 0 };
+    return {
+      w: ext.w,
+      h: HEAD_GROUP + ext.h,
+      place: (x0, y0, self) => {
+        let x1 = x0 + ext.w, y1 = y0 + HEAD_GROUP + ext.h;
+        let gx0 = x0, gy0 = y0;
+        for (const cell of cells) {
+          const b = built.get(cell.id)!;
+          const m = arch.nodes[cell.id];
+          const spot = laid.at.get(cell.id);
+          if (m.x !== null && m.y !== null) {
+            b.cx = m.x;
+            b.y = m.y;
+          } else if (spot) {
+            b.cx = x0 + (spot.cx - ext.x);
+            b.y = y0 + HEAD_GROUP + (spot.y - ext.y);
+          }
+          nodes.push(b);
+          subs.get(cell.id)?.place(b.cx - cell.w / 2, b.y, b);
+          // the ground reaches whatever stands on it
+          const w = b.group && !b.group.folded ? b.group.w : cell.w;
+          const h = b.group && !b.group.folded ? b.group.h : cell.h;
+          gx0 = Math.min(gx0, b.cx - w / 2 - PAD);
+          gy0 = Math.min(gy0, b.y - HEAD_GROUP - PAD);
+          x1 = Math.max(x1, b.cx + w / 2 + PAD);
+          y1 = Math.max(y1, b.y + h + PAD);
+        }
+        if (self && self.group) {
+          self.group.w = x1 - gx0;
+          self.group.h = y1 - gy0;
+          self.cx = gx0 + self.group.w / 2;
+          self.y = gy0;
+        }
+      },
+    };
+  };
 
   /** Which column each box ended up in. */
   const home = new Map<string, string>();
@@ -184,9 +359,18 @@ export function toBoard(arch: ArchState, heights: Record<string, number> = {}): 
   const chromeOn = new Map(cols.map((c) => [c.key, c.chrome ? (c.out ? HEAD_OUT : HEAD) : 0]));
   const head = (col: string) => chromeOn.get(col) ?? 0;
 
-  const links: Link[] = arch.edges
-    .filter((e) => e.src !== e.dst && home.has(e.src) && home.has(e.dst))
-    .map((e) => ({ from: e.src, to: e.dst }));
+  /* Down the page is decided at the top level: an edge between two members
+     of different containers is, up here, an edge between the containers. */
+  const links: Link[] = [];
+  {
+    const seen = new Set<string>();
+    for (const e of arch.edges) {
+      const a = topOf(e.src), b = topOf(e.dst);
+      if (a === b || !home.has(a) || !home.has(b) || seen.has(a + ">" + b)) continue;
+      seen.add(a + ">" + b);
+      links.push({ from: a, to: b });
+    }
+  }
 
   /** One arrangement over a set of columns. The live board is arranged first;
    *  whatever lost is arranged again underneath it, on its own row, because a
@@ -197,6 +381,7 @@ export function toBoard(arch: ArchState, heights: Record<string, number> = {}): 
     const keys = group.map((c) => c.key);
     const inGroup = new Set(keys);
     const built = new Map<string, BoardNode>();
+    const subs = new Map<string, Sub>();
     const cells: Cell[] = [];
     for (const c of group) {
       for (const n of c.nodes) {
@@ -204,11 +389,21 @@ export function toBoard(arch: ArchState, heights: Record<string, number> = {}): 
         b.lane = c.key;
         b.slot = c.slot;
         built.set(n.id, b);
+        let w = W[b.depth] ?? W.stub;
+        let h = heights[n.id] ?? estimateHeight(b);
+        if (b.group && !b.group.folded) {
+          const sub = subtree(n, c.slot, c.key);
+          subs.set(n.id, sub);
+          w = sub.w;
+          h = sub.h;
+          b.group.w = w;
+          b.group.h = h;
+        }
         cells.push({
           id: n.id,
           col: c.key,
-          w: W[b.depth] ?? W.stub,
-          h: heights[n.id] ?? estimateHeight(b),
+          w,
+          h,
           fixed: n.x !== null && n.y !== null ? { cx: n.x, y: n.y } : null,
         });
       }
@@ -226,7 +421,9 @@ export function toBoard(arch: ArchState, heights: Record<string, number> = {}): 
       const b = built.get(cell.id)!;
       const spot = cell.fixed ?? laid.at.get(cell.id);
       if (spot) { b.cx = spot.cx; b.y = spot.y; }
+      // the container goes down before its members, so it is drawn under them
       nodes.push(b);
+      subs.get(cell.id)?.place(b.cx - cell.w / 2, b.y, b);
     }
     let right = TOP;
     const empty: Column[] = [];
@@ -266,14 +463,28 @@ export function toBoard(arch: ArchState, heights: Record<string, number> = {}): 
   // still carrying the reason it lost
   arrange(cols.filter((c) => c.out), bottom + LOST_GAP);
 
-  const wires: Wire[] = arch.edges.map((e) => ({
-    from: e.src,
-    to: e.dst,
-    label: e.label || undefined,
-    kind: e.kind,
-    notes: e.notes,
-    out: isGreyed(arch, arch.nodes[e.src]) || isGreyed(arch, arch.nodes[e.dst]),
-  }));
+  /* A wire runs between what is drawn. Edges whose ends both fold into the
+     same container are its internals and are not drawn at all; several edges
+     that fold onto the same two boxes become one wire that says how many it
+     stands for, rather than a sheaf of parallel curves. */
+  const bundle = new Map<string, Wire>();
+  const wires: Wire[] = [];
+  for (const e of arch.edges) {
+    const from = shown(e.src), to = shown(e.dst);
+    if (from === to) continue;
+    const out = isGreyed(arch, arch.nodes[e.src]) || isGreyed(arch, arch.nodes[e.dst]);
+    const key = from + ">" + to;
+    const had = bundle.get(key);
+    if (had) {
+      had.count = (had.count ?? 1) + 1;
+      had.label = undefined;
+      had.out = had.out && out;
+      continue;
+    }
+    const w: Wire = { from, to, label: e.label || undefined, kind: e.kind, notes: e.notes, out, count: 1 };
+    bundle.set(key, w);
+    wires.push(w);
+  }
 
   const placed = new Map(nodes.map((n) => [n.id, n]));
   const annos: Anno[] = arch.annotations.map((a) => {

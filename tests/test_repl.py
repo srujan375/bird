@@ -690,3 +690,53 @@ def test_run_without_an_opening_message_goes_straight_to_the_prompt(monkeypatch)
 
     assert repl.run() == 0
     assert turns == []
+
+
+# ---- onboarding commands ----------------------------------------------------
+
+def test_keys_command_lists_and_sets(tmp_path, monkeypatch, capsys):
+    import bird.llm.registry as registry_mod
+    import bird.setup as setup_mod
+
+    bird_dir = tmp_path / ".bird"
+    monkeypatch.setattr(registry_mod, "USER_ENV_FILE", bird_dir / ".env")
+    monkeypatch.setattr(setup_mod, "USER_ENV_FILE", bird_dir / ".env")
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    repl = make_repl(tmp_path, [])
+
+    repl._command("/keys")
+    out = capsys.readouterr().out
+    assert "OLLAMA_API_KEY" in out and "not set" in out
+
+    class IO:
+        def ask_secret(self, prompt):
+            return "sk-abc"
+
+    repl._cmd_keys("set ollama_api_key", io=IO())
+    out = capsys.readouterr().out
+    assert "OLLAMA_API_KEY →" in out and "sk-abc" not in out  # never echoed
+    assert "OLLAMA_API_KEY=sk-abc" in (bird_dir / ".env").read_text()
+
+    repl._command("/keys set NOPE x")
+    assert "unknown key" in capsys.readouterr().out
+
+
+def test_doctor_command_prints_report(tmp_path, monkeypatch, capsys):
+    import bird.onboard as onboard_mod
+
+    monkeypatch.setattr(onboard_mod, "doctor_report", lambda registry, repo: (["✓ python", "", "all checks passed"], 0))
+    repl = make_repl(tmp_path, [])
+    repl._command("/doctor")
+    assert "all checks passed" in capsys.readouterr().out
+
+
+def test_setup_command_switches_to_the_chosen_model(tmp_path, monkeypatch, capsys):
+    import bird.onboard as onboard_mod
+
+    repl = make_repl(tmp_path, [])
+    repl.registry.providers["fake"] = ProviderConfig(name="fake", base_url="http://x")
+    repl.registry.models["fake:other"] = {"context_window": 4096}
+    monkeypatch.setattr(onboard_mod, "walkthrough", lambda io, registry, **kw: "fake:other")
+    repl._command("/setup")
+    assert repl.runner.spec.spec == "fake:other"

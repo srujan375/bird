@@ -52,7 +52,7 @@ from .state import Annotation, Edge, Node, slug
 # What a reader may change about a box: prose about something that already
 # exists. `kind` is structural and `id` is immutable — both stay the
 # architect's call.
-EDITABLE_NODE_FIELDS = ("label", "responsibility", "tech", "detail", "notes", "depth")
+EDITABLE_NODE_FIELDS = ("label", "kind", "responsibility", "tech", "detail", "notes", "depth", "facts", "items")
 
 
 class MutationError(Exception):
@@ -91,7 +91,7 @@ def _node(session: ArchSession, payload: dict[str, Any]) -> dict[str, Any]:
     before = session.state.nodes[nid].label
     spec["id"] = nid
     try:
-        _upsert_node(session, spec)
+        _upsert_node(session, spec, [])
     except Exception as e:  # ToolError and friends carry the message we want
         raise MutationError(str(e)) from e
     after = session.state.nodes[nid].label
@@ -273,6 +273,7 @@ def _remove_box(session: ArchSession, payload: dict[str, Any]) -> dict[str, Any]
             f"no box {nid!r} — the page is showing something the harness does not have."
         )
     dropped = state.references_to(nid)
+    state.orphan_children(nid)
     state.edges = [e for e in state.edges if nid not in (e.src, e.dst)]
     state.annotations = [a for a in state.annotations if a.anchor != nid]
     label = state.nodes[nid].label

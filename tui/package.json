@@ -8,7 +8,8 @@
     "start": "tsx src/main.ts",
     "dev": "tsx src/main.ts",
     "check": "tsc --noEmit",
-    "test": "tsx src/markdown.smoke.ts"
+    "test": "tsx src/markdown.smoke.ts && tsx src/branding.test.ts",
+    "debug": "tsx src/debug.ts"
   },
   "dependencies": {
     "@mariozechner/pi-tui": "^0.73.1",

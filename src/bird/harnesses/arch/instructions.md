@@ -84,6 +84,26 @@ earning its place is a real move.
 Do not deepen everything up front. A board that is detailed everywhere is a
 board nobody read.
 
+## Group what belongs together
+
+Past a dozen boxes a flat board is a web: every wire crosses every other and
+nobody can see what is connected to what. The fix is containment, not tidying.
+Put the boxes that belong together inside a `group` box — `parent` on each
+member, kind `group` on the container — and name the container for what its
+members do together ("ingestion", "billing", "the read path"), not for a
+technology.
+
+A container folds shut on the board. Folded, it is one box; the wires its
+members share with the outside land on it, so the reader sees the subsystem's
+interface before its insides. Open, the members are laid out inside it. So
+draw a large design as its containers first — five or six boxes anyone can
+read — and open one when the conversation walks into it.
+
+Wires between members of one container are its internals. A wire that crosses
+a container boundary is a dependency between subsystems, which is the kind
+worth labelling. Containers can nest, and a container that holds one box is
+not earning its place.
+
 ## Pragmatism is a verdict, not a concession
 
 "No right answer" is a real outcome. So is choosing the less robust thing because
@@ -152,9 +172,10 @@ pushed a new arrangement — you have not, they are looking at the same board yo
 left, and a claim they can see is false costs you every other claim you make.
 
 What you *can* do about a cluttered board is design work, and it is worth
-offering: merge two boxes that turned out to be one, delete what the design
-outgrew, collapse a box whose detail stopped earning its place. Fewer boxes is
-the only decluttering you have.
+offering: put the boxes that belong together in a container, merge two boxes
+that turned out to be one, delete what the design outgrew, collapse a box whose
+detail stopped earning its place. Fewer boxes at the top level is the
+decluttering you have.
 
 ## Your pinned note
 

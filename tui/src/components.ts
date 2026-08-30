@@ -1,5 +1,8 @@
 import {
 	type Component,
+	Editor,
+	type EditorTheme,
+	Input,
 	Key,
 	matchesKey,
 	type SelectItem,
@@ -10,6 +13,13 @@ import {
 	wrapTextWithAnsi,
 } from "@mariozechner/pi-tui";
 import { renderMarkdown } from "./markdown.ts";
+import {
+	renderChatBarModelName,
+	renderIndicator,
+	resolveAccent,
+	type AccentTheme,
+	type IndicatorInput,
+} from "./branding.ts";
 import { palette, SPINNER, SPINNER_MS, t } from "./theme.ts";
 
 /* ---------- messages ---------- */
@@ -60,6 +70,29 @@ export function harnessLabel(name: string): string {
 	return HARNESS_LABEL[name] ?? name.toUpperCase();
 }
 
+// Display order for the harness strip. All three are always listed so the set
+// is discoverable from the UI rather than only from `--harness`.
+export const HARNESS_ORDER = ["code", "arch", "lead"] as const;
+
+export type HarnessState =
+	| "active" // holding the wheel right now
+	| "dispatcher" // the session's own harness, waiting on a sub-harness it dispatched
+	| "idle";
+
+/** Which harnesses to show and how to weight each. Pure, so the weighting is
+ *  testable without a colour-capable terminal. */
+export function harnessStates(base: string, active: string | null): { name: string; state: HarnessState }[] {
+	const current = active ?? base;
+	const names: string[] = [...HARNESS_ORDER];
+	// a harness the build doesn't know about still gets a slot rather than
+	// silently vanishing from the strip
+	for (const n of [base, current]) if (n && !names.includes(n)) names.push(n);
+	return names.map((name) => ({
+		name,
+		state: name === current ? "active" : name === base ? "dispatcher" : "idle",
+	}));
+}
+
 export class HeaderBar implements Component {
 	invalidate(): void {}
 	// which harness this session started as, and which sub-harness (if any) is
@@ -68,19 +101,8 @@ export class HeaderBar implements Component {
 	// lead's own
 	private base = "code";
 	private active: string | null = null;
-	constructor(
-		private cwd: string,
-		private model: string,
-	) {}
-
-	setModel(model: string): void {
-		this.model = model;
-	}
-
-	setCwd(cwd: string): void {
-		this.cwd = cwd;
-	}
-
+	// Deliberately bare otherwise: the model name lives only in the chat bar
+	// (HintLine), and the repo path only in the startup banner.
 	setBaseHarness(name: string): void {
 		this.base = name;
 	}
@@ -90,23 +112,24 @@ export class HeaderBar implements Component {
 	}
 
 	render(width: number): string[] {
-		const path = t.muted(this.cwd);
-		const dispatched = this.active !== null && this.active !== this.base;
-		const chain = dispatched
-			? `${harnessLabel(this.base)} ▸ ${harnessLabel(this.active as string)}`
-			: harnessLabel(this.base);
-		// lit badge only while a sub-harness holds the wheel; the resting state
-		// stays dim so "something else is driving" reads at a glance
-		const hb = dispatched ? t.badge(` ${chain} `) : t.dim(chain);
-		const badge = hb + "  " + t.badge(` ${this.model.toUpperCase()} `);
-		const left = ` ${path}`;
-		const gap = width - visibleWidth(left) - visibleWidth(badge) - 1;
-		let line: string;
-		if (gap < 1) {
-			line = truncateToWidth(left, width);
-		} else {
-			line = left + " ".repeat(gap) + badge + " ";
+		// All three harnesses, with the one actually executing lit. When a lead
+		// has dispatched a sub-harness the lead stays half-lit, so the chain the
+		// old `LEAD ▸ CODE` notation carried is still readable at a glance.
+		const segs = harnessStates(this.base, this.active).map(({ name, state }) => {
+			const label = harnessLabel(name);
+			if (state === "active") return t.badge(` ${label} `);
+			if (state === "dispatcher") return t.muted(label);
+			return t.dim(label);
+		});
+		let bar = segs.join("  ");
+		// too narrow for the full strip: keep the lit one, which is the only
+		// segment that answers "what is running right now"
+		if (visibleWidth(bar) + 1 > width) {
+			const current = this.active ?? this.base;
+			bar = t.badge(` ${harnessLabel(current)} `);
 		}
+		const pad = Math.max(0, width - visibleWidth(bar) - 1);
+		const line = pad > 0 ? " ".repeat(pad) + bar + " " : truncateToWidth(bar, width);
 		const fill = " ".repeat(Math.max(0, width - visibleWidth(line)));
 		return [t.panelBg(line + fill), t.dim("─".repeat(width))];
 	}
@@ -307,7 +330,8 @@ export interface DiffLine {
 export type PermissionSpec =
 	| { kind: "bash"; cmd: string }
 	| { kind: "edit" | "write"; file: string; lines: DiffLine[] }
-	| { kind: "read_outside_repo"; tool: string; path: string };
+	| { kind: "read_outside_repo"; tool: string; path: string }
+	| { kind: "mcp"; server: string; tool: string; args: string };
 
 export type Resolution = "approved" | "denied";
 
@@ -319,10 +343,15 @@ export type Resolution = "approved" | "denied";
 // present or future, can turn a permission prompt into a crash.
 function normalizeSpec(spec: PermissionSpec): PermissionSpec {
 	const s = spec as Partial<Record<string, unknown>> & { kind?: string };
-	const kind = s.kind === "bash" || s.kind === "write" || s.kind === "read_outside_repo" ? s.kind : "edit";
+	const kind =
+		s.kind === "bash" || s.kind === "write" || s.kind === "read_outside_repo" || s.kind === "mcp"
+			? s.kind
+			: "edit";
 	if (kind === "bash") return { kind, cmd: String(s.cmd ?? "") };
 	if (kind === "read_outside_repo")
 		return { kind, tool: String(s.tool ?? "read"), path: String(s.path ?? "?") };
+	if (kind === "mcp")
+		return { kind, server: String(s.server ?? "?"), tool: String(s.tool ?? "?"), args: String(s.args ?? "{}") };
 	const raw = Array.isArray(s.lines) ? (s.lines as unknown[]) : [];
 	const lines: DiffLine[] = raw.map((l) => {
 		const d = (l ?? {}) as Partial<DiffLine>;
@@ -365,7 +394,9 @@ export class PermissionCard implements Component {
 						? "✓ Write approved"
 						: this.spec.kind === "read_outside_repo"
 							? "✓ Read approved"
-							: "✓ Edit approved";
+							: this.spec.kind === "mcp"
+								? "✓ MCP call approved"
+								: "✓ Edit approved";
 			return roundedBox([t.success.bold(msg)], { width: boxW, border: b, pad: t.panelBg }).map((l) => " " + l);
 		}
 		if (this.resolved === "denied") {
@@ -647,7 +678,44 @@ export class ThinkPicker implements Component {
 	}
 }
 
+/* ---------- chat bar ghost text ---------- */
+
+/** Placeholder shown inside the empty chat bar. pi-tui's Editor has no
+ *  placeholder support, so we paint one over the padding of its content row:
+ *  the row is the reverse-video cursor block followed by blanks, and the ghost
+ *  replaces those blanks. It is inert — the moment there is text it's gone, so
+ *  it can never be mistaken for content or end up submitted. */
+export class GhostEditor extends Editor {
+	constructor(
+		tui: TUI,
+		theme: EditorTheme,
+		private ghost: string,
+	) {
+		super(tui, theme);
+	}
+
+	render(width: number): string[] {
+		const lines = super.render(width);
+		// only when genuinely empty, and only on the standard 3-row box
+		// (top rule / content / bottom rule) — anything else and we leave the
+		// editor's own output alone rather than risk corrupting a frame
+		if (lines.length < 3 || this.getText().length > 0) return lines;
+		const row = lines[1];
+		// drop the trailing blanks; escapes (the cursor block) survive because
+		// the run ends in a reset, not whitespace
+		const head = row.replace(/ +$/, "");
+		const used = visibleWidth(head);
+		if (used + visibleWidth(this.ghost) + 1 > width) return lines;
+		lines[1] = head + t.dim(this.ghost) + " ".repeat(width - used - visibleWidth(this.ghost));
+		return lines;
+	}
+}
+
 /* ---------- prompt hint line ---------- */
+
+// Plain (escape-free) accent theme used until the startup background query
+// resolves — and equivalent to what NO_COLOR / non-TTY resolve to.
+const PLAIN_THEME = resolveAccent({ background: "unknown", env: { NO_COLOR: "1" }, isTTY: true });
 
 // The three-state approval mode — the TS mirror of src/bird/permissions.py's
 // PermissionMode contract (the only intentional logic duplication, ~6 lines).
@@ -685,8 +753,20 @@ export class HintLine implements Component {
 	// null when no mode is set (Ollama's auto/default behavior). Shown next to
 	// the model name so the active reasoning effort is visible at a glance.
 	private thinkMode: string | null = null;
+	// knowledge-graph state ("ready" / "building" / "off"), or null before the
+	// server has said. Lives here rather than in the transcript so it stays
+	// visible instead of scrolling away.
+	private kg: string | null = null;
+	// resolved accent theme (set once the startup OSC 11 query
+	// lands); until then the model name renders plain.
+	private theme: AccentTheme = PLAIN_THEME;
 
 	constructor(private model: string) {}
+
+	/** Swap the resolved accent theme once the startup background query lands. */
+	setTheme(theme: AccentTheme): void {
+		this.theme = theme;
+	}
 
 	setModel(model: string): void {
 		this.model = model;
@@ -694,6 +774,10 @@ export class HintLine implements Component {
 
 	setThinkMode(mode: string | null): void {
 		this.thinkMode = mode;
+	}
+
+	setKg(status: string | null): void {
+		this.kg = status;
 	}
 
 	setTokens(input: number, output: number): void {
@@ -724,7 +808,7 @@ export class HintLine implements Component {
 	}
 
 	render(width: number): string[] {
-		const left = " " + t.muted("⏎ send · ⇧⏎ newline · / commands · ⇧⇥ cycle mode");
+		const left = " " + t.muted("⇧⇥ to cycle");
 		const mode =
 			this.mode === "full_auto"
 				? t.danger.bold("⚠ FULL AUTO")
@@ -734,17 +818,202 @@ export class HintLine implements Component {
 		const tok = this.tokens
 			? t.dim(`↑${abbrevTokens(this.tokens.in)} ↓${abbrevTokens(this.tokens.out)}  `)
 			: "";
-		// the thinking mode sits next to the model name; absent when no mode is
-		// set (Ollama's default/auto behavior) so the line stays uncluttered
+		// kg state and thinking mode sit next to the model name; each is absent
+		// when unset (Ollama's default/auto behavior) so the line stays uncluttered
 		const think = this.thinkMode ? t.dim("· think:") + t.muted(this.thinkMode) + "  " : "";
-		const right = tok + mode + "  " + think + t.muted(this.model) + " ";
-		const gap = width - visibleWidth(left) - visibleWidth(right);
-		if (gap < 1) return [truncateToWidth(left, width)];
-		return [left + " ".repeat(gap) + right];
+		const kg = this.kg ? t.dim("· kg:") + t.muted(this.kg) + "  " : "";
+		const name = renderChatBarModelName(this.model, this.theme);
+
+		// Degrade right-to-left by IMPORTANCE, not all-or-nothing: the model name
+		// is the last thing to go, so a narrow terminal never costs you the one
+		// place the model is named. Tokens drop first, then kg, then think mode,
+		// then the approval mode, then the keybinding hints on the left.
+		const rights = [
+			tok + mode + "  " + kg + think + name + " ",
+			mode + "  " + kg + think + name + " ",
+			mode + "  " + think + name + " ",
+			mode + "  " + name + " ",
+			name + " ",
+		];
+		for (const l of [left, ""]) {
+			for (const right of rights) {
+				const gap = width - visibleWidth(l) - visibleWidth(right);
+				if (gap >= 1) return [l + " ".repeat(gap) + right];
+			}
+		}
+		// narrower than the model name itself — keep its tail, which is the part
+		// that identifies the model (family suffix), same rule as the indicator
+		return [truncateToWidth(name, width)];
 	}
 }
 
 /** Same 12.4k abbreviation the arch UI uses for token counts ("12.4k / 40k"). */
 function abbrevTokens(n: number): string {
 	return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+/* ---------- model indicator (currently unmounted) ---------- */
+
+/** One line directly below the chat input frame, aligned to the prompt caret
+ *  column: accent ◆ + accent BOLD model id + dim meta ("ctx 47k/200k" etc.).
+ *  Never wraps — as width shrinks the meta segments drop right-to-left
+ *  (switch hint first, then ctx counter), then the model id truncates from
+ *  the LEFT with an ellipsis so the family stays visible. All layout logic
+ *  lives in branding.ts (pure, testable); this component only holds state.
+ *
+ *  NOT mounted: the model name is shown once, in the chat bar. Kept because
+ *  the ctx counter here has no other home if it's ever wired up. */
+export class ModelIndicator implements Component {
+	invalidate(): void {}
+	private ctxUsed: number | null = null;
+	private ctxWindow: number | null = null;
+	private switchHint: string | null = null;
+	// set for one render when the model switches mid-session: a 300ms
+	// reverse-video flash of this line, plus a permanent transcript rule.
+	private flashUntil = 0;
+
+	constructor(
+		private modelId: string,
+		private theme: AccentTheme,
+	) {}
+
+	setModel(model: string): void {
+		if (model !== this.modelId) {
+			this.modelId = model;
+			this.flashUntil = Date.now() + 300;
+		}
+	}
+
+	setContext(used: number | null, window_: number | null): void {
+		this.ctxUsed = used;
+		this.ctxWindow = window_;
+	}
+
+	/** Swap the resolved accent theme once the startup OSC 11 query lands. */
+	setTheme(theme: AccentTheme): void {
+		this.theme = theme;
+	}
+
+	setSwitchHint(hint: string | null): void {
+		this.switchHint = hint;
+	}
+
+	isFlashing(): boolean {
+		return Date.now() < this.flashUntil;
+	}
+
+	input(): IndicatorInput {
+		return {
+			modelId: this.modelId,
+			ctxUsed: this.ctxUsed,
+			ctxWindow: this.ctxWindow,
+			switchHint: this.switchHint,
+		};
+	}
+
+	render(width: number): string[] {
+		let line = renderIndicator(this.input(), this.theme, width);
+		if (this.isFlashing() && !this.theme.plain) {
+			line = "\x1b[7m" + line + "\x1b[27m";
+		}
+		return [line];
+	}
+}
+
+
+/* ---------- setup prompts (prompt_request from serve) ---------- */
+
+/** A single question from the setup walkthrough: free text, or a secret
+ * rendered as dots so a key never lands in the scrollback. ⏎ answers,
+ * esc skips (null). */
+export class PromptInput implements Component {
+	invalidate(): void {}
+	onDone?: (value: string | null) => void;
+	private input = new Input();
+
+	constructor(
+		private prompt: string,
+		private secret: boolean,
+		defaultValue = "",
+	) {
+		this.input.setValue(defaultValue);
+		this.input.onSubmit = (v) => this.onDone?.(v);
+		this.input.onEscape = () => this.onDone?.(null);
+	}
+
+	handleInput(data: string): void {
+		this.input.handleInput(data);
+	}
+
+	render(width: number): string[] {
+		const head =
+			" " +
+			t.accent("●") +
+			" " +
+			t.fg.bold(this.prompt) +
+			t.muted(this.secret ? "  (hidden) ⏎ save · esc skip" : "  ⏎ ok · esc skip");
+		const body = this.secret
+			? ["  " + t.fg("•".repeat(this.input.getValue().length)) + t.accent("▏")]
+			: this.input.render(Math.max(20, width - 2)).map((l) => "  " + l);
+		return [truncateToWidth(head, width), ...body];
+	}
+}
+
+export interface PromptChoice {
+	value: string;
+	label: string;
+	description?: string;
+}
+
+/** A pick-one question from the walkthrough (the default model). */
+export class ChoicePicker implements Component {
+	invalidate(): void {}
+	onDone?: (value: string | null) => void;
+	private list: SelectList;
+	private filter = "";
+
+	constructor(
+		private title: string,
+		choices: PromptChoice[],
+		current: string | null,
+	) {
+		const items: SelectItem[] = choices.map((c) => ({
+			value: c.value,
+			label: (c.value === current ? "● " : "  ") + c.label,
+			description: c.description ?? "",
+		}));
+		this.list = new SelectList(items, 10, {
+			selectedPrefix: (s) => t.accentBold(s),
+			selectedText: (s) => t.accentBold(s),
+			description: (s) => t.muted(s),
+			scrollInfo: (s) => t.dim(s),
+			noMatch: (s) => t.muted(s),
+		});
+		this.list.onSelect = (item) => this.onDone?.(item.value);
+		this.list.onCancel = () => this.onDone?.(null);
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.backspace)) {
+			this.filter = this.filter.slice(0, -1);
+			this.list.setFilter(this.filter);
+			return;
+		}
+		if (data.length === 1 && data >= " " && data !== "\x7f") {
+			this.filter += data;
+			this.list.setFilter(this.filter);
+			return;
+		}
+		this.list.handleInput(data);
+	}
+
+	render(width: number): string[] {
+		const head =
+			" " +
+			t.accent("●") +
+			" " +
+			t.fg.bold(this.title) +
+			t.muted(this.filter ? `  filter: ${this.filter}` : "  type to filter · ⏎ select · esc keep current");
+		return [truncateToWidth(head, width), ...this.list.render(Math.max(20, width - 2)).map((l) => "  " + l)];
+	}
 }

@@ -29,6 +29,9 @@ from ...tools.web import WebFetchTool, WebSearchTool
 from . import derive
 from .session import ArchSession
 from .state import (
+    KIND_FACTS,
+    KIND_LIST,
+    Item,
     DEPTHS,
     EDGE_KINDS,
     KINDS,
@@ -116,9 +119,13 @@ def _confirm(message: str, session: ArchSession, subjects: tuple[str, ...] = ())
 # ------------------------------------------------------------- the canvas
 
 
-def _upsert_node(session: ArchSession, spec: dict[str, Any]) -> tuple[str, bool]:
+def _upsert_node(
+    session: ArchSession, spec: dict[str, Any], auto: list[str]
+) -> tuple[str, bool]:
     """Add or update one node. Returns (id, was_new). A partial spec updates
-    only the fields it names — the canvas is not re-posted whole every time."""
+    only the fields it names — the canvas is not re-posted whole every time.
+    A `parent` that does not exist yet is created as a stub group and its id
+    appended to `auto`."""
     state = session.state
     if not isinstance(spec, dict):
         raise ToolError(f"each node must be an object, got {type(spec).__name__}.")
@@ -137,6 +144,42 @@ def _upsert_node(session: ArchSession, spec: dict[str, Any]) -> tuple[str, bool]
             setattr(candidate, name, _str(spec[name]))
     if spec.get("approaches") is not None:
         candidate.approaches = [slug(a) for a in _strlist(spec["approaches"])]
+    if spec.get("facts") is not None:
+        facts = spec["facts"]
+        if not isinstance(facts, dict):
+            raise ToolError("`facts` must be an object of key: value.")
+        merged = dict(candidate.facts)
+        for k, v in facts.items():
+            v = _str(v)
+            if v:
+                merged[str(k)] = v
+            else:
+                merged.pop(str(k), None)  # an empty value clears the fact
+        candidate.facts = merged
+    if spec.get("items") is not None:
+        raw = spec["items"]
+        if not isinstance(raw, list):
+            raise ToolError("`items` must be a list of {k, v, d}.")
+        default_key = KIND_LIST.get(candidate.kind, ("", ""))[1]
+        items: list[Item] = []
+        for it in raw:
+            if isinstance(it, str):
+                items.append(Item(v=it, k=default_key))
+            elif isinstance(it, dict):
+                items.append(Item(v=_str(it.get("v")), k=_str(it.get("k")) or default_key, d=_str(it.get("d"))))
+            else:
+                raise ToolError("each item is a string or {k, v, d}.")
+        candidate.items = items  # the list is replaced whole, not merged
+    if spec.get("parent") is not None:
+        parent = slug(_str(spec["parent"]))
+        if parent and parent not in state.nodes and parent != nid:
+            # like a missing edge endpoint: the container is drawn as a stub so
+            # the members can be named first and the box around them after
+            stub = Node(id=parent, label=parent.replace("-", " "), kind="group")
+            _check(state.validate_node, stub)
+            state.nodes[parent] = stub
+            auto.append(parent)
+        candidate.parent = parent
     _check(state.validate_node, candidate)
     state.nodes[nid] = candidate
     return nid, current is None
@@ -194,9 +237,12 @@ def _remove(session: ArchSession, ref: str) -> str:
     if nid not in state.nodes:
         raise ToolError(f"no node {nid!r} to remove.")
     dropped = state.references_to(nid)
+    lifted = state.orphan_children(nid)
     state.edges = [e for e in state.edges if nid not in (e.src, e.dst)]
     del state.nodes[nid]
     tail = f" (and {len(dropped)} edge(s))" if dropped else ""
+    if lifted:
+        tail += f"; its {len(lifted)} member(s) now sit where it was"
     return f"node {nid}{tail}"
 
 
@@ -213,9 +259,28 @@ _NODE_ITEM = {
             "description": "stub = a name to react to · sketch = it has a job · "
                            "detailed = you have said what is inside. Lowering it is allowed.",
         },
-        "detail": {"type": "string", "description": "prose: what's inside, in whatever "
-                                                    "shape fits — schema sketch, endpoints, "
-                                                    "retention, failure behaviour"},
+        "detail": {"type": "string", "description": "prose for what fits neither `facts` "
+                                                    "nor `items` — failure behaviour, a caveat"},
+        "facts": {
+            "type": "object", "additionalProperties": {"type": "string"},
+            "description": "the fixed facts for the kind, drawn as key/value on the box. "
+                           + " · ".join(f"{k}: {', '.join(v)}" for k, v in KIND_FACTS.items() if v)
+                           + ". One word per value reads as a chip. \"\" clears one. Merged.",
+        },
+        "items": {
+            "type": "array",
+            "items": {"anyOf": [
+                {"type": "string"},
+                {"type": "object", "properties": {
+                    "k": {"type": "string", "description": "short key drawn in front: GET, tbl, fn"},
+                    "v": {"type": "string", "description": "the thing: /orders, sessions, mutate(op)"},
+                    "d": {"type": "string", "description": "one line under it, optional"},
+                }, "required": ["v"], "additionalProperties": False},
+            ]},
+            "description": "the box's list — "
+                           + " · ".join(f"{k}: {v[0]}" for k, v in KIND_LIST.items() if v[0] != "members")
+                           + ". Replaces the whole list. Six or fewer read; more fold.",
+        },
         "approaches": {
             "type": "array", "items": {"type": "string"},
             "description": "approach ids this box belongs to. OMIT for a box every "
@@ -223,6 +288,12 @@ _NODE_ITEM = {
         },
         "notes": {"type": "string"},
         "status": {"type": "string", "enum": list(STATUSES)},
+        "parent": {
+            "type": "string",
+            "description": "id of the box this one sits inside. A box with members "
+                           "is drawn as a container around them and can be folded "
+                           "shut. \"\" lifts a box back to the top level.",
+        },
     },
     "additionalProperties": False,
 }
@@ -250,10 +321,19 @@ class CanvasTool(Tool):
         "A node's `depth` is a slider you move both ways — deepen a box when the "
         "conversation reaches its branch, collapse it back when the detail stopped "
         "earning its place. A partial spec updates only the fields it names.\n"
+        "What is inside a box has a shape per kind: `facts` are its fixed key/values "
+        "(a store's engine and retention, a queue's delivery guarantee), `items` its "
+        "list (endpoints, tables, topics, tools). Use those before `detail`; a fact "
+        "in the same place on every box is what makes a board scannable.\n"
         "Missing edge endpoints are created as stubs, so you can draw the flow first "
         "and name what is in the boxes after.\n"
         "`approaches` is what makes rival takes coexist: label the boxes that differ, "
-        "and OMIT the label on the ones both takes share so they are drawn once."
+        "and OMIT the label on the ones both takes share so they are drawn once.\n"
+        "`parent` is what keeps a big board readable: past a dozen boxes, put the ones "
+        "that belong together inside a `group` box (kind: group) named for what they "
+        "do together — 'ingestion', 'billing' — not for a technology. Wires between "
+        "members stay inside; wires that cross the boundary are the subsystem's "
+        "interface, and the reader sees them on the container when it is folded."
     )
     parameters = {
         "type": "object",
@@ -281,7 +361,7 @@ class CanvasTool(Tool):
         added = updated = 0
         subjects: list[str] = []
         for spec in nodes:
-            nid, was_new = _upsert_node(session, spec)
+            nid, was_new = _upsert_node(session, spec, auto)
             subjects.append(nid)
             added, updated = (added + 1, updated) if was_new else (added, updated + 1)
         new_edges = same_edges = 0
@@ -752,9 +832,16 @@ class ImportRepoTool(Tool):
                 "that scope matched no nodes in the graph; try a file path, a symbol "
                 "name, or a broader term."
             )
+        # members name their containers, so everything lands before anything is
+        # checked; the board was empty, so a refusal leaves it empty again
         for node in result.nodes:
-            _check(state.validate_node, node)
             state.nodes[node.id] = node
+        try:
+            for node in result.nodes:
+                _check(state.validate_node, node)
+        except ToolError:
+            state.nodes.clear()
+            raise
         for edge in result.edges:
             _check(state.validate_edge, edge)
             state.edges.append(edge)

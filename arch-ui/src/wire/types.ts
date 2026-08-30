@@ -18,15 +18,23 @@ export interface WireNode {
   tech: string;
   depth: Depth;
   detail: string;
+  /** the kind's fixed facts, key -> value (see board/vocab.ts) */
+  facts: Record<string, string>;
+  /** the box's list: endpoints, tables, topics, tools */
+  items: WireItem[];
   /** approach ids this box belongs to; empty = shared by all of them */
   approaches: string[];
   status: Status;
   notes: string;
   existing: boolean;
+  /** id of the box this one sits inside; "" = top level */
+  parent: string;
   /** where somebody put it; null = never arranged, lay it out */
   x: number | null;
   y: number | null;
 }
+
+export interface WireItem { k: string; v: string; d: string }
 
 export interface WireEdge {
   src: string;

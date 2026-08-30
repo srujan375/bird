@@ -56,12 +56,26 @@ interface Props {
   paths: WirePath[];
   /** the wire being dragged out of a port, if any */
   temp: string | null;
+  /** boxes whose wires should light up — the one under the pointer and the
+   *  one selected. With any set, every other wire steps back. */
+  hot: Set<string>;
 }
 
-function WiresImpl({ paths, temp }: Props) {
+/** Past this many wires, labels are read by pointing, not all at once. */
+const QUIET_ABOVE = 18;
+
+function WiresImpl({ paths, temp, hot }: Props) {
   const layer = useDrawIn(paths);
+  const focus = hot.size > 0;
+  const quiet = paths.length > QUIET_ABOVE;
   return (
-    <svg className="wires" id="wires" aria-hidden="true">
+    <svg
+      className="wires"
+      id="wires"
+      aria-hidden="true"
+      {...(focus ? { "data-focus": "1" } : {})}
+      {...(quiet ? { "data-quiet": "1" } : {})}
+    >
       <defs>
         <marker id="head" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M0 0 L8 4 L0 8 Z" />
@@ -74,20 +88,24 @@ function WiresImpl({ paths, temp }: Props) {
         </marker>
       </defs>
       <g id="wire-layer" ref={layer}>
-        {paths.map((p) => (
-          <g key={p.key}>
+        {paths.map((p) => {
+          const lit = focus && (hot.has(p.from) || hot.has(p.to));
+          return (
+          <g key={p.key} {...(lit ? { "data-lit": "1" } : {})}>
             <path
               className="wire"
               d={p.d}
               {...(p.fresh ? { "data-fresh": "1", style: { opacity: 0 } } : {})}
               {...(p.out ? { "data-out": "1" } : {})}
-              markerEnd={`url(#${p.out ? "head-out" : "head"})`}
+              {...(lit ? { "data-lit": "1" } : {})}
+              markerEnd={`url(#${lit ? "head-lit" : p.out ? "head-out" : "head"})`}
             />
             {p.label ? (
               <text className="wire-label" x={p.lx} y={p.ly} textAnchor="middle">{p.label}</text>
             ) : null}
           </g>
-        ))}
+          );
+        })}
         {temp ? (
           <path id="tmp-wire" className="wire" d={temp}
                 markerEnd="url(#head)" style={{ strokeDasharray: "4 4" }} />

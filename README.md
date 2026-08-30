@@ -37,19 +37,20 @@ So the leverage moves upstream, to the questions an agent is worst at asking
 itself: what are the components, how do they talk, what happens when one of them
 is down, and which trade-offs did we take deliberately rather than by accident.
 `bird` treats that as a first-class mode of work — `bird arch` is a harness with
-its own tools, its own canvas and its own critic, not a paragraph pasted above a
-coding prompt.
+its own tools, its own canvas and its own review loop, not a paragraph pasted
+above a coding prompt.
 
 - **Architecture is a mode, not a preamble.** `bird arch` opens a live canvas and
   designs *with* you, recording each decision as you take it alongside the
   alternatives you rejected, so the reasoning outlives the conversation that
   produced it.
-- **A second model argues with the first.** A background critic reviews the
-  architect's design on its own thread every turn and files objections of its
-  own — typed, carrying a severity, and hard to lose: open blockers surface at the
-  finalize gate instead of quietly yielding to the last thing anyone said.
-  Agreement is the failure mode here. One model asked to both design and review
-  its own work will approve it, at length, in confident prose.
+- **A second model argues with the first.** The architect's design is reviewed
+  every turn — not by a second model, but by deterministic checks (`derive.py`)
+  that reach it as material for its next recommendation, and by you: objections
+  are filed as typed `concern`s carrying a severity, and open blockers surface
+  at the finalize gate instead of quietly yielding to the last thing anyone
+  said. Agreement is the failure mode here. One model asked to both design and
+  review its own work will approve it, at length, in confident prose.
 - **A design is an artifact, not scrollback.** Finalizing writes a bundle *and*
   seeds the knowledge graph with a node per component, entity and endpoint, so
   `bird code` starts able to query a system that doesn't exist yet — and so the
@@ -95,9 +96,6 @@ are the memory.
   severity, against the design, against a decision, or against *your*
   instruction. Open blockers are shown at the finalize gate instead of silently
   blocking work.
-- **A background critic.** A second model reviews the design on its own thread
-  each turn and files concerns of its own. The architect answers them, acts on
-  them, or overrules them with a reason.
 - **Nothing is phase-locked.** Tools refuse only what is *broken* (an edge to a
   component that doesn't exist). Thin design comes back as advice, not a refusal.
   Post-approval structural edits record an amendment, because the audit trail
@@ -113,12 +111,14 @@ bird arch "design a multi-tenant billing service"
 bird code "build it" --from-arch latest      # or let the lead do both
 ```
 
-<img alt="the critic, running deepseek-v4-flash, files an objection about emitted[0] being set on the first reasoning chunk; the architect replies 'You're right' and revises the design" src="assets/arch-critic.png" width="900">
+<img alt="bird arch reviewing its own design: a thinness check surfaces as the architect's own recommendation to set a retention policy, and the user answers it" src="assets/arch-critic.png" width="900">
 
-<sub>`bird arch` reviewing its own design. The critic — on its own model, here
-`deepseek-v4-flash` — files objections against the architect's work, and each one
-is accepted or overruled on the record rather than silently dropped. The architect
-conceded this one.</sub>
+<sub>`bird arch` reviewing its own design. The deterministic thinness checks in
+`derive.py` reach the architect as material for its next recommendation — "one
+thing I'm noticing — this store has no retention policy, that'll bite you at
+scale; set one now or defer it?" — and the user answers on the record. There is
+no second model: the user is in the room the whole time, which makes them the
+critic.</sub>
 
 ---
 
@@ -168,6 +168,19 @@ meantime the flag is on your machine: run any task both ways and see what you ge
 
 ## Install
 
+One line (needs `git` and Python 3.11+; Node is optional and adds the TUI):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/srujan375/bird/main/install.sh | sh
+```
+
+That checks out bird into `~/.bird/app`, installs it into its own venv, links
+`bird` into `~/.local/bin`, and installs the TUI when `npm` is present. Run the
+same line again to upgrade; `rm -rf ~/.bird/app ~/.local/bin/bird` uninstalls.
+`BIRD_REF=<branch>` pins a branch, `BIRD_NO_TUI=1` skips the TUI.
+
+Or by hand, from a clone:
+
 ```bash
 git clone https://github.com/srujan375/bird.git && cd bird
 python3 -m venv .venv && .venv/bin/pip3 install -e '.[dev]'
@@ -193,9 +206,44 @@ Requires Python 3.11+, plus at least one model source:
 |---|---|
 | **Ollama Cloud** *(what the shipped `models.json` points at)* | `OLLAMA_API_KEY` |
 | **OpenRouter** | `OPENROUTER_API_KEY` |
-| **Local Ollama** | `ollama serve`, then set the `ollama` provider's `native_url` to `http://localhost:11434` in `models.json`. Missing models are pulled on demand |
+| **Local Ollama** | `ollama serve`; any `ollama:<model>` spec without a cloud marker is served by the local daemon, which pulls missing models on demand |
+| **Ollama cloud** | set `OLLAMA_API_KEY`; specs with Ollama's cloud marker — `ollama:glm-5.3:cloud`, `ollama:gpt-oss:120b-cloud` — go straight to ollama.com |
 
 Put keys in a `.env` at the repo root. It's loaded automatically.
+
+**First launch.** The first time you run `bird` it walks you through setup
+before anything else: it probes what's reachable (local Ollama daemon, Ollama
+Cloud, OpenRouter), asks for the keys you want to use (typed hidden, stored in
+`~/.bird/.env` with mode 600), lists the models that are actually usable with
+what you have, and verifies your pick with one real call. Every question can be
+skipped with an empty answer. It runs once (`~/.bird/setup-done` remembers;
+`BIRD_SKIP_SETUP=1` suppresses it, e.g. in CI); afterwards the same things are
+slash commands inside any session:
+
+| In a session | Does |
+|---|---|
+| `/setup` | the walkthrough again — keys, model pick, verify |
+| `/doctor` | health check, one line per check, a fix hint per failure |
+| `/keys` | which provider keys are set and where they come from |
+| `/keys set OLLAMA_API_KEY` | store a key (prompted, never echoed) — live immediately, no restart |
+
+The same flows exist as shell commands for scripts and for the case where a
+session can't start at all: `bird setup [--yes]` and `bird doctor`.
+
+**The `~/.bird/` config layer.** Your config lives in `~/.bird/` (`models.json`,
+`.env`, `skills/`), so it survives reinstalls and applies in every repo. Nothing
+is written to the package's own `models.json` — that stays pristine across
+upgrades. Precedence:
+
+- **models.json:** an explicit `--models-json <path>` is used exactly, no
+  merging; otherwise `~/.bird/models.json` is merged over the builtin
+  `src/bird/models.json` per top-level key (your `models`, `aliases` and
+  `providers` win; builtin entries you didn't override survive). `set_default`
+  and `/think` persist to the user file, creating it from the merged state if
+  it doesn't exist yet.
+- **environment:** shell export > `.env` in the current repo > `~/.bird/.env`.
+  Later loads only fill gaps, so a per-repo override wins where it exists and
+  keys written by `bird setup` are still found everywhere else.
 
 Optional frontends (both work without them, both are one `npm install`):
 
@@ -212,7 +260,6 @@ real hours on them:
 |---|---|---|
 | `default` — the `code` loop | `qwen3.8:27b` today; `ornith` (9B) and `ornith:35b` before it | where most of the mileage is |
 | `architect` — `bird arch` | `qwen3.8:27b` today; `glm-5.2` before it | `glm-5.2` is the arm measured in [the numbers](#the-numbers) |
-| `judge` — the critic | `deepseek-v4-flash` | deliberately *not* the architect's model, so it reads the design cold |
 | `compactor` | `gemma4:31b` | only ever summarizes a transcript; it never sees a task |
 | `kg` | `kimi-k2.7-code` | reads docs and papers into the graph. No code reaches it — extraction there is pure AST — so a cheap mid-tier model is the right call |
 
@@ -308,8 +355,8 @@ investigation that lands its findings in the knowledge graph). See
 - Interactive picker fed by live discovery: `models.json`, the Ollama daemon
   you're pointed at, and the OpenRouter catalog, merged and deduped. Unreachable
   or unconfigured sources are skipped with a note, not an error.
-- Named roles in `models.json`: `default`, `architect`, `judge`, `compactor`,
-  `vision`, `kg`, so the critic and the compactor are never the model under test.
+- Named roles in `models.json`: `default`, `architect`, `compactor`,
+  `vision`, `kg`, so the compactor is never the model under test.
 - `kg` names the model that reads docs/papers into the graph. It wants context
   (chunks are packed to 60k tokens) and clean JSON, not brilliance. Code never
   reaches it, so a cheap mid-tier model is the right choice here.
@@ -361,6 +408,8 @@ bird code "task" --from-arch latest   # seed from a finalized architecture
 bird arch ["what to design"]  # architecture session in the browser
 bird kg status|build|update|query "question"
 bird serve [--harness code|lead]      # JSON-lines bridge over stdio
+bird setup [--yes]                    # the first-launch walkthrough, on demand (also /setup in a session)
+bird doctor                           # health check: one line per check, a fix hint per failure
 ```
 
 **Flags**, shared by `code` / `chat` / `lead` / `serve` / `arch`:
@@ -369,8 +418,7 @@ bird serve [--harness code|lead]      # JSON-lines bridge over stdio
 graph tool) · `--no-web` (drop `web_search` / `web_fetch`, for a network-free
 run). Then `-y/--yes` (auto-approve, for unattended `code`/`lead` runs) ·
 `--tui` / `--plain` (interactive surface) · `--from-arch <run-id|latest>`.
-`arch` adds `--no-open` / `--headless`, plus `--no-critic` and `--judge-model
-<spec>` to control the background critic. `kg` takes `--repo`, `--budget` and
+`arch` adds `--no-open` / `--headless`. `kg` takes `--repo`, `--budget` and
 `--models-json`.
 
 **Slash commands** (REPL and TUI):
@@ -425,7 +473,7 @@ src/bird/
   harnesses/
     registry.py     name → HarnessDef → built Runner (the one construction path)
     lead/           the front door: routing policy + dispatch tools
-    arch/           state, tools, sketch, critic, renderers, bundle, KG seed
+    arch/           state, tools, sketch, derive, renderers, bundle, KG seed
     code/           the coding loop's instructions + toolset
     handoff.py      the arch → code seam
   tools/            shared toolbox: read/edit/write, bash, kg_query, web, plan,

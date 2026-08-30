@@ -80,18 +80,19 @@ export interface BoardLayout {
 
 /* ── heights ──────────────────────────────────────────────────────────── */
 
-/* Cross-checked against the rendered board: a one-line stub measures 39px, a
-   two-line stub 56, and detailed boxes 121–171 depending on their prose. These
-   constants track `.node` in board.css and only have to be close — the DOM
-   replaces them on the next frame. */
-const CHROME = 21;   // padding 9 + 10, border 1 + 1
-const LINE_LABEL = 17.5;
-const LINE_RESP = 17.75;
-const LINE_MONO = 13.5;
-const RESP_TOP = 5;
-const DEEP_TOP = 18; // margin 9 + rule 1 + padding 8
-const ROWS_TOP = 7;
-const ROW_GAP = 3;
+/* Tracks `.node` in board.css — the proposed card: 12/14 padding, a 15px
+   display label, 13.5px sentence, a key/value strip at 12.5px mono, keyed
+   list rows, and a wire-derived footer. Only has to be close — the DOM
+   replaces the estimate on the next frame. */
+const CHROME = 26;    // padding 12 + 12, border 1 + 1
+const LINE_LABEL = 19;
+const LINE_RESP = 19.5;
+const LINE_MONO = 18.75;  // 12.5px * 1.5
+const RESP_TOP = 8;
+const SECTION_TOP = 23;   // margin 12 + rule 1 + padding 10
+const ROW_H = 24;         // 12.5px/1.45 + 3+3 padding
+const ROW_D = 16;         // a description line under a row
+const FOOT_H = 16;
 
 /** Roughly how many lines of `text` fit across `width` at `perChar` px. */
 const lines = (text: string, width: number, perChar: number) =>
@@ -101,16 +102,22 @@ const lines = (text: string, width: number, perChar: number) =>
  *  said. Never used once `Board.tsx` has a measurement for it. */
 export function estimateHeight(n: BoardNode): number {
   const w = W[n.depth] ?? W.stub;
-  const inner = w - 24; // horizontal padding
-  // the kind chip sits beside the label and eats into its line
-  const head = LINE_LABEL * lines(n.label, inner - n.kind.length * 6 - 8, 7.2);
+  const inner = w - 27; // horizontal padding + the lane rule
+  // the kind pill sits beside the label and eats into its line
+  const head = LINE_LABEL * lines(n.label, inner - n.kind.length * 7 - 22, 8);
   let h = CHROME + head;
-  if (n.depth !== "stub" && n.resp) h += RESP_TOP + LINE_RESP * lines(n.resp, inner, 6.6);
-  if (n.depth === "detailed" && (n.tech || n.rows.length)) {
-    h += DEEP_TOP;
-    if (n.tech) h += LINE_MONO * lines(n.tech, inner, 6.3);
-    // rows are `white-space:nowrap` with an ellipsis — always exactly one line
-    if (n.rows.length) h += ROWS_TOP + n.rows.length * LINE_MONO + (n.rows.length - 1) * ROW_GAP;
+  if (n.depth === "stub") return Math.round(h);
+  if (n.resp) h += RESP_TOP + LINE_RESP * lines(n.resp, inner, 7);
+  const facts = n.facts.filter(([, v]) => v);
+  if (facts.length || n.tech) h += SECTION_TOP + (facts.length + (n.tech ? 1 : 0)) * LINE_MONO;
+  if (n.depth === "detailed") {
+    const rows = n.items.length ? n.items : n.rows.map((v) => ({ k: "", v, d: "" }));
+    if (rows.length) {
+      const shown = rows.slice(0, 6);
+      h += SECTION_TOP + 20 + shown.length * ROW_H + shown.filter((r) => r.d).length * ROW_D;
+      if (rows.length > 6) h += 18;
+    }
+    if (n.derived.length) h += SECTION_TOP - 1 + FOOT_H;
   }
   return Math.round(h);
 }

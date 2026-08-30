@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from .activity import attach_printer
 from .context.kg import KG
 from .engine.runner import Runner
 from .engine.session import SessionRecorder, new_run_id
 from .llm.ollama import Ollama, OllamaError
-from .llm.registry import Registry, RegistryError
+from .llm.registry import USER_ENV_FILE, Registry, RegistryError
+from .llm.wire.openai_compat import WireError
 from .llm.wire.openai_compat import OpenAICompatClient
 from .harnesses.handoff import read_seed
 from .harnesses.lead import lead_harness_tools
@@ -26,6 +28,26 @@ from .skills import load_skills
 # gives up sooner the moment the page closes; this is only the backstop for a
 # tab left open and forgotten.
 ARCH_LINGER_SECONDS = 30 * 60
+
+
+def _model_source_missing() -> bool:
+    """True when nothing can serve a model: no provider key in the environment
+    after every .env load, and no local Ollama daemon answering. Failure-tolerant
+    by design — a daemon that isn't there must read as 'down', never raise."""
+    if os.environ.get("OLLAMA_API_KEY") or os.environ.get("OPENROUTER_API_KEY"):
+        return False
+    try:
+        return not Ollama(timeout=2.0).is_up()
+    except Exception:
+        return True
+
+
+def _print_first_run_hint() -> None:
+    """One non-blocking line when an interactive session boots with no model
+    source configured. Never prompts, never blocks, and is only called from
+    interactive (tty) paths — a one-shot run just fails with its own error."""
+    if _model_source_missing():
+        print("no model source configured — run `bird setup`")
 
 
 def _add_common(p) -> None:
@@ -46,7 +68,14 @@ def _add_common(p) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    # Env precedence: shell export > CWD .env > ~/.bird/.env. The CWD load
+    # keeps per-repo overrides working; the user file loads after with
+    # override=False so it only fills gaps — keys there survive changing
+    # directories, which a CWD-only .env never did. find_dotenv(usecwd=True)
+    # because a bare load_dotenv() resolves relative to this file's location,
+    # not the process cwd — a per-repo .env would never be found.
+    load_dotenv(find_dotenv(usecwd=True))
+    load_dotenv(USER_ENV_FILE, override=False)
     if argv is None:
         argv = sys.argv[1:]
     if not argv:
@@ -108,7 +137,68 @@ def main(argv: list[str] | None = None) -> int:
     kg_cmd.add_argument("--budget", type=int, default=2000)
     kg_cmd.add_argument("--models-json", default=None, help="path to a models.json override")
 
+    mcp_cmd = sub.add_parser("mcp", help="manage MCP servers (mcp.json)")
+    mcp_sub = mcp_cmd.add_subparsers(dest="mcp_command", required=True)
+    mcp_add = mcp_sub.add_parser("add", help="add a server entry")
+    mcp_add.add_argument("name", help="server name (registry name with --from-registry)")
+    mcp_add.add_argument("--command", default=None, help="launch command (e.g. npx, uvx)")
+    mcp_add.add_argument("--args", nargs="*", default=None, help="command arguments")
+    mcp_add.add_argument("--env", action="append", default=None, metavar="K=V",
+                         help="environment variable (repeatable; '$VAR' keeps the "
+                              "value in the environment, out of the file)")
+    mcp_add.add_argument("--scope", choices=["user", "project"], default="project")
+    mcp_add.add_argument("--from-registry", action="store_true",
+                         help="resolve the name in the official MCP registry, show the "
+                              "translated entry, and install after confirmation")
+    mcp_list = mcp_sub.add_parser("list", help="list configured servers")
+    mcp_get = mcp_sub.add_parser("get", help="show one entry + connection check")
+    mcp_get.add_argument("name")
+    mcp_rm = mcp_sub.add_parser("remove", help="remove a server entry")
+    mcp_rm.add_argument("name")
+    mcp_rm.add_argument("--scope", choices=["user", "project"], default="project")
+    mcp_search = mcp_sub.add_parser("search", help="search the official MCP registry")
+    mcp_search.add_argument("query")
+    mcp_cmd.add_argument("--repo", default=".")
+
+    setup_cmd = sub.add_parser(
+        "setup", help="first-run setup: probe model sources, write keys and defaults to ~/.bird/"
+    )
+    setup_cmd.add_argument("--models-json", default=None, help="path to a models.json override")
+    setup_cmd.add_argument(
+        "-y", "--yes", action="store_true",
+        help="non-interactive: apply detected defaults, print what still needs attention",
+    )
+
+    doctor_cmd = sub.add_parser(
+        "doctor", help="health check: one line per check, a fix hint per failure"
+    )
+    _add_common(doctor_cmd)
+
     args = parser.parse_args(argv)
+    try:
+        return _dispatch(args)
+    except WireError as e:
+        # a provider refusal in a one-shot run: say what to do, not a traceback
+        msg = str(e)
+        hint = (" — run `bird setup` (or /setup in a session) to store a key or pick a local model"
+                if "401" in msg or "Unauthorized" in msg else "")
+        print(f"error: {msg}{hint}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(args) -> int:
+    if args.command == "mcp":
+        from .mcp.management import mcp_main
+
+        return mcp_main(args, Path(args.repo).resolve())
+    if args.command == "setup":
+        from .setup import setup_main
+
+        return setup_main(args)
+    if args.command == "doctor":
+        from .doctor import doctor_main
+
+        return doctor_main(args)
     if args.command == "kg":
         return _kg_main(args)
     if args.command == "serve":
@@ -223,7 +313,14 @@ def _headless_broker(args):
 
 def _make_runner(args, registry, spec, kg, recorder, *, harness="code",
                  tools=None, seed_context=None, broker=None) -> Runner:
+    from .mcp import load_mcp_servers
+
     repo_root = Path(args.repo).resolve()
+    # mcp.json is read once per process here. A corrupt file raises McpError
+    # and the caller exits 2 — the user's own config is unparseable, which is
+    # a config bug, not a degraded session. A server that merely fails to
+    # START is handled inside build_runner (logged, skipped, session lives).
+    mcp_servers = load_mcp_servers(repo_root)
     ctx = ToolContext(
         repo_root=repo_root,
         kg=kg,
@@ -250,7 +347,21 @@ def _make_runner(args, registry, spec, kg, recorder, *, harness="code",
         with_web=not getattr(args, "no_web", False),
         tools=tools,
         seed_context=seed_context,
+        mcp_servers=mcp_servers,
     )
+
+
+def _close_mcp_clients(runner: Runner) -> None:
+    """Shut down the MCP server subprocesses build_runner started.
+
+    Each close() is stdin close -> terminate -> kill(5s grace), so a hung
+    server can't hold the process open. Best-effort: one misbehaving server
+    must not keep the others (or the exit code) from a clean shutdown."""
+    for client in getattr(runner.ctx, "mcp_clients", []):
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def _code_main(args) -> int:
@@ -276,6 +387,7 @@ def _code_main(args) -> int:
         if build_proc is not None:
             print("kg: building in background; harness starts now")
         result = runner.run(args.task)
+        _close_mcp_clients(runner)
 
     # best-effort background KG refresh after the run; non-blocking and never a
     # failure — a stale graph must not affect the exit code.
@@ -340,6 +452,7 @@ def _arch_repl_main(args) -> int:
               f"| session={run_id}")
         print(f"board: {run_dir / 'arch_state.json'}")
         rc = repl.run(args.task)
+        _close_mcp_clients(runner)
         if arch.state.handed_off:
             from .harnesses.arch.bundle import bundle_paths
 
@@ -350,15 +463,84 @@ def _arch_repl_main(args) -> int:
         return rc
 
 
+def _first_run_console(args) -> None:
+    """A fresh install's first interactive launch: run the setup walkthrough
+    on the terminal before anything tries to reach a model."""
+    from .onboard import ConsoleIO, needs_first_run, walkthrough
+
+    if not needs_first_run() or not sys.stdin.isatty():
+        return
+    walkthrough(ConsoleIO(), Registry.load(args.models_json), first_run=True)
+    print()
+
+
+def _first_run_bridge(args) -> None:
+    """The same walkthrough for a TUI-spawned serve: questions go out as
+    prompt_request events and answers are read back from stdin here, before
+    the Server (and its own reader loop) exists."""
+    import json
+
+    from .onboard import Prompter, TransportIO, needs_first_run, walkthrough
+
+    if not needs_first_run():
+        return
+
+    def emit(event_type: str, **data) -> None:
+        sys.stdout.write(json.dumps({"type": event_type, **data}, ensure_ascii=False, default=str) + "\n")
+        sys.stdout.flush()
+
+    class SyncPrompter(Prompter):
+        """Prompter.request blocks on an Event that only a reader can set,
+        and no reader loop exists yet — so ask from a helper thread and pump
+        stdin here until the answer (or an interrupt / EOF) arrives."""
+
+        def request(self, payload):
+            import threading
+
+            result: list = []
+            t = threading.Thread(target=lambda: result.append(Prompter.request(self, payload)), daemon=True)
+            t.start()
+            self._pump()
+            t.join()
+            return result[0] if result else None
+
+        def _pump(self) -> None:
+            for raw in sys.stdin:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("type") == "prompt_response":
+                    value = msg.get("value")
+                    self.resolve(int(msg.get("id", 0)), None if value is None else str(value))
+                    return
+                if msg.get("type") == "interrupt":
+                    self.cancel_all()
+                    return
+            self.cancel_all()  # stdin closed
+
+    io = TransportIO(emit, SyncPrompter(emit))
+    emit("setup_start")
+    walkthrough(io, Registry.load(args.models_json), first_run=True)
+    emit("setup_end")
+
+
 def _repl_session(args, harness: str = "code", tools=None, seed_context=None) -> int:
     """The plain REPL for any interactive harness (chat=code, bare bird=lead)."""
     from .permissions import ConsoleBroker
     from .repl import Repl
 
+    _first_run_console(args)
     setup = _setup(args)
     if isinstance(setup, int):
         return setup
     registry, spec, kg, _build_proc, run_id, run_dir = setup
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        _print_first_run_hint()
 
     with SessionRecorder(run_dir) as recorder:
         # the REPL runs turns on the main thread, so the prompt is just input()
@@ -371,7 +553,9 @@ def _repl_session(args, harness: str = "code", tools=None, seed_context=None) ->
         # freshly-loaded code/skills without losing history.
         if getattr(args, "resume", None):
             _resume_into_repl(repl, args.resume, registry)
-        return repl.run()
+        rc = repl.run()
+        _close_mcp_clients(runner)
+        return rc
 
 
 def _serve_main(args) -> int:
@@ -379,6 +563,7 @@ def _serve_main(args) -> int:
     from .repl import Repl
     from .serve import Server
 
+    _first_run_bridge(args)
     setup = _setup(args)
     if isinstance(setup, int):
         return setup
@@ -403,7 +588,9 @@ def _serve_main(args) -> int:
         # on freshly-loaded code/skills without losing history.
         if getattr(args, "resume", None):
             _resume_into_repl(repl, args.resume, registry)
-        return Server(repl, broker=broker).run()
+        rc = Server(repl, broker=broker).run()
+        _close_mcp_clients(runner)
+        return rc
 
 
 def _arch_main(args) -> int:
@@ -489,6 +676,7 @@ def _arch_main(args) -> int:
         except KeyboardInterrupt:
             transport.shutdown()
             rc = 0
+        _close_mcp_clients(runner)
         time.sleep(0.3)  # let SSE clients drain the finalized/bye events
         if arch.state.handed_off:
             # (we are only here once the page closed or the linger ran out)
@@ -572,6 +760,7 @@ def _lead_main(args) -> int:
         if build_proc is not None:
             print("kg: building in background")
         result = runner.run(args.task)
+        _close_mcp_clients(runner)
 
     print(f"\n[{result.status}] {result.summary}")
     return 0 if result.status == "done" else 1

@@ -42,7 +42,10 @@ def _client(captured_transport, **kwargs) -> tuple[Ollama, dict[str, httpx.Reque
     return o, captured
 
 
-def test_no_api_key_sends_no_auth_header(transport):
+def test_no_api_key_sends_no_auth_header(transport, monkeypatch):
+    # pin the precondition the name states: no key anywhere (an ambient
+    # OLLAMA_API_KEY in the developer's shell would otherwise be picked up)
+    monkeypatch.delenv(DEFAULT_API_KEY_ENV, raising=False)
     o, captured = _client(transport)
     try:
         assert o.is_up() is True

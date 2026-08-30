@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toBoard } from "../board/adapter";
 import { bounds as calcBounds, rect, snap, STEP, wirePaths } from "../board/geometry";
-import type { BoardNode, Tool } from "../board/types";
+import type { BoardNode, NodeField, Tool } from "../board/types";
 import {
   clearNodeDraft, clearNoteDraft, draftNode, draftNote, flash, getUi,
-  nextLocalId, select, setEditing, setTool, useUi,
+  nextLocalId, select, setEditing, setFolded, setHot, setTool, useUi,
 } from "../board/ui";
 import { setViewApi } from "../board/viewApi";
 import { mutate, refusal, useSession } from "../wire/session";
@@ -13,17 +13,25 @@ import { useView } from "../hooks/useView";
 import { Annotation } from "./Annotation";
 import { Dock } from "./Dock";
 import { Lanes } from "./Lanes";
-import { NodeCard, type NodeAct } from "./NodeCard";
+import { fieldOrder, itemText, NodeCard, parseItem, type Nav, type NodeAct } from "./NodeCard";
+import { KIND_LIST } from "../board/vocab";
 import { Wires } from "./Wires";
 import { Zoomer } from "./Zoomer";
 
 type Drag =
   | { mode: "pan"; sx: number; sy: number; vx: number; vy: number }
-  | { mode: "node"; id: string; ox: number; oy: number; moved: boolean }
+  | { mode: "node"; id: string; ox: number; oy: number; moved: boolean; cx0: number; y0: number }
   | { mode: "anno"; id: string; ox: number; oy: number; moved: boolean }
   | { mode: "wire"; from: string };
 
 const EMPTY = { lanes: [], nodes: [], wires: [], annos: [] };
+
+/** The key a new list row wears when the person typed none — mirrors
+ *  KIND_LIST in state.py. */
+const DEFAULT_KEY: Record<string, string> = {
+  service: "op", api: "GET", store: "tbl", queue: "msg", ui: "scr", llm: "fn", external: "call", infra: "res",
+};
+const defaultKey = (kind: string) => DEFAULT_KEY[kind] ?? "";
 
 export function Board({ setTip }: { setTip: (t: string) => void }) {
   const { arch, handedOff, bornWith } = useSession();
@@ -45,19 +53,27 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
    *  on its content and its width, never on where it sits, so the first paint
    *  uses an estimate, the observer reports the truth, and the second settles. */
   const board = useMemo(() => {
-    const view = arch ? toBoard(arch, heights) : EMPTY;
+    const view = arch ? toBoard(arch, heights, ui.folded) : EMPTY;
     if (!Object.keys(ui.drafts).length && !Object.keys(ui.noteDrafts).length) return view;
     return {
       ...view,
       nodes: view.nodes.map((n) => (ui.drafts[n.id] ? { ...n, ...ui.drafts[n.id] } : n)),
       annos: view.annos.map((a) => (ui.noteDrafts[a.id] ? { ...a, ...ui.noteDrafts[a.id] } : a)),
     };
-  }, [arch, heights, ui.drafts, ui.noteDrafts]);
+  }, [arch, heights, ui.drafts, ui.noteDrafts, ui.folded]);
 
-  const byId = useCallback(
-    (id: string) => board.nodes.find((n) => n.id === id),
-    [board.nodes],
-  );
+  const index = useMemo(() => new Map(board.nodes.map((n) => [n.id, n])), [board.nodes]);
+  const byId = useCallback((id: string) => index.get(id), [index]);
+
+  /* What the wires light up for: the box under the pointer and the one
+     selected. Everything not touching them steps back, so "what is this
+     connected to" is answered by pointing at it. */
+  const hot = useMemo(() => {
+    const ids = new Set<string>();
+    if (ui.hot && index.has(ui.hot)) ids.add(ui.hot);
+    if (ui.selected?.t === "node" && index.has(ui.selected.id)) ids.add(ui.selected.id);
+    return ids;
+  }, [ui.hot, ui.selected, index]);
 
   const getBounds = useCallback(
     (ids?: string[] | null) => calcBounds(board.nodes, board.annos, board.lanes, heights, ids),
@@ -144,7 +160,7 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
     setTool("select");
     if (!ok) return;
     select({ t: "node", id });
-    setTimeout(() => setEditing({ t: "node", id }), 30);
+    setTimeout(() => setEditing({ t: "node", id, field: "label" }), 30);
   };
 
   const addNoteAt = (x: number, y: number) => {
@@ -173,9 +189,32 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
     await send({ op: "remove_box", id: sel.id });
   };
 
+  /** Every box somebody has placed by hand inside `id`, however deep. */
+  const placedInside = (id: string) => {
+    if (!arch) return [];
+    const out: typeof arch.nodes[string][] = [];
+    const walk = (pid: string) => {
+      for (const n of Object.values(arch.nodes)) {
+        if (n.parent !== pid || n.id === pid) continue;
+        if (n.x !== null && n.y !== null) out.push(n);
+        walk(n.id);
+      }
+    };
+    walk(id);
+    return out;
+  };
+
+  const toggleFold = (id: string) => {
+    const n = byId(id);
+    if (!n?.group) return;
+    setFolded(id, !n.group.folded);
+  };
+
   const runDeepen = async (id: string) => {
     const n = byId(id);
     if (!n || readOnly) return;
+    // a container's detail is what is inside it
+    if (n.group) { toggleFold(id); return; }
     const i = STEP.indexOf(n.depth);
     if (i >= STEP.length - 1) return;
     const has = i === 0 ? n.resp : n.tech || n.rows.length;
@@ -188,7 +227,8 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
   };
 
   const onAct = (act: NodeAct, id: string) => {
-    if (act === "rename") setEditing({ t: "node", id });
+    if (act === "fold") { toggleFold(id); return; }
+    if (act === "rename") setEditing({ t: "node", id, field: "label" });
     if (act === "deepen") void runDeepen(id);
     if (act === "delete") { select({ t: "node", id }); void removeSelected(); }
     if (act === "connect") {
@@ -197,14 +237,72 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
     }
   };
 
-  const commitLabel = useCallback(async (id: string, after: string) => {
-    setEditing(null);
-    const before = byId(id)?.label ?? "";
-    if (after === before) return;
-    await mutate({ op: "node", id, label: after }).then((e) => e && refusal(e));
+  /* Tab walks the fields of a selected box; committing one hands the next
+     one the caret. */
+  const advance = useCallback((id: string, field: NodeField, nav: Nav) => {
+    if (!nav) { setEditing(null); return; }
+    const n = byId(id);
+    if (!n) { setEditing(null); return; }
+    const order = fieldOrder(n);
+    const i = order.indexOf(field);
+    const next = order[(i + (nav === "next" ? 1 : -1) + order.length) % order.length];
+    setEditing({ t: "node", id, field: next });
   }, [byId]);
 
-  const cancelEdit = useCallback(() => setEditing(null), []);
+  /* What the card calls a field and what the harness calls it. Filling a
+     part of a box the depth was hiding deepens the box to show it — the two
+     are the same statement about how much of the design is known. */
+  const commitField = useCallback(async (id: string, field: NodeField, text: string, nav: Nav) => {
+    advance(id, field, nav);
+    const n = byId(id);
+    if (!n) return;
+    const payload: Record<string, unknown> = { op: "node", id };
+    const deepenTo = (d: "sketch" | "detailed") => {
+      if (n.depth === "stub" || (d === "detailed" && n.depth === "sketch")) payload.depth = d;
+    };
+    if (field === "label") {
+      if (!text || text === n.label) return;
+      payload.label = text;
+    } else if (field === "resp") {
+      payload.responsibility = text;
+      if (text) deepenTo("sketch");
+    } else if (field === "tech") {
+      payload.tech = text;
+      if (text) deepenTo("sketch");
+    } else if (field === "detail") {
+      payload.detail = text;
+      if (text) deepenTo("detailed");
+    } else if (field.startsWith("fact:")) {
+      payload.facts = { [field.slice(5)]: text === "—" ? "" : text };
+      if (text && text !== "—") deepenTo("sketch");
+    } else if (field.startsWith("item:")) {
+      const key = KIND_LIST[n.kind] ? (n.items[0]?.k || defaultKey(n.kind)) : "";
+      const items = n.items.map((it) => ({ ...it }));
+      const parsed = parseItem(text, key);
+      if (field === "item:new") {
+        if (!parsed) return;
+        items.push(parsed);
+      } else {
+        const i = Number(field.slice(5));
+        if (!parsed) items.splice(i, 1);        // an emptied row is a removed row
+        else items[i] = parsed;
+        if (parsed && itemText(parsed) === itemText(n.items[i] ?? { k: "", v: "", d: "" })) return;
+      }
+      payload.items = items;
+      if (items.length) deepenTo("detailed");
+    } else {
+      return;
+    }
+    await mutate(payload).then((e) => e && refusal(e));
+    if (payload.depth) flash([id]);
+  }, [byId, advance]);
+
+  const setKind = useCallback(async (id: string, kind: string) => {
+    if (readOnly) return;
+    await mutate({ op: "node", id, kind }).then((e) => e && refusal(e));
+  }, [readOnly]);
+
+  const cancelEdit = useCallback((id: string, field: NodeField, nav: Nav) => advance(id, field, nav), [advance]);
 
   const commitAnno = useCallback(async (id: string, text: string) => {
     setEditing(null);
@@ -232,7 +330,7 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
 
   const onPointerDown = (e: React.PointerEvent) => {
     const t = e.target as HTMLElement;
-    if (t.closest('[data-role="bar"]')) return;
+    if (t.closest('[data-role="bar"]') || t.closest('[data-role="fold"]') || t.closest('[data-role="kind"]')) return;
     if (t.getAttribute && t.getAttribute("contenteditable") === "true") return;
 
     const port = t.closest('[data-role="port"]');
@@ -250,9 +348,20 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
     if (nodeEl && e.button === 0 && tool === "select") {
       const n = byId(nodeEl.dataset.id!);
       if (!n) return;
+      /* on a box that is already selected, a click on one of its fields is a
+         request to type there — the card has opened into fields for exactly
+         this. The click is consumed; a drag has to start from the card's
+         own ground. */
+      const sel = getUi().selected;
+      const fieldEl = t.closest<HTMLElement>("[data-field]");
+      if (fieldEl && sel?.t === "node" && sel.id === n.id && !readOnly && !n.out) {
+        e.preventDefault();
+        setEditing({ t: "node", id: n.id, field: fieldEl.dataset.field! });
+        return;
+      }
       e.preventDefault();
       select({ t: "node", id: n.id });
-      drag.current = { mode: "node", id: n.id, ox: p.x - n.cx, oy: p.y - n.y, moved: false };
+      drag.current = { mode: "node", id: n.id, ox: p.x - n.cx, oy: p.y - n.y, moved: false, cx0: n.cx, y0: n.y };
       capture(e.pointerId);
       return;
     }
@@ -312,6 +421,17 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
         if (error) refusal(error);
         clearNodeDraft(d.id);
       });
+      /* a container carries its hand-placed members with it; the laid-out
+         ones follow on their own, because they are placed relative to it */
+      const dx = cx - d.cx0, dy = y - d.y0;
+      for (const m of placedInside(d.id)) {
+        const mx = m.x! + dx, my = m.y! + dy;
+        draftNode(m.id, mx, my);
+        void mutate({ op: "move", id: m.id, x: mx, y: my }).then((error) => {
+          if (error) refusal(error);
+          clearNodeDraft(m.id);
+        });
+      }
       return;
     }
     if (d.mode === "anno" && d.moved) {
@@ -341,7 +461,13 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
   const onDoubleClick = (e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
     const nodeEl = t.closest<HTMLElement>(".node");
-    if (nodeEl) { e.stopPropagation(); setEditing({ t: "node", id: nodeEl.dataset.id! }); return; }
+    if (nodeEl) {
+      e.stopPropagation();
+      if (readOnly) return;
+      const field = (t.closest<HTMLElement>("[data-field]")?.dataset.field as NodeField | undefined) ?? "label";
+      setEditing({ t: "node", id: nodeEl.dataset.id!, field });
+      return;
+    }
     const annoEl = t.closest<HTMLElement>(".anno");
     if (annoEl) { e.stopPropagation(); setEditing({ t: "anno", id: annoEl.dataset.id! }); return; }
     const p = toWorld(e);
@@ -391,6 +517,7 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
 
       const sel = getUi().selected;
       if (!sel) return;
+      if (k === " " && sel.t === "node") { e.preventDefault(); toggleFold(sel.id); return; }
 
       /* the keyboard equivalent of dragging — same round trip, so the harness
          hears about it the same way */
@@ -452,19 +579,24 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
       >
         <div className="world" id="world" ref={world}>
           <Lanes lanes={board.lanes} />
-          <Wires paths={paths} temp={tempWire} />
-          <div id="nodes">
+          <Wires paths={paths} temp={tempWire} hot={hot} />
+          <div
+            id="nodes"
+            onPointerOver={(e) => setHot((e.target as HTMLElement).closest<HTMLElement>(".node")?.dataset.id ?? null)}
+            onPointerLeave={() => setHot(null)}
+          >
             {board.nodes.map((n) => (
               <NodeCard
                 key={n.id}
                 node={n}
                 selected={ui.selected?.t === "node" && ui.selected.id === n.id}
                 flashNonce={flashNonce(n.id)}
-                editing={ui.editing?.t === "node" && ui.editing.id === n.id}
+                editing={ui.editing?.t === "node" && ui.editing.id === n.id ? (ui.editing.field ?? "label") : null}
                 animate={!bornWith[n.id]}
                 onAct={onAct}
-                onCommitLabel={commitLabel}
+                onCommitField={commitField}
                 onEditCancelled={cancelEdit}
+                onSetKind={setKind}
                 onFocus={(id) => {
                   const sel = getUi().selected;
                   if (!sel || sel.t !== "node" || sel.id !== id) select({ t: "node", id });
@@ -502,7 +634,7 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
       </div>
 
       <p className="hint" data-od-id="board-hint">
-        Drag or <kbd>↑↓←→</kbd> to move · double-click to add a box · <kbd>E</kbd> deepens · <kbd>⌫</kbd> deletes
+        Drag or <kbd>↑↓←→</kbd> to move · select a box, then click any part of it to edit · double-click empty space to add one · <kbd>E</kbd> deepens · <kbd>space</kbd> folds a container · <kbd>⌫</kbd> deletes
       </p>
 
       <div className="board-empty" id="board-empty" hidden={!empty} data-od-id="board-empty">

@@ -51,6 +51,8 @@ from .engine.runner import repair_interrupted
 from .engine.session import save_messages
 from .llm.discovery import discover_models
 from .llm.types import Usage
+from .llm.wire.openai_compat import WireAborted
+from .onboard import Prompter, TransportIO
 from .permissions import (  # re-exported: importers still say bird.serve.GatedTool
     DIFF_CONTEXT_LINES,
     MAX_DIFF_LINES,
@@ -75,6 +77,7 @@ class Handlers(Protocol):
 
     def on_user_input(self, text: str, subjects: Sequence[str] = ()) -> None: ...
     def on_permission(self, req_id: int, approved: bool, feedback: str) -> None: ...
+    def on_prompt(self, req_id: int, value: str | None) -> None: ...
     def on_interrupt(self) -> None: ...
     def on_command(self, line: str) -> bool | None: ...
     def on_mutate(self, payload: dict[str, Any]) -> dict[str, Any]: ...
@@ -122,6 +125,9 @@ class StdioTransport:
                     bool(msg.get("approved")),
                     str(msg.get("feedback", "") or ""),
                 )
+            elif kind == "prompt_response":
+                value = msg.get("value")
+                handlers.on_prompt(int(msg.get("id", 0)), None if value is None else str(value))
             elif kind == "interrupt":
                 handlers.on_interrupt()
             elif kind == "command":
@@ -148,6 +154,9 @@ class Server:
         self.broker.bind(self._emit)
         self.cancel = threading.Event()
         self.worker: threading.Thread | None = None
+        # questions the setup walkthrough asks the UI (keys, model pick):
+        # same blocking round-trip as permissions
+        self.prompter = Prompter(self._emit)
 
         runner = repl.runner
         # Safety net for a Repl built without a broker on its ctx (tests,
@@ -324,9 +333,19 @@ class Server:
     def on_permission(self, req_id: int, approved: bool, feedback: str) -> None:
         self.broker.resolve(req_id, approved, feedback)
 
+    def on_prompt(self, req_id: int, value: str | None) -> None:
+        self.prompter.resolve(req_id, value)
+
     def on_interrupt(self) -> None:
         self.cancel.set()
         self.broker.deny_all()
+        self.prompter.cancel_all()
+        # the flag above is only seen when a chunk arrives; a provider that
+        # has gone quiet leaves the worker blocked in a socket read that
+        # nothing else can wake — tear the request down from here
+        abort = getattr(self.repl.runner.client, "abort", None)
+        if abort is not None:
+            abort()
 
     def on_command(self, line: str) -> bool | None:
         return self._command(line)
@@ -376,15 +395,21 @@ class Server:
             self._emit("error", message="a turn is already running")
             return
         self.cancel.clear()
+        clear_abort = getattr(self.repl.runner.client, "clear_abort", None)
+        if clear_abort is not None:
+            clear_abort()
 
         def work() -> None:
             try:
                 result = self.repl.runner.chat(self.repl.messages, text)
-            except _Interrupted:
+            except (_Interrupted, WireAborted):
                 repair_interrupted(self.repl.messages)
                 self._emit("turn_end", status="interrupted", summary="", turns=0)
             except Exception as e:  # surface, don't die: the UI owns the terminal
-                self._emit("turn_end", status="error", summary=str(e), turns=0)
+                summary = str(e)
+                if "401" in summary or "Unauthorized" in summary or "not reachable" in summary:
+                    summary += " — /setup configures a key or picks a local model; /doctor explains"
+                self._emit("turn_end", status="error", summary=summary, turns=0)
             else:
                 # persist the transcript so a /reload respawn can resume it
                 # (the plain REPL does this too; serve never used to)
@@ -408,6 +433,37 @@ class Server:
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
+
+    def _start_setup(self, keys_only: str | None = None) -> None:
+        if self.worker and self.worker.is_alive():
+            self._emit("error", message="a turn is already running")
+            return
+        self.cancel.clear()
+        tio = TransportIO(self._emit, self.prompter)
+
+        def work() -> None:
+            try:
+                if keys_only:
+                    self._run_repl_command(lambda: self.repl._cmd_keys(f"set {keys_only}", io=tio))
+                else:
+                    self.repl._cmd_setup(io=tio)
+            except Exception as e:  # noqa: BLE001
+                self._emit("error", message=f"setup failed: {e}")
+            finally:
+                self._emit("state", model=self.repl.runner.spec.spec, think_mode=self.repl._think_label())
+                self._emit("setup_end")
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    def _run_repl_command(self, fn) -> None:
+        """Run a Repl command whose output is print()ed, forwarding it as
+        command_output."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        if buf.getvalue().strip():
+            self._emit("command_output", text=buf.getvalue().rstrip())
 
     def _command(self, line: str) -> bool | None:
         if self.worker and self.worker.is_alive():
@@ -439,6 +495,17 @@ class Server:
             # hand it the current run_id so the respawn resumes this session
             # via --resume (transcript is persisted after every turn).
             self._emit("reload", run_id=self.repl.run_id)
+            return None
+        if line.strip() == "/setup":
+            # the walkthrough asks questions, so it runs off the reader
+            # thread (which has to stay free to deliver the answers) — the
+            # same reason a model turn does
+            self._start_setup()
+            return None
+        if line.startswith("/keys set") and len(line.split()) == 3:
+            # `/keys set NAME` with no value: ask for it masked, off-thread
+            name = line.split()[2]
+            self._start_setup(keys_only=name)
             return None
         if line.strip() == "/model":
             # bare /model is the picker — the UI renders the selectable list

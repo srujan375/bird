@@ -285,11 +285,13 @@ def test_next_mode_cycles_three_states():
 
 def test_auto_modes_covered_kinds():
     # normal covers nothing; auto_edits covers edits + reads, NOT bash;
-    # full_auto adds bash. offer is never covered in any mode.
+    # full_auto adds bash + mcp (an MCP tool is arbitrary remote code behind
+    # a friendly name, so it gates like bash, never like a repo-local edit).
+    # offer is never covered in any mode.
     assert AUTO_MODES["normal"] == frozenset()
     assert AUTO_MODES["auto_edits"] == frozenset({"edit", "write", "read_outside_repo"})
     assert AUTO_MODES["full_auto"] == frozenset(
-        {"edit", "write", "read_outside_repo", "bash"}
+        {"edit", "write", "read_outside_repo", "bash", "mcp"}
     )
     for kinds in AUTO_MODES.values():
         assert "offer" not in kinds

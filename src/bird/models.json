@@ -5,8 +5,8 @@
       "api_key_env": "OPENROUTER_API_KEY"
     },
     "ollama": {
-      "base_url": "https://ollama.com/v1",
-      "native_url": "https://ollama.com",
+      "base_url": "http://localhost:11434/v1",
+      "native_url": "http://localhost:11434",
       "api_key_env": "OLLAMA_API_KEY"
     }
   },
@@ -31,36 +31,47 @@
       "supports_tools": true,
       "constrained_decoding": false
     },
-    "ollama:glm-5.2": {
+    "ollama:glm-5.2:cloud": {
       "context_window": 900000,
       "supports_tools": true,
       "constrained_decoding": false,
       "reasoning_effort": "high"
     },
-    "ollama:minimax-m3": {
+    "ollama:minimax-m3:cloud": {
       "context_window": 500000,
       "supports_tools": true,
       "constrained_decoding": false
     },
-    "ollama:kimi-k2.7-code": {
+    "ollama:kimi-k2.7-code:cloud": {
       "context_window": 250000,
       "supports_tools": true,
       "constrained_decoding": false
     },
-    "ollama:kimi-k3": {
+    "ollama:kimi-k3:cloud": {
       "context_window": 900000,
       "supports_tools": true,
       "constrained_decoding": false
     },
-    "ollama:deepseek-v4-flash:0731": {
+    "ollama:deepseek-v4-flash:0731-cloud": {
       "context_window": 1000000,
       "supports_tools": true,
       "constrained_decoding": false
     },
-    "ollama:gemma4:31b": {
+    "ollama:gemma4:31b-cloud": {
       "context_window": 200000,
       "supports_tools": true,
       "constrained_decoding": false
+    },
+    "ollama:glm-5.3-flash:cloud": {
+      "context_window": 1000000,
+      "supports_tools": true,
+      "constrained_decoding": false
+    },
+    "ollama:glm-5.3:cloud": {
+      "context_window": 1000000,
+      "supports_tools": true,
+      "constrained_decoding": false,
+      "reasoning_effort": "low"
     },
     "openrouter:anthropic/claude-sonnet-5": {
       "context_window": 200000,
@@ -110,10 +121,10 @@
     }
   },
   "aliases": {
-    "default": "openrouter:stealth/ox-alpha",
-    "architect": "ollama:glm-5.2",
-    "compactor": "ollama:gemma4:31b",
-    "vision": "ollama:kimi-k2.7-code",
-    "kg": "ollama:kimi-k2.7-code"
+    "default": "ollama:glm-5.3:cloud",
+    "architect": "ollama:kimi-k3:cloud",
+    "compactor": "ollama:gemma4:31b-cloud",
+    "vision": "ollama:kimi-k2.7-code:cloud",
+    "kg": "ollama:kimi-k2.7-code:cloud"
   }
 }
