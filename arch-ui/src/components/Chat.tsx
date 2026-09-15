@@ -2,6 +2,7 @@ import { useRef } from "react";
 import type { Turn } from "../board/chat";
 import type { Attachment } from "../board/types";
 import { RAIL_MAX, RAIL_MIN } from "../hooks/useRail";
+import { AskDock } from "./AskDock";
 import { Composer } from "./Composer";
 import { Thread } from "./Thread";
 
@@ -77,7 +78,10 @@ export function Chat({
       />
       <div className="chat-inner">
         <Thread turns={turns} onOpen={onOpenShot} />
-        <Composer tip={tip} disabled={readOnly} reason={readOnlyReason} />
+        <div>
+          {readOnly ? null : <AskDock />}
+          <Composer tip={tip} disabled={readOnly} reason={readOnlyReason} />
+        </div>
       </div>
     </aside>
   );

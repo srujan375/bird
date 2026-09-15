@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BOARD_EDIT_PREFIX, FOCUS_PREFIX, splitTask } from "./task";
+import { BOARD_EDIT_PREFIX, FOCUS_PREFIX, PICK_PREFIX, splitTask } from "./task";
 
 /**
  * The harness assembles a prompt out of context plus what the user typed. This
@@ -19,7 +19,9 @@ const drew = [BOARD_EDIT_PREFIX, '- drew a box "Rate limiter"', "- drew a wire a
 
 describe("splitTask", () => {
   it("leaves a plain message alone", () => {
-    expect(splitTask("why this one?")).toEqual({ drew: [], about: [], typed: "why this one?" });
+    expect(splitTask("why this one?")).toEqual({
+      drew: [], about: [], picked: [], typed: "why this one?",
+    });
   });
 
   it("takes the boxes a message pointed at out of the words", () => {
@@ -52,10 +54,21 @@ describe("splitTask", () => {
     expect(typed).toBe("first\n\nsecond");
   });
 
+  it("reads a picked row as a gesture, not as words the user typed", () => {
+    /* the harness composes this block when a picker is answered — the turn
+       has to read as "picked", because nobody typed the label */
+    const { picked, typed } = splitTask(
+      `${PICK_PREFIX}\n- Redis\n  in answer to q1: Where does the queue live?`,
+    );
+    expect(picked).toEqual(["Redis"]);
+    expect(typed).toBe("");
+  });
+
   it("survives a message that is only context", () => {
     expect(splitTask(drew)).toEqual({
       drew: ['drew a box "Rate limiter"', "drew a wire api -> pg"],
       about: [],
+      picked: [],
       typed: "",
     });
   });

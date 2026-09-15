@@ -23,6 +23,20 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_TRANSPORT_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 1.0
 
+# One flat 300s timeout made a stalled provider indistinguishable from a
+# working one. A queued Ollama Cloud request holds the socket open sending
+# nothing; the read timeout was the only thing that ever ended it, so every
+# attempt cost five silent minutes and a full retry budget could hold the UI
+# on "Thinking" for ~20 minutes before any error surfaced (one logged session
+# lost 308s to exactly this, then got its answer in 9s on the retry). Split
+# the budget instead: a connect or a write that takes more than a few seconds
+# is broken, while `read` has to stay generous enough for a slow prefill on a
+# million-token context window.
+DEFAULT_READ_TIMEOUT = 120.0
+CONNECT_TIMEOUT = 10.0
+WRITE_TIMEOUT = 30.0
+POOL_TIMEOUT = 10.0
+
 # bird's internal reasoning_effort vocabulary (see repl.THINK_MODES: off/low/
 # medium/high/max, with `off` stored as "none") -> OpenRouter's unified
 # `reasoning` object. OpenRouter only accepts effort high|medium|low there —
@@ -54,21 +68,62 @@ class WireAborted(WireError):
 # is complete. Callers may raise from it to abort the stream.
 OnDelta = Callable[[str | None], None]
 
+# Tool-call streaming callback: called with (index, name, arguments_fragment)
+# as a tool call's arguments arrive, `index` being the call's slot in the
+# message and `name` the function name as far as it has been announced (it
+# arrives in the first fragment; later ones carry only arguments). The
+# fragments concatenate to the call's arguments_json. Callers may raise from
+# it to abort the stream. Delivering one counts as delivery for the retry
+# policy: a stream that drops after a page has drawn half an artboard cannot
+# be restarted without drawing it twice.
+OnToolDelta = Callable[[int, str, str], None]
+
+# Transport-retry callback: called once per retry, before the backoff sleep,
+# with {attempt, max_attempts, delay, reason}. Retries used to be silent, which
+# is why a stalled provider looked like a hung bird — the caller's UI had
+# nothing to render but a spinner. Callers may raise from it to abort.
+OnRetry = Callable[[dict[str, Any]], None]
+
+
+def _notify_retry(on_retry: "OnRetry | None", attempt: int, delay: float, reason: str) -> None:
+    """Report an imminent retry to the caller.
+
+    Runs on the request thread, and is allowed to raise: the server's recorder
+    raises to honor an interrupt, and aborting the retry loop is the right
+    response to that — better than sleeping through the user's cancel.
+    """
+    if on_retry is None:
+        return
+    on_retry({
+        "attempt": attempt + 1,
+        "max_attempts": MAX_TRANSPORT_ATTEMPTS,
+        "delay": round(delay, 1),
+        "reason": reason[:200],
+    })
+
 
 class OpenAICompatClient:
-    def __init__(self, timeout: float = 300.0):
-        self._http = httpx.Client(timeout=timeout)
+    def __init__(self, timeout: float = DEFAULT_READ_TIMEOUT):
+        # `timeout` is the READ budget — the one callers actually tune (how
+        # long to wait on a slow model). Connect/write/pool get their own,
+        # much tighter, budgets; see the constants above.
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(
+                timeout, connect=CONNECT_TIMEOUT, write=WRITE_TIMEOUT, pool=POOL_TIMEOUT
+            )
+        )
         # abort() runs on a different thread than the request it kills: the
         # lock guards the in-flight response handle, the flag tells the
         # request thread that whatever error it just saw was self-inflicted
         self._lock = threading.Lock()
         self._inflight: httpx.Response | None = None
         self._aborted = False
+        self._abort_reason: str | None = None
 
     def close(self) -> None:
         self._http.close()
 
-    def abort(self) -> None:
+    def abort(self, reason: str = "user") -> None:
         """Tear down the in-flight streaming request from another thread.
 
         A cooperative cancel flag is only ever seen when a chunk arrives; a
@@ -77,9 +132,17 @@ class OpenAICompatClient:
         wakes that read immediately, and `_stream_with_retries` reports
         WireAborted instead of retrying. Idempotent; a no-op when idle (the
         flag still sticks until `clear_abort`, so an interrupt that lands
-        between requests aborts the next one rather than being lost)."""
+        between requests aborts the next one rather than being lost).
+
+        `reason` records WHO tore the request down — "user" for an interrupt,
+        "watchdog" for the runner's per-turn wall-clock budget. Both surface
+        as WireAborted, and the runner must be able to tell them apart: a
+        budget expiry is a timeout to report, not a cancel nobody asked for
+        (the design session that hung silently on a trickling stream for
+        hours is the failure this distinction exists to prevent)."""
         with self._lock:
             self._aborted = True
+            self._abort_reason = reason
             resp = self._inflight
         if resp is None:
             return
@@ -99,10 +162,23 @@ class OpenAICompatClient:
         """Arm the client for a new turn after an abort."""
         with self._lock:
             self._aborted = False
+            self._abort_reason = None
 
     @property
     def aborted(self) -> bool:
         return self._aborted
+
+    @property
+    def abort_reason(self) -> str | None:
+        """Who called abort() last — "user", "watchdog", or None once cleared."""
+        with self._lock:
+            return self._abort_reason
+
+    def _aborted_error(self, url: str) -> WireAborted:
+        """The WireAborted for this client's abort, with the cause named — a
+        bare "aborted" told nobody whether a person cancelled or a budget
+        expired, which is exactly how the silent hang stayed undiagnosable."""
+        return WireAborted(f"request to {url} aborted ({self.abort_reason or 'unknown'})")
 
     def _set_inflight(self, resp: httpx.Response | None) -> None:
         with self._lock:
@@ -122,6 +198,8 @@ class OpenAICompatClient:
         max_tokens: int | None = None,
         on_delta: OnDelta | None = None,
         on_thinking: OnDelta | None = None,
+        on_retry: OnRetry | None = None,
+        on_tool_delta: OnToolDelta | None = None,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": spec.model,
@@ -158,20 +236,26 @@ class OpenAICompatClient:
         if on_delta is not None:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
-            data = self._stream_with_retries(url, payload, headers, on_delta, on_thinking)
+            data = self._stream_with_retries(
+                url, payload, headers, on_delta, on_thinking, on_retry, on_tool_delta
+            )
         else:
-            data = self._post_with_retries(url, payload, headers)
+            data = self._post_with_retries(url, payload, headers, on_retry)
         return self._parse(data, spec)
 
     def _post_with_retries(
-        self, url: str, payload: dict[str, Any], headers: dict[str, str]
+        self, url: str, payload: dict[str, Any], headers: dict[str, str],
+        on_retry: OnRetry | None = None,
     ) -> dict[str, Any]:
         last_error = ""
         for attempt in range(MAX_TRANSPORT_ATTEMPTS):
             try:
                 resp = self._http.post(url, json=payload, headers=headers)
             except httpx.HTTPError as e:
-                last_error = f"connection error: {e}"
+                # the class name carries the diagnosis: httpx.ReadTimeout
+                # stringifies to "" or "timed out", which told nobody that the
+                # provider had gone silent rather than refused the connection
+                last_error = f"connection error: {type(e).__name__}: {e}"
             else:
                 if resp.status_code == 200:
                     try:
@@ -184,19 +268,25 @@ class OpenAICompatClient:
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after and attempt < MAX_TRANSPORT_ATTEMPTS - 1:
                     try:
-                        time.sleep(min(float(retry_after), 30.0))
-                        continue
+                        delay = min(float(retry_after), 30.0)
                     except ValueError:
-                        pass
+                        delay = None  # unparseable header: fall through to backoff
+                    if delay is not None:
+                        _notify_retry(on_retry, attempt, delay, last_error)
+                        time.sleep(delay)
+                        continue
             if attempt < MAX_TRANSPORT_ATTEMPTS - 1:
-                time.sleep(BACKOFF_BASE_SECONDS * (2**attempt))
+                delay = BACKOFF_BASE_SECONDS * (2**attempt)
+                _notify_retry(on_retry, attempt, delay, last_error)
+                time.sleep(delay)
         raise WireError(
             f"{url} failed after {MAX_TRANSPORT_ATTEMPTS} attempts; last: {last_error}"
         )
 
     def _stream_with_retries(
         self, url: str, payload: dict[str, Any], headers: dict[str, str], on_delta: OnDelta,
-        on_thinking: OnDelta | None = None,
+        on_thinking: OnDelta | None = None, on_retry: OnRetry | None = None,
+        on_tool_delta: OnToolDelta | None = None,
     ) -> dict[str, Any]:
         """SSE streaming POST. Retries only while nothing has been delivered to
         on_delta/on_thinking — a stream that drops mid-response cannot be
@@ -205,14 +295,16 @@ class OpenAICompatClient:
         last_error = ""
         for attempt in range(MAX_TRANSPORT_ATTEMPTS):
             if self._aborted:
-                raise WireAborted(f"request to {url} aborted")
+                raise self._aborted_error(url)
             emitted = [False]
             try:
                 with self._http.stream("POST", url, json=payload, headers=headers) as resp:
                     self._set_inflight(resp)
                     try:
                         if resp.status_code == 200:
-                            return self._consume_sse(resp, on_delta, emitted, on_thinking)
+                            return self._consume_sse(
+                                resp, on_delta, emitted, on_thinking, on_tool_delta
+                            )
                         resp.read()
                     finally:
                         self._set_inflight(None)
@@ -221,21 +313,25 @@ class OpenAICompatClient:
                         raise WireError(f"{url} -> {last_error}")
             except WireError:
                 if self._aborted:
-                    raise WireAborted(f"request to {url} aborted") from None
+                    raise self._aborted_error(url) from None
                 raise
             except Exception as e:
                 # an aborted socket surfaces as whatever httpx/httpcore was in
                 # the middle of (ReadError, StreamClosed, RemoteProtocolError,
                 # a bare OSError) — none of it is the provider's doing
                 if self._aborted:
-                    raise WireAborted(f"request to {url} aborted") from None
+                    raise self._aborted_error(url) from None
                 if not isinstance(e, httpx.HTTPError):
                     raise
                 if emitted[0]:
                     raise WireError(f"stream from {url} dropped mid-response: {e}") from e
-                last_error = f"connection error: {e}"
+                # see _post_with_retries: a bare ReadTimeout stringifies to
+                # nothing, and "the provider went quiet" is the whole diagnosis
+                last_error = f"connection error: {type(e).__name__}: {e}"
             if attempt < MAX_TRANSPORT_ATTEMPTS - 1:
-                time.sleep(BACKOFF_BASE_SECONDS * (2**attempt))
+                delay = BACKOFF_BASE_SECONDS * (2**attempt)
+                _notify_retry(on_retry, attempt, delay, last_error)
+                time.sleep(delay)
         raise WireError(
             f"{url} failed after {MAX_TRANSPORT_ATTEMPTS} attempts; last: {last_error}"
         )
@@ -243,7 +339,7 @@ class OpenAICompatClient:
     @staticmethod
     def _consume_sse(
         resp: httpx.Response, on_delta: OnDelta, emitted: list[bool],
-        on_thinking: OnDelta | None = None,
+        on_thinking: OnDelta | None = None, on_tool_delta: OnToolDelta | None = None,
     ) -> dict[str, Any]:
         """Fold an SSE chunk stream back into the non-streaming response shape
         so _parse stays the single parser."""
@@ -306,6 +402,12 @@ class OpenAICompatClient:
                     slot["name"] += fn["name"]
                 if fn.get("arguments"):
                     slot["arguments"] += fn["arguments"]
+                if on_tool_delta is not None and (fn.get("name") or fn.get("arguments")):
+                    # the page draws an artboard as its html is written, so
+                    # this is delivery: a drop from here on is a hard error,
+                    # never a silent restart that would draw it twice
+                    emitted[0] = True
+                    on_tool_delta(tc.get("index", 0), slot["name"] or "", fn.get("arguments") or "")
 
         if emitted[0]:
             on_delta(None)  # text complete

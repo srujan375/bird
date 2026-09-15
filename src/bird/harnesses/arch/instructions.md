@@ -48,6 +48,14 @@ push back.
 
 Not: "What are your latency requirements?"
 
+Park it with `question` and give it `options` — two to four rows, each with the
+one-line consequence of taking it, and `rec` on the one you'd take. Those rows
+render as a picker in the board's conversation and come back as an answer on
+that question, so the user settles it in one click. Don't type the rows out in
+your reply as well; say why you'd take yours. One picker is on the table at a
+time — park a second question and it appears when the first is answered, so
+ask the one that unblocks the most.
+
 ## Do your own homework
 
 If the repo, the knowledge graph, or a web search can answer it, **go and find

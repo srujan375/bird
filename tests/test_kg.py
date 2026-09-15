@@ -599,3 +599,410 @@ def test_low_confidence_text_forbids_a_third_rewording(kg):
     r = kg.query("telemetry ingestion pipeline throughput")
     if r.confidence == "weak":
         assert "reworded a third time" in r.text
+
+
+def test_kg_canonicalizes_phantom_paths_and_merges_duplicates(tmp_path):
+    """graphify indexes sub-projects from their own root as well as the repo's,
+    so one file arrives under several spellings — on this repo `tui/src/main.ts`
+    was also `src/main.ts` and `main.ts`, neither of which exists. That gave
+    three nodes per symbol with three line numbers (two stale), all competing
+    for the same result budget and pointing `read` at files it would reject."""
+    (tmp_path / "tui" / "src").mkdir(parents=True)
+    (tmp_path / "tui" / "src" / "main.ts").write_text("export function sendTurn() {}\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    nodes = [
+        {"id": "tui_src_main_sendturn", "label": "sendTurn()", "source_file": "tui/src/main.ts", "source_location": "L1"},
+        {"id": "src_main_sendturn", "label": "sendTurn()", "source_file": "src/main.ts", "source_location": "L1"},
+        {"id": "main_sendturn", "label": "sendTurn()", "source_file": "main.ts", "source_location": "L1"},
+        {"id": "tui_src_main", "label": "tui/src/main.ts", "source_file": "tui/src/main.ts", "source_location": "L1"},
+        {"id": "src_main", "label": "src/main.ts", "source_file": "src/main.ts", "source_location": "L1"},
+        {"id": "caller", "label": "onMessage()", "source_file": "tui/src/main.ts", "source_location": "L20"},
+    ]
+    links = [
+        {"source": "caller", "target": "src_main_sendturn", "relation": "calls"},
+        {"source": "tui_src_main", "target": "tui_src_main_sendturn", "relation": "contains"},
+    ]
+    (out / "graph.json").write_text(json.dumps(
+        {"directed": False, "multigraph": False, "graph": {}, "nodes": nodes, "links": links}
+    ))
+
+    G = KG(tmp_path, store_dir=out)._load_graph()
+    assert sorted(str(d["label"]) for _, d in G.nodes(data=True)) == [
+        "onMessage()", "sendTurn()", "tui/src/main.ts",
+    ]
+    sym = next(d for _, d in G.nodes(data=True) if d["label"] == "sendTurn()")
+    assert sym["source_file"] == "tui/src/main.ts" and sym["source_location"] == "L1"
+    # the call edge follows the merge instead of dangling on a dropped duplicate
+    pairs = {frozenset((G.nodes[u]["label"], G.nodes[v]["label"])) for u, v in G.edges()}
+    assert frozenset(("onMessage()", "sendTurn()")) in pairs
+
+
+def test_kg_leaves_ambiguous_paths_alone(tmp_path):
+    """Two real `index.ts` in different packages: guessing would answer
+    confidently about the wrong file, which is worse than a duplicate node."""
+    for pkg in ("a", "b"):
+        (tmp_path / pkg / "src").mkdir(parents=True)
+        (tmp_path / pkg / "src" / "index.ts").write_text("x\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [{"id": "n1", "label": "go()", "source_file": "src/index.ts", "source_location": "L1"}],
+        "links": [],
+    }))
+    G = KG(tmp_path, store_dir=out)._load_graph()
+    assert G.nodes["n1"]["source_file"] == "src/index.ts"  # untouched
+
+
+def test_extraction_is_canonicalized_regardless_of_batch_width(tmp_path):
+    """graphify's extractor strips the common prefix of the batch it is handed,
+    so an incremental update that touched only `tui/src/` recorded the file as
+    `main.ts` with node id `main_sendturn`, while a full build recorded
+    `tui/src/main.ts` / `tui_src_main_sendturn`. build_merge matches on id, so
+    the narrow update APPENDED a second copy of every node instead of replacing
+    them — the actual source of this repo's 41% duplicate nodes."""
+    (tmp_path / "tui" / "src").mkdir(parents=True)
+    (tmp_path / "tui" / "src" / "main.ts").write_text("export function sendTurn() {}\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    narrow = {  # what extract() returns when handed only tui/src/main.ts
+        "nodes": [
+            {"id": "main", "label": "main.ts", "source_file": "main.ts", "source_location": "L1"},
+            {"id": "main_sendturn", "label": "sendTurn()", "source_file": "main.ts", "source_location": "L1"},
+        ],
+        "edges": [{"source": "main", "target": "main_sendturn", "relation": "contains"}],
+        "hyperedges": [],
+    }
+    kg = KG(tmp_path, store_dir=out)
+    got = kg._canonicalize_extraction(narrow, [tmp_path / "tui" / "src" / "main.ts"])
+
+    # the ids a WHOLE-REPO build would have produced, so the merge replaces
+    assert {n["id"] for n in got["nodes"]} == {"tui_src_main", "tui_src_main_sendturn"}
+    assert all(n["source_file"] == "tui/src/main.ts" for n in got["nodes"])
+    # the file node is labelled by its own path, so the label moves too
+    assert got["nodes"][0]["label"] == "tui/src/main.ts"
+    # edges follow the rename instead of dangling on the old ids
+    assert got["edges"][0]["source"] == "tui_src_main"
+    assert got["edges"][0]["target"] == "tui_src_main_sendturn"
+
+
+def test_extraction_leaves_ambiguous_paths_alone(tmp_path):
+    """Two real `index.ts`: no unique answer, so nothing is rewritten. A wrong
+    merge points every caller at the wrong file, which beats a duplicate."""
+    for pkg in ("a", "b"):
+        (tmp_path / pkg / "src").mkdir(parents=True)
+        (tmp_path / pkg / "src" / "index.ts").write_text("x\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    ext = {
+        "nodes": [{"id": "src_index_go", "label": "go()", "source_file": "src/index.ts"}],
+        "edges": [],
+        "hyperedges": [],
+    }
+    got = KG(tmp_path, store_dir=out)._canonicalize_extraction(ext, [])
+    assert got["nodes"][0]["source_file"] == "src/index.ts"
+    assert got["nodes"][0]["id"] == "src_index_go"
+
+
+def test_id_prefix_matches_graphify_shape():
+    assert KG._id_prefix("tui/src/main.ts") == "tui_src_main"
+    assert KG._id_prefix("main.ts") == "main"
+    assert KG._id_prefix("src/bird/context/kg.py") == "src_bird_context_kg"
+
+
+def test_kg_never_merges_distinct_symbols_that_share_a_name(tmp_path):
+    """Seven `.run()` methods live in one real file at seven different lines.
+    A repair that keys on (file, label) alone fuses them into a single node and
+    deletes the only thing a "which run()?" query has to go on."""
+    (tmp_path / "t.py").write_text("x\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [
+            {"id": f"n{i}", "label": ".run()", "file_type": "code", "_origin": "ast",
+             "source_file": "t.py", "source_location": f"L{i}"}
+            for i in (10, 20, 30)
+        ],
+        "links": [],
+    }))
+    G = KG(tmp_path, store_dir=out)._load_graph()
+    assert G.number_of_nodes() == 3
+
+
+def test_kg_never_merges_across_node_kinds(tmp_path):
+    """An AST dependency `react` and a semantically-extracted concept `react`
+    in the same package.json are two different assertions; collapsing them
+    deletes the semantic layer the graph pays a model to produce."""
+    (tmp_path / "package.json").write_text("{}\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [
+            {"id": "a", "label": "react", "file_type": "code", "_origin": "ast",
+             "source_file": "package.json", "source_location": "L1"},
+            {"id": "b", "label": "react", "file_type": "concept", "_origin": "semantic",
+             "source_file": "package.json", "source_location": "L1"},
+        ],
+        "links": [],
+    }))
+    G = KG(tmp_path, store_dir=out)._load_graph()
+    assert G.number_of_nodes() == 2
+
+
+def test_kg_leaves_pathless_reference_nodes_alone(tmp_path):
+    """`Any` imported in 31 files is recorded once per importer with no
+    source_file. Those cannot be path-spelling duplicates, and merging them
+    would fuse 31 references into one degree-31 hub."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [
+            {"id": f"m{i}_any", "label": "Any", "file_type": "code", "_origin": "ast"}
+            for i in range(4)
+        ],
+        "links": [],
+    }))
+    G = KG(tmp_path, store_dir=out)._load_graph()
+    assert G.number_of_nodes() == 4
+
+
+def test_ghost_spellings_are_pruned_so_old_graphs_self_heal(tmp_path):
+    """build_merge's replace-set is keyed on source_file, so it only drops nodes
+    filed under the path the NEW chunk carries. A graph that already holds the
+    same file under a stripped-prefix spelling keeps those nodes forever — they
+    are never re-extracted, so nothing ever replaces them. Naming them as
+    prune_sources lets an existing graph heal on the next update."""
+    (tmp_path / "tui" / "src").mkdir(parents=True)
+    (tmp_path / "tui" / "src" / "main.ts").write_text("x\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [
+            {"id": "tui_src_main_a", "label": "a()", "source_file": "tui/src/main.ts"},
+            {"id": "src_main_a", "label": "a()", "source_file": "src/main.ts"},
+            {"id": "main_a", "label": "a()", "source_file": "main.ts"},
+        ],
+        "links": [],
+    }))
+    kg = KG(tmp_path, store_dir=out)
+    assert kg._ghost_source_files({"tui/src/main.ts"}) == ["main.ts", "src/main.ts"]
+
+
+def test_ghost_pruning_never_touches_a_real_file(tmp_path):
+    """A real `src/index.ts` elsewhere in the repo is somebody's actual source,
+    not a stripped-prefix ghost, even though it is a trailing slice of
+    `pkg/src/index.ts`. Pruning it would delete a live file's whole subgraph."""
+    (tmp_path / "pkg" / "src").mkdir(parents=True)
+    (tmp_path / "pkg" / "src" / "index.ts").write_text("x\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "index.ts").write_text("y\n")  # a REAL file
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [
+            {"id": "a", "label": "a()", "source_file": "pkg/src/index.ts"},
+            {"id": "b", "label": "b()", "source_file": "src/index.ts"},
+            {"id": "c", "label": "c()", "source_file": "index.ts"},
+        ],
+        "links": [],
+    }))
+    ghosts = KG(tmp_path, store_dir=out)._ghost_source_files({"pkg/src/index.ts"})
+    assert ghosts == ["index.ts"]  # the real src/index.ts is spared
+
+
+def test_no_ghosts_means_no_prune(tmp_path):
+    (tmp_path / "a.py").write_text("x\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [{"id": "a", "label": "f()", "source_file": "a.py"}], "links": [],
+    }))
+    assert KG(tmp_path, store_dir=out)._ghost_source_files({"a.py"}) == []
+
+
+# ---------- staleness marking ----------
+
+
+def _tiny_graph(tmp_path):
+    (tmp_path / "app.ts").write_text("export function endTurn() {}\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps({
+        "directed": False, "multigraph": False, "graph": {},
+        "nodes": [
+            {"id": "app_endturn", "label": "endTurn()", "file_type": "code",
+             "_origin": "ast", "source_file": "app.ts", "source_location": "L1"},
+            {"id": "app_onmessage", "label": "onMessage()", "file_type": "code",
+             "_origin": "ast", "source_file": "app.ts", "source_location": "L9"},
+        ],
+        "links": [{"source": "app_onmessage", "target": "app_endturn", "relation": "calls"}],
+    }))
+    return KG(tmp_path, store_dir=out)
+
+
+def test_query_marks_a_stale_graph(tmp_path, monkeypatch):
+    """is_ready() only asks whether a graph EXISTS, so one built before a
+    hundred edits answers as confidently as one built a second ago. That is how
+    a query returns [main.ts:L217] for a symbol that has since moved to L229 — a
+    citation the model has no way to distrust, pointing at the wrong lines."""
+    kg = _tiny_graph(tmp_path)
+    monkeypatch.setattr(KG, "is_stale", lambda self: True)
+    r = kg.query("where is endTurn defined")
+    assert r.stale
+    assert r.text.startswith("[STALE GRAPH"), "the notice must survive the budget clip"
+
+
+def test_query_does_not_mark_a_fresh_graph(tmp_path, monkeypatch):
+    kg = _tiny_graph(tmp_path)
+    monkeypatch.setattr(KG, "is_stale", lambda self: False)
+    r = kg.query("where is endTurn defined")
+    assert not r.stale and "STALE GRAPH" not in r.text
+
+
+def test_staleness_verdict_is_cached(tmp_path, monkeypatch):
+    """is_stale() walks the repo (~180ms) against a ~20ms query, so it cannot
+    run per call. A stale verdict stands until the graph is rebuilt, because
+    staleness only grows as files are edited."""
+    kg = _tiny_graph(tmp_path)
+    calls = []
+    monkeypatch.setattr(KG, "is_stale", lambda self: (calls.append(1), True)[1])
+    for _ in range(4):
+        assert kg.query("where is endTurn defined").stale
+    assert len(calls) == 1
+
+
+def test_staleness_failure_never_breaks_a_query(tmp_path, monkeypatch):
+    """A freshness hint is a nicety; losing retrieval over one is not."""
+    kg = _tiny_graph(tmp_path)
+
+    def boom(self):
+        raise RuntimeError("graphify exploded")
+
+    monkeypatch.setattr(KG, "is_stale", boom)
+    r = kg.query("where is endTurn defined")
+    assert not r.stale and r.hit_count > 0
+
+
+# --- digest: the repo map a session starts from -------------------------------
+
+
+def _write_graph(out, nodes, links):
+    out.mkdir(exist_ok=True)
+    (out / "graph.json").write_text(json.dumps(
+        {"directed": False, "multigraph": False, "graph": {}, "nodes": nodes, "links": links}
+    ))
+
+
+def _code(nid, label, file, line=1):
+    return {"id": nid, "label": label, "source_file": file, "source_location": f"L{line}", "file_type": "code"}
+
+
+def test_digest_leads_with_source_files_and_their_purpose(tmp_path):
+    """The map answers "what is this program". So source files come before
+    tests however many symbols the tests define, each file leads with the
+    first sentence of its docstring, top-level names come before methods, and
+    a rationale node — a docstring fragment — never poses as a symbol."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "core.py").write_text(
+        '"""The engine: runs the loop\nand keeps score. Second sentence."""\n\nclass Runner: ...\n'
+    )
+    (tmp_path / "tests" / "test_core.py").write_text("def test_0(): ...\n")
+    nodes = [
+        _code("f_core", "src/core.py", "src/core.py"),
+        _code("runner", "Runner", "src/core.py", 4),
+        _code("runner_go", ".go()", "src/core.py", 5),
+        {"id": "why", "label": "A loop that never ends is a bug", "source_file": "src/core.py",
+         "source_location": "L4", "file_type": "rationale"},
+        _code("f_test", "tests/test_core.py", "tests/test_core.py"),
+    ] + [_code(f"t{i}", f"test_{i}()", "tests/test_core.py", i + 1) for i in range(6)]
+    links = [
+        {"source": "f_core", "target": "runner", "relation": "contains"},
+        {"source": "runner", "target": "runner_go", "relation": "method"},
+        {"source": "why", "target": "runner", "relation": "rationale_for"},
+        {"source": "t0", "target": "runner", "relation": "calls"},
+    ]
+    _write_graph(tmp_path / "out", nodes, links)
+
+    d = KG(tmp_path, store_dir=tmp_path / "out").digest()
+    lines = d.splitlines()
+    assert lines[0] == "[repo map — from the knowledge graph]"
+    assert lines[1] == "  src/core.py — The engine: runs the loop and keeps score. (Runner, .go())"
+    assert "never ends" not in d  # rationale text is not a symbol
+    assert "  tests: 1 file (test_core.py)" in lines
+    assert not any(ln.startswith("  tests/") for ln in lines)  # tests never get a file line
+    # the file's own node and the test that calls Runner are not hubs; Runner is
+    assert lines[-1] == "  key hubs: Runner [core.py]"
+
+
+def test_digest_ranks_files_by_how_much_the_repo_uses_them(tmp_path):
+    """A one-class module that three functions import outranks the seven-
+    function module they live in: both touch one other file, so the tie
+    breaks on squared degree (3² beats 3 × 1²), never on size — ranking by
+    symbol count put a 178-symbol TUI component file above the engine.
+    Manifests are indexed but are not program source, so package.json never
+    gets a line; a file with no docstring still gets its symbols; a `//`
+    header comment counts as a purpose."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "base.py").write_text("class Ctx: ...\n")
+    (tmp_path / "src" / "big.ts").write_text("// The big module: many things.\n// More.\nexport const a = 1;\n")
+    (tmp_path / "package.json").write_text("{}")
+    nodes = [
+        _code("f_base", "src/base.py", "src/base.py"),
+        _code("ctx", "Ctx", "src/base.py", 1),
+        _code("f_big", "src/big.ts", "src/big.ts"),
+        _code("pkg", "package.json", "package.json"),
+        _code("pkg_name", "name", "package.json", 2),
+    ] + [_code(f"b{i}", f"thing{i}()", "src/big.ts", i + 3) for i in range(7)]
+    links = [{"source": f"b{i}", "target": "ctx", "relation": "imports"} for i in range(3)]
+    _write_graph(tmp_path / "out", nodes, links)
+
+    d = KG(tmp_path, store_dir=tmp_path / "out").digest()
+    lines = d.splitlines()
+    assert lines[1] == "  src/base.py (Ctx)"  # no docstring: symbols alone, no dangling dash
+    assert lines[2].startswith("  src/big.ts — The big module: many things. (thing0(), thing1(), thing2(), ")
+    assert "+2 more)" in lines[2]
+    assert "package.json" not in d
+
+
+def test_digest_is_bounded(tmp_path):
+    """Past max_files the map says how much it left out rather than growing."""
+    (tmp_path / "src").mkdir()
+    nodes, links = [], []
+    for i in range(20):
+        (tmp_path / "src" / f"m{i}.py").write_text("x = 1\n")
+        nodes.append(_code(f"f{i}", f"src/m{i}.py", f"src/m{i}.py"))
+        nodes.append(_code(f"s{i}", f"sym{i}()", f"src/m{i}.py", 1))
+    _write_graph(tmp_path / "out", nodes, links)
+    d = KG(tmp_path, store_dir=tmp_path / "out").digest(max_files=15)
+    assert "  … and 5 more source files" in d.splitlines()
+    assert d.count("  src/m") == 15
+
+
+def test_file_purpose_reads_docstrings_and_comment_blocks(tmp_path):
+    from bird.context.kg import _file_purpose
+
+    py = tmp_path / "a.py"
+    py.write_text('#!/usr/bin/env python\n"""One line."""\nimport os\n')
+    assert _file_purpose(py) == "One line."
+    multi = tmp_path / "b.py"
+    multi.write_text('"""In-session onboarding: the setup walkthrough, key management and the\nfirst-run hint. Then more."""\n')
+    assert _file_purpose(multi) == "In-session onboarding: the setup walkthrough, key management and the first-run hint."
+    ts = tmp_path / "c.ts"
+    ts.write_text("/**\n * The message queue state machine,\n * extracted from main.\n */\nexport {}\n")
+    assert _file_purpose(ts) == "The message queue state machine, extracted from main."
+    bare = tmp_path / "d.ts"
+    bare.write_text("import x from 'y';\n")
+    assert _file_purpose(bare) == ""
+    assert _file_purpose(tmp_path / "missing.py") == ""
+    long = tmp_path / "e.py"
+    long.write_text('"""' + "word " * 40 + '"""\n')
+    got = _file_purpose(long, limit=30)
+    assert got.endswith("…") and len(got) <= 31

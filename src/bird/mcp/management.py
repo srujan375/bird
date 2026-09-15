@@ -61,6 +61,70 @@ def _entry_to_spec(name: str, entry: dict[str, Any], source: str) -> McpServerSp
     return parse_servers({"servers": {name: entry}}, Path("<entry>"), source)[0]
 
 
+# ------------------------------------------------- programmatic (catalog) API
+
+
+def install_from_registry(
+    name: str,
+    repo_root: Path,
+    scope: str = "project",
+    confirm: bool = False,
+) -> tuple[dict[str, Any], list[str]]:
+    """Resolve a registry name, translate it, and write it to mcp.json.
+
+    Returns (entry, warnings). The caller (CLI or catalog) MUST have shown
+    the entry and obtained an explicit yes before calling with confirm=True —
+    a registry entry is arbitrary code, so install is always a conscious yes
+    and `confirm=False` refuses rather than defaulting to installing.
+
+    Raises McpError on registry/translation/config problems; FileExistsError
+    is not used — a duplicate name raises McpError naming the path.
+    """
+    if not confirm:
+        raise McpError(
+            f"refusing to install '{name}' without explicit confirmation — "
+            f"a registry entry runs arbitrary code"
+        )
+    path = _config_path(repo_root, scope)
+    data = _read_file(path)
+    if name in data["servers"]:
+        raise McpError(
+            f"'{name}' already exists in {path} (remove it first, or pick another name)"
+        )
+    server = fetch_server(name)
+    entry, warnings = package_to_entry(server)
+    data["servers"][name] = entry
+    _write_file(path, data)
+    return entry, warnings
+
+
+def remove_server(name: str, repo_root: Path, scope: str = "project") -> Path:
+    """Remove a server from mcp.json. Returns the path written. Raises
+    McpError when the name is absent or the file is corrupt."""
+    path = _config_path(repo_root, scope)
+    data = _read_file(path)
+    if name not in data["servers"]:
+        raise McpError(f"no server '{name}' in {path}")
+    del data["servers"][name]
+    _write_file(path, data)
+    return path
+
+
+def test_connection(spec: McpServerSpec) -> tuple[bool, list[dict[str, Any]], str, list[str]]:
+    """Start a server and list its tools. Returns (ok, tools, error, log):
+    tools on success; on failure, error is the McpError text and log is the
+    last lines of the server's stderr (empty unless the caller asked for
+    capture — the catalog does)."""
+    client = McpClient(spec, capture_stderr=True)
+    try:
+        tools = client.start()
+    except McpError as e:
+        return False, [], str(e), list(client.stderr_tail)
+    finally:
+        client.close()
+    return True, tools, "", list(client.stderr_tail)
+
+
 # ------------------------------------------------------------------- commands
 
 
@@ -73,6 +137,9 @@ def cmd_add(args, repo_root: Path) -> int:
         return 2
 
     if args.from_registry:
+        # resolve + translate first so the user confirms against the exact
+        # entry that will be written; the write itself goes through
+        # install_from_registry (the same path the catalog uses)
         server = fetch_server(args.name)
         entry, warnings = package_to_entry(server)
         print(f"registry entry for '{args.name}':")
@@ -89,6 +156,9 @@ def cmd_add(args, repo_root: Path) -> int:
         if answer not in ("y", "yes"):
             print("not installed")
             return 1
+        install_from_registry(args.name, repo_root, args.scope, confirm=True)
+        print(f"added '{args.name}' to {_config_path(repo_root, args.scope)}")
+        return 0
     else:
         if not args.command:
             print("error: add needs --command (or --from-registry)", file=sys.stderr)
@@ -159,13 +229,11 @@ def cmd_get(args, repo_root: Path) -> int:
 
 
 def cmd_remove(args, repo_root: Path) -> int:
-    path = _config_path(repo_root, args.scope)
-    data = _read_file(path)
-    if args.name not in data["servers"]:
-        print(f"error: no server '{args.name}' in {path}", file=sys.stderr)
+    try:
+        path = remove_server(args.name, repo_root, args.scope)
+    except McpError as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
-    del data["servers"][args.name]
-    _write_file(path, data)
     print(f"removed '{args.name}' from {path}")
     return 0
 

@@ -17,6 +17,7 @@ lifecycle, and none of that needs a dependency.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -40,9 +41,14 @@ class McpClient:
     call tools on from many threads (writes are locked, replies are routed
     by request id)."""
 
-    def __init__(self, spec: McpServerSpec) -> None:
+    def __init__(self, spec: McpServerSpec, capture_stderr: bool = False) -> None:
         self.spec = spec
         self.tools: list[dict[str, Any]] = []  # raw tool dicts from tools/list
+        self.capture_stderr = capture_stderr
+        # last lines of the server's stderr — the catalog's failure view shows
+        # them ("last lines from the server"), so a failed install says WHY
+        self.stderr_tail: list[str] = []
+        self._stderr: io.StringIO | None = io.StringIO() if capture_stderr else None
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._write_lock = threading.Lock()
@@ -79,6 +85,11 @@ class McpClient:
         """stdin close -> terminate -> kill(5s). Idempotent."""
         self._closed = True
         proc, self._proc = self._proc, None
+        if self._stderr is not None:
+            # snapshot the tail now — the buffer dies with the client
+            self.stderr_tail = [
+                l for l in self._stderr.getvalue().splitlines() if l.strip()
+            ][-8:]
         if proc is None:
             return
         with self._pending_lock:
@@ -106,7 +117,7 @@ class McpClient:
                 [self.spec.command, *self.spec.args],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=self._stderr if self._stderr is not None else subprocess.DEVNULL,
                 text=True,
                 env=env,
             )

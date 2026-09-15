@@ -16,7 +16,7 @@ class FakeClient:
     def __init__(self, script):
         self.script = list(script)
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
         msg = self.script.pop(0)
         if on_delta is not None and msg.content:
             on_delta(msg.content)  # simulate streaming: one chunk, then end marker
@@ -177,21 +177,143 @@ class Tty:
         return True
 
 
-def test_model_picker_selects_and_sets_default(tmp_path, monkeypatch, capsys):
-    repl = make_repl(tmp_path, [])
+def with_fake_models(repl):
     reg = repl.registry
     reg.providers["fake"] = ProviderConfig(name="fake", base_url="http://x")
     reg.models["fake:model"] = {"context_window": 32768}
     reg.models["fake:other"] = {"context_window": 65536}
-    monkeypatch.setattr("sys.stdin", Tty())
-    feed(monkeypatch, ["/model", "2", "/quit"])
+    return reg
+
+
+def test_model_bare_lists_harnesses_off_tty(tmp_path, monkeypatch, capsys):
+    """Bare /model starts at the harness step: one row per harness with its
+    alias, model and thinking level; the running one is starred. Off a tty
+    it only lists, and says how to pick by hand."""
+    repl = make_repl(tmp_path, [])
+    feed(monkeypatch, ["/model", "/quit"])
     repl.run()
     out = capsys.readouterr().out
+    assert "harness:" in out
+    assert "*  1. code" in out and "fake:model" in out
+    assert "[default, shared with lead]" in out
+    assert "2. arch" in out and "[architect]" in out
+    assert "4. design" in out and "[designer]" in out
+    assert "pick with /model <harness> [spec] [mode] [tokens]" in out
+
+
+def test_model_picker_walks_harness_model_and_thinking(tmp_path, monkeypatch, capsys):
+    """harness # -> model # -> mode: the pick switches the session when the
+    harness is the running one, becomes its alias, and the chosen thinking
+    level lands on the picked model."""
+    repl = make_repl(tmp_path, [])
+    reg = with_fake_models(repl)
+    monkeypatch.setattr("sys.stdin", Tty())
+    feed(monkeypatch, ["/model", "1", "2", "low", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "harness:" in out and "*  1. code" in out
+    assert "model for code (default): fake:model" in out
     assert "1. fake:model" in out and "2. fake:other" in out
+    assert "thinking for fake:other: (auto)" in out
     assert repl.runner.spec.spec == "fake:other"
     assert repl.runner.spec.context_window == 65536
     assert reg.aliases["default"] == "fake:other"
     assert "default updated for this session" in out  # no models.json to persist to
+    assert repl.runner.spec.extra["reasoning_effort"] == "low"
+    assert reg.models["fake:other"]["reasoning_effort"] == "low"
+
+
+def test_model_picker_keep_uses_the_picked_models_own_level(tmp_path, monkeypatch, capsys):
+    """An empty answer at the thinking step keeps the PICKED model's stored
+    level — the walk just showed it — rather than carrying the running
+    model's level across, which a direct /model <spec> does."""
+    repl = make_repl(tmp_path, [])
+    reg = with_fake_models(repl)
+    reg.models["fake:other"]["reasoning_effort"] = "high"
+    monkeypatch.setattr("sys.stdin", Tty())
+    feed(monkeypatch, ["/think low", "/model", "1", "2", "", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "thinking for fake:other: high" in out
+    assert "* high" in out
+    assert repl.runner.spec.spec == "fake:other"
+    assert repl.runner.spec.extra["reasoning_effort"] == "high"
+
+
+def test_model_picker_other_harness_persists_alias_only(tmp_path, monkeypatch, capsys):
+    """Picking a model for a harness that is not running (design from a code
+    session) points its alias at the pick and stores the thinking level, but
+    leaves the running model alone."""
+    repl = make_repl(tmp_path, [])
+    reg = with_fake_models(repl)
+    monkeypatch.setattr("sys.stdin", Tty())
+    feed(monkeypatch, ["/model", "4", "2", "medium", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "model for design (designer): (unset)" in out
+    assert "design: fake:other (designer updated for this session" in out
+    assert "thinking: medium" in out
+    assert reg.aliases["designer"] == "fake:other"
+    assert reg.models["fake:other"]["reasoning_effort"] == "medium"
+    assert repl.runner.spec.spec == "fake:model"  # the code session is untouched
+    assert "reasoning_effort" not in repl.runner.spec.extra
+    assert "default" in reg.aliases and reg.aliases["default"] == "fake:model"
+
+
+def test_model_harness_direct_form(tmp_path, monkeypatch, capsys):
+    """/model <harness> <spec> [mode] [tokens] sets it all without prompts;
+    a harness sharing the running alias (lead ~ code) switches the session."""
+    repl = make_repl(tmp_path, [])
+    reg = with_fake_models(repl)
+    feed(monkeypatch, ["/model design fake:other high 8192", "/model lead fake:other", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert reg.aliases["designer"] == "fake:other"
+    assert reg.models["fake:other"]["reasoning_effort"] == "high"
+    assert "thinking: high" in out
+    # lead shares `default` with the running code harness → live switch
+    assert "model: fake:model → fake:other" in out
+    assert repl.runner.spec.spec == "fake:other"
+    assert reg.aliases["default"] == "fake:other"
+
+
+def test_model_keep_does_not_carry_the_running_level(tmp_path, monkeypatch, capsys):
+    """`keep` (what the TUI sends when the thinking step is skipped) leaves
+    the new model on its own stored level instead of carrying the running
+    model's across — the direct form without it still carries."""
+    repl = make_repl(tmp_path, [])
+    with_fake_models(repl)
+    feed(monkeypatch, ["/think low", "/model code fake:other keep", "/quit"])
+    repl.run()
+    assert repl.runner.spec.spec == "fake:other"
+    # fake:other has no stored level of its own, and `keep` did not carry low
+    assert "reasoning_effort" not in repl.runner.spec.extra
+    # the level /think set stays on the model it was set on
+    assert repl.registry.models["fake:model"]["reasoning_effort"] == "low"
+
+
+def test_model_harness_then_bad_token(tmp_path, monkeypatch, capsys):
+    repl = make_repl(tmp_path, [])
+    with_fake_models(repl)
+    feed(monkeypatch, ["/model design fake:other turbo", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "unexpected 'turbo'" in out
+    assert "designer" not in repl.registry.aliases
+
+
+def test_model_harness_starts_at_model_step(tmp_path, monkeypatch, capsys):
+    """/model <harness> skips the harness step; a cancelled model pick
+    changes nothing."""
+    repl = make_repl(tmp_path, [])
+    reg = with_fake_models(repl)
+    monkeypatch.setattr("sys.stdin", Tty())
+    feed(monkeypatch, ["/model arch", "", "/quit"])
+    repl.run()
+    out = capsys.readouterr().out
+    assert "harness #" not in out
+    assert "model for arch (architect): (unset)" in out
+    assert "architect" not in reg.aliases
 
 
 def test_unknown_command(tmp_path, monkeypatch, capsys):
@@ -740,3 +862,43 @@ def test_setup_command_switches_to_the_chosen_model(tmp_path, monkeypatch, capsy
     monkeypatch.setattr(onboard_mod, "walkthrough", lambda io, registry, **kw: "fake:other")
     repl._command("/setup")
     assert repl.runner.spec.spec == "fake:other"
+
+
+@pytest.mark.parametrize("existing", [None, {"reasoning_effort": "none"}])
+def test_model_direct_form_learns_a_local_ollama_context_window(tmp_path, monkeypatch, capsys, existing):
+    """/model ollama:<local model> whose models.json entry is missing — or
+    exists without a window, as a /think choice leaves it — records the
+    window the daemon reports instead of assuming 32k, so neither 'assuming'
+    warning fires."""
+    repl = make_repl(tmp_path, [])
+    reg = repl.registry
+    if existing is not None:
+        reg.models["ollama:qwen3.8:27b-mlx"] = dict(existing)
+    reg.providers["ollama"] = ProviderConfig(
+        name="ollama", base_url="http://localhost:11434/v1", native_url="http://localhost:11434"
+    )
+
+    class FakeDaemon:
+        def __init__(self, *a, **kw):
+            pass
+
+        def ensure(self, name, **kw):
+            pass
+
+        def context_length(self, name):
+            assert name == "qwen3.8:27b-mlx"
+            return 262144
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("bird.repl.Ollama", FakeDaemon)
+    monkeypatch.setattr("bird.llm.discovery.Ollama", FakeDaemon)
+    feed(monkeypatch, ["/model ollama:qwen3.8:27b-mlx", "/quit"])
+    repl.run()
+    captured = capsys.readouterr()
+    assert reg.models["ollama:qwen3.8:27b-mlx"] == {**(existing or {}), "context_window": 262144}
+    assert repl.runner.spec.context_window == 262144
+    assert "model: fake:model → ollama:qwen3.8:27b-mlx" in captured.out
+    assert "no context window known" not in captured.out
+    assert "no models.json entry" not in captured.err

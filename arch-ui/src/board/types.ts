@@ -27,6 +27,8 @@ export interface Lane {
   out?: boolean;
   /** the one that won */
   taken?: boolean;
+  /** who runs this shape and at what scale, under the name */
+  evidence?: { who?: string; scale?: string; sources?: string[] };
 }
 
 export interface BoardNode {
@@ -54,6 +56,8 @@ export interface BoardNode {
   approaches: string[];
   existing: boolean;
   out?: boolean;
+  /** the user closed this branch: "settled" or "out_of_scope" */
+  closed?: string;
   /** the container this box sits inside, if any */
   parent?: string;
   /** set on a box that holds other boxes. Folded, it is drawn as one card and
@@ -96,4 +100,7 @@ export interface Attachment {
   size: number;
   img: boolean;
   url: string | null;
+  /** the bytes, kept so a page with an upload channel can deliver them on
+   *  send; absent on attachments restored from an old transcript */
+  file?: File;
 }

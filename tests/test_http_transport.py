@@ -19,6 +19,10 @@ class Handlers:
         self.subjects = []
         self.permissions = []
         self.interrupts = 0
+        self.interrupt_sources = []
+        self.captures = []
+        self.uploads = []
+        self.upload_ok = True
 
     def on_user_input(self, text, subjects=()):
         self.inputs.append(text)
@@ -27,11 +31,22 @@ class Handlers:
     def on_permission(self, req_id, approved, feedback):
         self.permissions.append((req_id, approved, feedback))
 
-    def on_interrupt(self):
+    def on_interrupt(self, source="unknown"):
         self.interrupts += 1
+        self.interrupt_sources.append(source)
 
     def on_command(self, line):
         return None
+
+    def on_capture(self, payload):
+        self.captures.append(payload)
+        return {"ok": True}
+
+    def on_upload(self, payload):
+        self.uploads.append(payload)
+        if self.upload_ok:
+            return {"ok": True, "path": ".bird/sessions/t/attachments/shot.png", "size": 8}
+        return {"ok": False, "error": "not a raster image"}
 
 
 @pytest.fixture
@@ -174,6 +189,9 @@ def test_post_dispatch(served):
     assert status == 200
     status, _ = request(host, port, "POST", "/interrupt", {})
     assert status == 200
+    # the route names itself as the source — the session log's interrupt
+    # event is only as diagnosable as the detail the transport passes
+    assert handlers.interrupt_sources == ["/interrupt"]
     status, _ = request(host, port, "POST", "/nope", {})
     assert status == 404
     assert handlers.inputs == ["hello"]
@@ -300,6 +318,59 @@ def test_linger_gives_up_when_nobody_is_reading(tmp_path):
     assert done.wait(timeout=5)
 
 
+def _running(transport):
+    done = threading.Event()
+
+    def run():
+        transport.run(Handlers())
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    time.sleep(0.05)
+    return done
+
+
+def test_close_when_empty_ends_the_run_once_the_last_page_closes(tmp_path):
+    """The page closing is the user leaving. A dispatched design session has
+    no other exit — its caller is blocked on run() — and all 16 logged
+    dispatches hung there. Armed by the first page: a room nobody ever
+    entered (--no-open, a blocked auto-open) still gets its chance."""
+    transport = HttpTransport(static_dir=_static(tmp_path), close_when_empty=0.6)
+    done = _running(transport)
+    assert not done.wait(timeout=1.5), "never opened: nothing to close on"
+    host, port = transport._server.server_address[:2]
+    reader = SseReader(host, port)
+    assert not done.wait(timeout=1.5), "a page is reading"
+    reader.close()
+    assert done.wait(timeout=10)  # noticed by the poke, closed after the window
+
+
+def test_close_when_empty_zero_keeps_the_run_up(tmp_path):
+    transport = HttpTransport(static_dir=_static(tmp_path))
+    done = _running(transport)
+    host, port = transport._server.server_address[:2]
+    reader = SseReader(host, port)
+    reader.close()
+    assert not done.wait(timeout=1.5)
+    transport.shutdown()
+    assert done.wait(timeout=5)
+
+
+def test_a_returning_page_resets_the_empty_room_clock(tmp_path):
+    """A reconnecting page (SSE dropped, backoff, new stream) must not lose
+    the session to a window it was inside of."""
+    transport = HttpTransport(static_dir=_static(tmp_path), close_when_empty=1.5)
+    done = _running(transport)
+    host, port = transport._server.server_address[:2]
+    reader = SseReader(host, port)
+    reader.close()
+    time.sleep(0.7)  # inside the window
+    reader = SseReader(host, port)  # back
+    assert not done.wait(timeout=2.0), "the room was not empty for the whole window"
+    reader.close()
+    assert done.wait(timeout=10)
+
+
 def test_replayed_arch_state_is_stamped_so_the_page_can_tell(tmp_path):
     """A late joiner gets the whole design at once. Without a marker the page
     cannot tell that from a design that just arrived, and animates history."""
@@ -314,3 +385,86 @@ def test_replayed_arch_state_is_stamped_so_the_page_can_tell(tmp_path):
     # the live push itself is untouched — it really is new
     assert "replayed" not in transport._arch_state
     transport.shutdown()
+
+
+# ---------- capture round trip ----------
+
+
+def test_the_capture_answer_reaches_the_handlers(served):
+    transport, handlers, host, port = served
+    status, body = request(host, port, "POST", "/capture",
+                           {"id": "cap-1", "png": "data:image/png;base64,AA"})
+    assert status == 200 and json.loads(body)["ok"] is True
+    assert handlers.captures == [{"id": "cap-1", "png": "data:image/png;base64,AA"}]
+
+
+def test_a_pending_capture_request_replays_to_a_late_joiner(served):
+    """A page that reloads mid-capture is the one that has to answer it — the
+    same replay contract as an open permission gate."""
+    transport, _, host, port = served
+    transport.emit({"type": "capture_request", "id": "cap-1",
+                    "artboard": "hero", "version": "v1"})
+    reader = SseReader(host, port)
+    got = reader.wait_for("capture_request")
+    assert got["id"] == "cap-1" and got["artboard"] == "hero"
+    reader.close()
+
+
+def test_an_answered_capture_stops_replaying(served):
+    """The round trip is over; the next late joiner must not be asked to
+    re-capture and POST a second png the waiter would only drop."""
+    transport, _, host, port = served
+    transport.emit({"type": "capture_request", "id": "cap-1", "artboard": "hero"})
+    status, _ = request(host, port, "POST", "/capture", {"id": "cap-1", "png": "data:image/png;base64,AA"})
+    assert status == 200
+    reader = SseReader(host, port)
+    time.sleep(0.3)
+    assert not [e for e in reader.events if e.get("type") == "capture_request"]
+    reader.close()
+
+
+def test_a_transport_whose_handlers_have_no_capture_route_serves_404(served):
+    """getattr, like /mutate: not every embedder's Handlers grows a method
+    for a route it never serves."""
+    transport, _, host, port = served
+
+    class NoCapture:
+        def on_user_input(self, text, subjects=()):
+            pass
+
+    transport._handlers = NoCapture()
+    status, _ = request(host, port, "POST", "/capture", {"id": "cap-1"})
+    assert status == 404
+
+
+# ---------- upload ----------
+
+
+def test_the_upload_reaches_the_handlers(served):
+    transport, handlers, host, port = served
+    status, body = request(host, port, "POST", "/upload",
+                           {"name": "shot.png", "data": "AAAA"})
+    assert status == 200
+    out = json.loads(body)
+    assert out["ok"] is True and out["path"].endswith("shot.png")
+    assert handlers.uploads == [{"name": "shot.png", "data": "AAAA"}]
+
+
+def test_a_refused_upload_serves_400(served):
+    transport, handlers, host, port = served
+    handlers.upload_ok = False
+    status, body = request(host, port, "POST", "/upload",
+                           {"name": "notes.png", "data": "AAAA"})
+    assert status == 400 and "raster" in json.loads(body)["error"]
+
+
+def test_a_transport_whose_handlers_have_no_upload_route_serves_404(served):
+    transport, _, host, port = served
+
+    class NoUpload:
+        def on_user_input(self, text, subjects=()):
+            pass
+
+    transport._handlers = NoUpload()
+    status, _ = request(host, port, "POST", "/upload", {"name": "x.png", "data": "AAAA"})
+    assert status == 404

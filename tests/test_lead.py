@@ -98,7 +98,7 @@ class CapturingClient:
     def __init__(self):
         self.seen = []
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
         self.seen = list(messages)
         return LLMResponse(
             message=assistant(calls=[tc("done", {"summary": "ok"})]),
@@ -298,7 +298,7 @@ class ScriptClient:
     def __init__(self, script):
         self.script = list(script)
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
         return LLMResponse(message=self.script.pop(0), usage=Usage(10, 5),
                            stop_reason="stop", model=spec.spec)
 
@@ -357,7 +357,7 @@ class RoutingClient:
     def __init__(self, lead, arch, code):
         self.q = {"lead": list(lead), "arch": list(arch), "code": list(code)}
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
         names = {t.name for t in (tools or [])}
         if "brief" in names:
             key = "arch"
@@ -376,7 +376,7 @@ def test_lead_end_to_end(tmp_path, monkeypatch):
     from bird.harnesses.arch.run import run_arch_headless
 
     monkeypatch.setattr("bird.harnesses.arch.run.run_arch_interactive",
-                        lambda *, on_status=None, **kw: run_arch_headless(**kw))
+                        lambda *, on_status=None, broker=None, store=None, **kw: run_arch_headless(**kw))
 
     events = []
     run_dir = tmp_path / ".bird" / "sessions" / "lead-e2e"
@@ -409,3 +409,64 @@ def test_lead_end_to_end(tmp_path, monkeypatch):
     assert (arch_dir / "bundle" / "architecture.md").is_file()
     # and code was dispatched WITH the design seeded in
     assert dispatches[1]["seeded"] is True
+
+
+def test_architect_shares_the_leads_broker(monkeypatch, tmp_path):
+    """The Workbench page renders no permission prompts, so the architect's
+    gates (read outside the repo) must be answered by the lead's UI: the tool
+    hands its own broker down instead of letting the sub-session mint a
+    page-bound one that nobody can answer."""
+    from bird.harnesses.lead.tools import ArchitectTool
+    from bird.tools import ToolContext
+
+    seen = {}
+
+    def fake_interactive(*, run_dir, broker=None, **kw):
+        seen["broker"] = broker
+        (run_dir / "bundle").mkdir(parents=True)
+        (run_dir / "bundle" / "architecture.md").write_text("# X\n\ndesign")
+        return _fake_arch_session(True, run_dir)
+
+    monkeypatch.setattr("bird.harnesses.arch.run.run_arch_interactive", fake_interactive)
+    sentinel = object()
+    ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path, broker=sentinel)
+    ArchitectTool().run({"task": "x"}, ctx)
+    assert seen["broker"] is sentinel
+
+
+def test_failed_dispatch_is_an_error_and_seeds_the_retry(tmp_path, monkeypatch):
+    """A capped run finished nothing but came back as a successful tool result,
+    so the lead re-sent the identical task and paid for the whole exploration
+    twice (1.30M tokens, then 0.68M re-reading the same files)."""
+    msgs = [
+        Message(
+            role="assistant",
+            content="I had narrowed it to the send path",
+            tool_calls=[tc("read", {"path": "tui/src/main.ts"})],
+        )
+    ]
+
+    def fake_build_runner(name, *, spec, client, registry, ctx, **kw):
+        return SimpleNamespace(run=lambda task: SimpleNamespace(
+            status="max_turns", summary="hit the cap", turns=40, messages=msgs))
+
+    monkeypatch.setattr("bird.harnesses.registry.build_runner", fake_build_runner)
+    ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path)
+    res = CodeTool().run({"task": "fix /mcp"}, ctx)
+
+    assert res.is_error, "a run that finished nothing must not read as success"
+    assert "WITHOUT finishing" in res.output and "Do not re-send the same task" in res.output
+    assert ctx.last_bundle and "tui/src/main.ts" in ctx.last_bundle
+    assert "narrowed it to the send path" in ctx.last_bundle
+
+
+def test_successful_dispatch_is_unchanged(tmp_path, monkeypatch):
+    def fake_build_runner(name, *, spec, client, registry, ctx, **kw):
+        return SimpleNamespace(run=lambda task: SimpleNamespace(
+            status="done", summary="built", turns=3, messages=[]))
+
+    monkeypatch.setattr("bird.harnesses.registry.build_runner", fake_build_runner)
+    ctx = ToolContext(repo_root=tmp_path, registry=REG, run_dir=tmp_path)
+    res = CodeTool().run({"task": "build it"}, ctx)
+    assert not res.is_error and res.output == "[done] built"
+    assert ctx.last_bundle is None  # nothing to carry forward

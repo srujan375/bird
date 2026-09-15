@@ -1,7 +1,11 @@
 .venv
 __pycache__/
 *.egg-info/
-.bird/
+# .bird/ holds generated state (sessions, kg, cache) — except the project
+# instructions file, which is source: every harness loads it into its system
+# prompt. `.bird/*` (not `.bird/`) so the one file can be re-included.
+.bird/*
+!.bird/instructions.md
 .pytest_cache/
 graphify-out/
 .env

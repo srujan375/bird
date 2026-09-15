@@ -25,3 +25,110 @@
   content:''; position:absolute; left:0; top:6px;
   width:5px; height:5px; border-radius:50%; background:var(--muted);
 }
+
+/* ─── the dock: the one question on the table, pinned above the composer ── */
+.dockq{ border-top:1px solid var(--border); background:var(--bg); padding:12px 16px 0; }
+.dockq .dq-head{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px; }
+.dockq .dq-label{ font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--ink-2); }
+.dockq .dq-where{ font-size:11.5px; color:var(--ink-2); text-decoration:underline; text-underline-offset:3px; }
+.dockq .dq-where:hover{ color:var(--fg); }
+.dockq .ask{ margin-top:0; }
+.dockq .ask .picker{ margin-top:0; }
+.dockq .ask .q-text{ font-size:13.5px; }
+/* a pick made while the architect is still writing: sent when the turn ends */
+.picker .queued{ display:flex; align-items:center; gap:9px; margin-top:12px; font-family:var(--font-mono); font-size:11px; color:var(--ink-2); }
+.picker .queued .thinking{ height:auto; }
+.picker .queued .thinking i{ width:4px; height:4px; }
+/* the composer under the dock loses its own top border: the dock carries it */
+.dockq + .composer{ border-top:0; padding-top:12px; }
+/* the app bar's chat toggle, when the rail is away and a question waits */
+.chat-toggle .waiting{
+  font-family:var(--font-mono); font-size:10px; letter-spacing:.08em; text-transform:uppercase; white-space:nowrap;
+  padding:2px 7px; border:1px solid var(--fg); border-radius:999px; color:var(--fg);
+}
+
+/* ─── the activity strip: what the scribe is drawing, beside the tool dock ── */
+.strip{
+  position:absolute; bottom:16px; left:140px; z-index:4;
+  display:flex; align-items:center; gap:10px; height:36px; padding:0 12px 0 10px;
+  background:color-mix(in oklch, var(--surface) 88%, transparent); backdrop-filter:blur(10px);
+  border:1px solid var(--border); border-radius:11px;
+  box-shadow:0 2px 10px color-mix(in oklch, var(--fg) 7%, transparent);
+  font-family:var(--font-mono); font-size:11.5px; color:var(--ink-2); white-space:nowrap;
+  max-width:calc(100% - 300px); overflow:hidden; text-overflow:ellipsis;
+}
+.strip .dot{ width:6px; height:6px; border-radius:50%; background:var(--muted); flex:none; }
+.strip[data-state="drawing"] .dot{ background:var(--accent); animation:blip 1.25s var(--ease-in-out) infinite; }
+.strip[data-state="error"] .dot{ background:var(--danger); }
+.strip[data-state="error"]{ color:var(--danger); }
+.strip .sep{ width:1px; height:16px; background:var(--border); flex:none; }
+.strip .last{ color:var(--fg); overflow:hidden; text-overflow:ellipsis; }
+.strip .n{ color:var(--ink-2); }
+/* the last three, opened above the strip */
+.strip-recent{
+  position:absolute; left:140px; bottom:60px; z-index:4; padding:4px;
+  background:var(--surface); border:1px solid var(--border); border-radius:9px;
+  box-shadow:0 4px 14px color-mix(in oklch, var(--fg) 10%, transparent);
+  display:flex; flex-direction:column; gap:1px; min-width:220px;
+}
+.strip-recent .board-line{ margin-top:0; }
+/* the keyboard hint sits above the strip's stack; with a scribe on it moves up */
+.board:has(.strip) .hint{ bottom:60px; left:140px; }
+.board:has(.strip-recent) .hint{ display:none; }
+
+/* ─── the frontier: what is still open, and how to close a branch ── */
+.frontier{
+  position:absolute; right:16px; top:16px; z-index:4; width:268px; padding:10px 12px 6px;
+  background:color-mix(in oklch, var(--surface) 88%, transparent); backdrop-filter:blur(10px);
+  border:1px solid var(--border); border-radius:11px;
+  box-shadow:0 2px 10px color-mix(in oklch, var(--fg) 7%, transparent);
+  max-height:calc(100% - 80px); overflow-y:auto; scrollbar-width:thin;
+}
+.frontier .fr-head{ display:flex; align-items:baseline; justify-content:space-between; font-family:var(--font-mono);
+  font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-2); margin-bottom:4px; }
+.frontier .fr-head b{ font-weight:600; color:var(--fg); }
+.frontier .fr-more{ letter-spacing:.04em; text-transform:none; color:var(--muted); }
+.frontier .fr-fork{ padding:8px 0 9px; font-size:12.5px; line-height:1.4; color:var(--fg); border-bottom:1px solid var(--border); }
+.frontier .fr-fork b{ font-weight:600; }
+.frontier .fr-fork .k{ font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--ink-2); display:block; margin-bottom:2px; }
+.fr-row{ display:grid; grid-template-columns:1fr auto; column-gap:8px; row-gap:1px; align-items:center; padding:8px 0; }
+.fr-row + .fr-row{ border-top:1px dashed var(--fg-hair); }
+.fr-row .fr-label{ font-size:13px; font-weight:500; color:var(--fg); letter-spacing:-.005em; }
+.fr-row .fr-why{ grid-column:1 / -1; font-size:11.5px; color:var(--ink-2); }
+.fr-row .node-kind{ font-size:10px; padding:3px 5px; }
+/* the two gestures, shown on the row you are pointing at */
+.fr-row .fr-acts{ grid-column:1 / -1; display:flex; gap:12px; margin-top:4px; }
+.fr-row .fr-acts .link-btn{ padding:2px 0; font-size:12px; color:var(--fg); text-decoration:underline; text-underline-offset:3px; background:none; border:0; cursor:pointer; }
+.fr-row .fr-acts .link-btn:hover{ color:var(--accent-ink); }
+.fr-row[data-hover="1"]{ margin:0 -12px; padding:8px 12px; background:var(--fg-soft); border-top-color:transparent; }
+.fr-empty{ padding:8px 0 6px; font-size:12.5px; line-height:1.5; color:var(--ink-2); text-wrap:pretty; margin:0; }
+.fr-closed{ margin-top:6px; padding-top:4px; border-top:1px solid var(--border); }
+.fr-row-closed .fr-label{ color:var(--ink-2); font-weight:400; }
+.fr-row-closed .fr-acts{ margin-top:2px; }
+/* a closed box wears it in the head, quietly */
+.node-mark{ font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; padding:2px 6px;
+  border:1px solid var(--line-strong); border-radius:999px; color:var(--ink-2); flex:none; white-space:nowrap; }
+.node[data-closed] .node-label{ color:var(--ink-2); }
+.node .node-closed{ margin-top:7px; display:flex; }
+
+/* ─── the progress list: the research turn, in place of the thinking dots ── */
+.progress{ display:grid; gap:7px; }
+.progress .pg-row{ display:flex; align-items:center; gap:10px; font-size:13.5px; color:var(--ink-2); line-height:1.4; }
+.progress .pg-row[data-done="1"]{ color:var(--fg); }
+.progress .pg-mark{ flex:none; width:16px; height:16px; border-radius:50%; border:1.5px solid var(--line-strong); background:var(--surface); display:grid; place-items:center; }
+.progress .pg-row[data-done="1"] .pg-mark{ background:var(--accent); border-color:var(--accent); }
+.progress .pg-mark svg{ width:9px; height:9px; color:var(--surface); }
+.progress .pg-row[data-active="1"] .pg-mark{ border-color:var(--accent); }
+.progress .pg-row[data-active="1"] .pg-mark i{ width:6px; height:6px; border-radius:50%; background:var(--accent); animation:blip 1.25s var(--ease-in-out) infinite; }
+.progress .pg-eta{ font-family:var(--font-mono); font-size:10.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin-top:4px; }
+
+/* ─── the evidence line: who runs this shape, in the lane's header ── */
+.lane-evidence{
+  position:absolute; top:50px; left:16px; right:16px;
+  display:flex; align-items:baseline; gap:7px; font-size:11.5px; line-height:1.35; color:var(--ink-2);
+  white-space:nowrap; overflow:hidden;
+}
+.lane-evidence .k{ font-family:var(--font-mono); font-size:10px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); flex:none; }
+.lane-evidence .who{ color:var(--fg); overflow:hidden; text-overflow:ellipsis; }
+.lane-evidence .src{ text-decoration:underline; text-underline-offset:3px; color:var(--ink-2); flex:none; }
+.lane-evidence .src:hover{ color:var(--fg); }

@@ -171,6 +171,7 @@ function NodeCardImpl({
       {...(n.parent ? { "data-parent": n.parent } : {})}
       {...(n.group ? { "data-group": open ? "open" : "folded" } : {})}
       {...(n.out ? { "data-out": "1" } : {})}
+      {...(n.closed ? { "data-closed": n.closed } : {})}
       {...(selected ? { "data-sel": "1" } : {})}
       {...(reveal ? { "data-fields": "1" } : {})}
       {...(editing ? { "data-editing": editing } : {})}
@@ -235,6 +236,16 @@ function NodeCardImpl({
             </span>
           )}
       </div>
+
+      {n.closed ? (
+        /* the user closed this branch: said under the head, not squeezed into
+           it — a stub box has no room beside its name */
+        <div className="node-closed">
+          <span className="node-mark" title="Closed by you; reopen it from the frontier">
+            {n.closed === "settled" ? "good enough" : "out of scope"}
+          </span>
+        </div>
+      ) : null}
 
       {showResp ? (
         <p className="node-resp" data-field="resp" data-tag="does" ref={bind("resp")} {...empty(!n.resp)}>

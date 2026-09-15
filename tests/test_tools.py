@@ -5,6 +5,7 @@ import pytest
 from bird.harnesses.code import code_harness_tools
 from bird.tools import (
     BashTool,
+    DeleteTool,
     DoneTool,
     EditTool,
     GlobTool,
@@ -14,7 +15,7 @@ from bird.tools import (
     ReadTool,
     WriteTool,
 )
-from bird.tools.base import ToolContext
+from bird.tools.base import ToolContext, ToolError
 from bird.tools.bash import check_command, is_pure_search, is_verification_command
 
 
@@ -577,7 +578,7 @@ def test_bash_runs_and_captures(ctx):
 def test_bash_rejection_is_loud_and_logged(ctx):
     r = BashTool().execute({"command": "rm -rf src"}, ctx)
     assert r.is_error
-    assert "Allowed command categories" in r.output  # names what IS allowed
+    assert "write, edit and delete tools" in r.output  # names the allowed form, not a category list
     assert any(t == "bash_rejected" for t, _ in ctx.events)
 
 
@@ -742,14 +743,20 @@ def test_other_harnesses_are_not_gated(ctx):
 # gate (~20: the unverified_reason param and the clause naming the gate —
 # the rest of that rule lives in instructions.md and in the rejection
 # message, which cost nothing per turn).
+# 2600 covers the 16-tool toolset (measured ≈2455): `delete` joined, and
+# grep grew six bare alias properties (-i/-n/-A/-B/-C, output_mode — the
+# other-agent shape that 14 logged calls were rejected for, ~60 tokens) and
+# plan a `note` per step (~15). The alternative was trimming other tools'
+# descriptions to make room, which trades a documented cost for an
+# undocumented one.
 # The /4 heuristic is loose; the guardrail exists to keep per-turn schema
 # overhead from eating small-model context windows, not as a hard wall.
-SCHEMA_TOKEN_BUDGET = 2400
+SCHEMA_TOKEN_BUDGET = 2600
 
 
 def test_all_schemas_under_token_budget():
     tools = code_harness_tools(with_kg=True)
-    assert len(tools) == 15
+    assert len(tools) == 16
     wire = json.dumps([t.spec().to_openai() for t in tools])
     approx_tokens = len(wire) / 4
     assert approx_tokens < SCHEMA_TOKEN_BUDGET, (
@@ -761,7 +768,7 @@ def test_control_arm_has_no_kg_query():
     names = [t.name for t in code_harness_tools(with_kg=False)]
     assert "kg_query" not in names
     assert names == [
-        "read", "read_image", "ls", "grep", "glob", "edit", "write", "bash",
+        "read", "read_image", "ls", "grep", "glob", "edit", "write", "delete", "bash",
         "WebSearch", "WebFetch",
         "plan", "plan_update", "skill", "done",
     ]
@@ -774,7 +781,7 @@ def test_offline_control_arm_strips_web_too():
     assert "WebFetch" not in names
     assert "kg_query" not in names
     assert names == [
-        "read", "read_image", "ls", "grep", "glob", "edit", "write", "bash",
+        "read", "read_image", "ls", "grep", "glob", "edit", "write", "delete", "bash",
         "plan", "plan_update", "skill", "done",
     ]
 
@@ -1008,3 +1015,181 @@ def test_search_tools_are_never_gated(search_repo, ctx):
     # read-only by construction; they must not carry the permission flag
     assert GrepTool().requires_permission is False
     assert GlobTool().requires_permission is False
+
+
+# --- batched read + output spill ---
+
+
+def test_read_batches_several_files_in_one_call(ctx, repo):
+    """Reconnaissance was costing one turn per file; `paths` rides extra files
+    along with the first. A bad path reports in place instead of sinking the
+    batch — the usual reason to batch is not knowing which file matters yet."""
+    (repo / "a.py").write_text("AAA\n")
+    (repo / "b.py").write_text("BBB\n")
+    r = ReadTool().run({"path": "a.py", "paths": ["b.py", "nope.py"]}, ctx)
+    assert "===== a.py =====" in r.output and "AAA" in r.output
+    assert "===== b.py =====" in r.output and "BBB" in r.output
+    assert "===== nope.py =====" in r.output and "Error:" in r.output
+    assert r.details["requested"] == 3 and r.details["read"] == 2
+    # a plain single read is untouched
+    assert ReadTool().run({"path": "a.py"}, ctx).output.startswith("AAA")
+
+
+def test_read_accepts_paths_without_path(ctx, repo):
+    """The schema required `path` while the description advertised "or several
+    at once with `paths`", so `{"paths": [...]}` — the form the invitation asks
+    for — was rejected by the validator before the tool ever ran. One logged
+    session burned a retry on it, then fell back to one file per call: the
+    exact waste batching exists to prevent."""
+    from bird.llm.types import ToolCall
+    from bird.llm.validate import validate_tool_call
+
+    (repo / "a.py").write_text("AAA\n")
+    (repo / "b.py").write_text("BBB\n")
+    r = ReadTool().run({"paths": ["a.py", "b.py"]}, ctx)
+    assert "===== a.py =====" in r.output and "AAA" in r.output
+    assert "===== b.py =====" in r.output and "BBB" in r.output
+    assert r.details["requested"] == 2 and r.details["read"] == 2
+    # and the schema now agrees with the tool: the validator lets it through
+    call = ToolCall.from_raw("1", "read", json.dumps({"paths": ["a.py"]}))
+    assert validate_tool_call(call, {"read": ReadTool().spec()}) is None
+
+
+def test_read_with_neither_path_nor_paths_says_which_to_use(ctx):
+    """Dropping `required` moves the rule into run(), so it has to state it."""
+    with pytest.raises(ToolError, match="`path` for one file"):
+        ReadTool().run({}, ctx)
+
+
+def test_read_does_not_pay_twice_for_a_file_named_in_both(ctx, repo):
+    (repo / "a.py").write_text("AAA\n")
+    r = ReadTool().run({"path": "a.py", "paths": ["a.py", "a.py"]}, ctx)
+    assert r.output.count("===== a.py =====") == 1
+    assert r.details["requested"] == 1 and r.details["read"] == 1
+
+
+def test_oversized_output_spills_to_a_file_read_can_open(tmp_path):
+    """Truncation used to be terminal, so the only way to the tail was to
+    re-run the command behind a different window — eighteen turns of that
+    killed one logged run. The full output now lands somewhere `read` reaches."""
+    from bird.tools.base import Tool, ToolResult
+
+    class Big(Tool):
+        name = "big"
+        description = "x"
+        parameters = {"type": "object", "properties": {}}
+
+        def run(self, args, ctx):
+            return ToolResult(output="A" * 40_000)
+
+    ctx = ToolContext(repo_root=tmp_path, run_dir=tmp_path / ".bird" / "sessions" / "t")
+    r = Big().execute({}, ctx)
+    rel = r.details["full_output"]
+    assert (tmp_path / rel).read_text() == "A" * 40_000
+    assert rel in r.output and "Do NOT re-run" in r.output
+    assert ReadTool().run({"path": rel}, ctx).output.startswith("A")
+
+
+def test_oversized_output_without_a_run_dir_still_truncates(tmp_path):
+    """No session directory (library use, tests) — clip and say so, never crash."""
+    from bird.tools.base import Tool, ToolResult
+
+    class Big(Tool):
+        name = "big"
+        description = "x"
+        parameters = {"type": "object", "properties": {}}
+
+        def run(self, args, ctx):
+            return ToolResult(output="A" * 40_000)
+
+    r = Big().execute({}, ToolContext(repo_root=tmp_path))
+    assert "truncated" in r.output and "full_output" not in r.details
+
+
+# --- delete ---
+
+
+def test_delete_removes_a_file(ctx, repo):
+    (repo / "scratch.txt").write_text("junk\n")
+    r = DeleteTool().run({"path": "scratch.txt"}, ctx)
+    assert not (repo / "scratch.txt").exists()
+    assert "Deleted scratch.txt" in r.output and r.details["path"] == "scratch.txt"
+
+
+def test_delete_refuses_a_directory(ctx, repo):
+    """Recursive delete is the one action in this toolset with nothing to undo
+    it — a run that genuinely needs a tree gone says so a file at a time."""
+    with pytest.raises(ToolError) as e:
+        DeleteTool().run({"path": "src"}, ctx)
+    assert "directory" in str(e.value)
+    assert (repo / "src").is_dir()
+
+
+def test_delete_reports_a_missing_file(ctx):
+    with pytest.raises(ToolError) as e:
+        DeleteTool().run({"path": "nope.txt"}, ctx)
+    assert "nothing to delete" in str(e.value)
+
+
+def test_delete_is_gated_and_never_auto_approved(tmp_path):
+    """The TUI collapses an unknown permission kind to "edit", and auto_edits
+    auto-approves edit — so a delete arriving without its own kind would remove
+    files with no prompt. It gets its own kind precisely to stay askable."""
+    from bird.permissions import permission_payload
+
+    assert DeleteTool.requires_permission is True
+    (tmp_path / "gone.txt").write_text("a\nb\n")
+    payload = permission_payload("delete", {"path": "gone.txt"}, ToolContext(repo_root=tmp_path))
+    assert payload["kind"] == "delete" and payload["file"] == "gone.txt"
+    assert [l["kind"] for l in payload["lines"]] == ["del", "del"]
+
+
+def test_script_runners_allow_a_file_but_not_inline_code():
+    """A TypeScript repo had no permitted way to run a throwaway probe, so a
+    model that wrote one — the right instinct — could not execute it."""
+    cats = ("search", "test", "lint", "git_read")
+    for ok in ("npx tsx probe.ts", "node probe.js", "python script.py", "ts-node x.ts"):
+        assert check_command(ok, cats) is None, ok
+    for bad in ('python -c "import os"', 'node -e "process.exit()"', "tsx", "node"):
+        assert check_command(bad, cats) is not None, bad
+
+
+
+@pytest.mark.parametrize("cmd, hint", [
+    ('python -c "import bird; print(1)"', "it to a file and run `python probe.py`"),
+    ("python -m bird.cli", "`python -m` only for"),
+    ("python", "`python path/to/script.py`"),
+    ("git stash", "Do not `git stash`"),
+    ("git checkout -- src/x.py", "Do not `git checkout`"),
+    ("npm publish", "`npm run <script>`"),
+    ("curl https://example.com", "web_fetch"),
+    ("tsx -e 'console.log(1)'", "`npx tsx probe.ts`"),
+    ("pytest -q > out.txt", "saved to a file automatically"),
+])
+def test_bash_rejection_names_the_nearest_allowed_form(cmd, hint):
+    """Of 206 logged rejections, 45 were `python`/`python3` probes answered with
+    a list of categories; the model's next move was a shell grep or a fourth
+    guess at the test command. The rejection now says what to type instead."""
+    reason = check_command(cmd, ("search", "test", "lint", "git_read"))
+    assert reason is not None and hint in reason, reason
+
+
+def test_grep_accepts_the_other_agent_argument_shape(search_repo, ctx):
+    """-i/-n/-C, output_mode, type, head_limit: the shape models trained on
+    another agent's grep keep sending. 14 logged calls were rejected for it,
+    each a wasted turn and a retry."""
+    from bird.llm.types import ToolCall
+    from bird.llm.validate import validate_tool_call
+
+    shape = {"pattern": "api_key", "-i": True, "-n": True, "-C": 1, "output_mode": "content"}
+    call = ToolCall("1", "grep", shape, json.dumps(shape))
+    assert validate_tool_call(call, {"grep": GrepTool().spec()}) is None  # the wire accepts it
+    r = GrepTool().execute(shape, ctx)
+    assert not r.is_error, r.output
+    assert "src/auth.js:1:" in r.output
+    files = GrepTool().execute({"pattern": "API_KEY", "output_mode": "files_with_matches"}, ctx)
+    assert "src/auth.js" in files.output and ":1:" not in files.output
+    capped = GrepTool().execute({"pattern": ".", "head_limit": 2}, ctx)
+    assert not capped.is_error
+    assert "truncated" in capped.output.splitlines()[0]
+    assert len(capped.output.splitlines()) == 4  # header, two lines, the cap notice

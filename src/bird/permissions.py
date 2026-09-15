@@ -124,6 +124,16 @@ def permission_payload(name: str, args: dict[str, Any], ctx: ToolContext) -> dic
             "new_file": not old,
             "lines": _diff_lines(old, content),
         }
+    if name == "delete":
+        path = args.get("path") or "?"
+        old = ""
+        with contextlib.suppress(Exception):
+            p = ctx.resolve_path(path)
+            if p.is_file():
+                old = p.read_text(encoding="utf-8", errors="replace")
+        # its own kind, not "edit": the TUI collapses unknown kinds to edit, and
+        # auto_edits auto-approves edit — which would delete files without asking
+        return {"kind": "delete", "file": path, "lines": _diff_lines(old, "")}
     if name.startswith("mcp__"):
         # mcp__<server>__<tool>: split back apart so the card can show WHICH
         # server is being asked to run WHAT — the flattened name alone reads
@@ -209,6 +219,14 @@ class PermissionBroker:
     def bind(self, emit: Callable[..., None]) -> None:
         self._emit = emit
 
+    @property
+    def bound(self) -> bool:
+        """True once a sink is attached. A Server only binds an unbound
+        broker: a sub-session (the lead's arch dispatch) shares its parent's
+        broker so gates keep routing to the UI that can answer them, and
+        rebinding would silently redirect them to a transport that can't."""
+        return self._emit is not None
+
     def request(self, payload: dict[str, Any]) -> tuple[bool, str]:
         if self._emit is None:
             # nothing is listening; refuse rather than silently proceed
@@ -280,6 +298,22 @@ class ConsoleBroker:
         self.out = out if out is not None else sys.stdout
         self.ask = ask if ask is not None else input
         self.mode: PermissionMode = "normal"
+
+    # The Server's broker surface (bind/resolve/deny_all) is inert here: the
+    # terminal answers synchronously inside request(), so there is nothing to
+    # bind a sink to, no id to resolve, and nothing pending to deny. Present so
+    # a Server can run on a ConsoleBroker (`bird arch`, whose page has no
+    # permission UI) without special-casing it.
+    bound = True
+
+    def bind(self, emit: Callable[..., None]) -> None:
+        pass
+
+    def resolve(self, req_id: int, approved: bool, feedback: str = "") -> None:
+        pass
+
+    def deny_all(self) -> None:
+        pass
 
     # Back-compat view for existing tests and any reader of the attribute:
     # the old boolean toggle is "auto_edits mode is on".

@@ -13,16 +13,27 @@ export type ServerMessage =
 	| { type: "harness_event"; event: string; data: Record<string, unknown> }
 	| ({ type: "permission_request"; id: number } & (
 			| { kind: "bash"; cmd: string }
-			| { kind: "edit" | "write"; file: string; lines: DiffLine[] }
+			| { kind: "edit" | "write" | "delete"; file: string; lines: DiffLine[] }
 			| { kind: "read_outside_repo"; tool: string; path: string }
 	  ))
 	| { type: "state"; model: string; think_mode?: string | null }
 	| {
-			type: "model_list";
+			type: "harness_list";
 			current: string;
+			harnesses: { name: string; alias: string; model: string | null; think_mode: string | null; shared_with: string[] }[];
+	  }
+	| {
+			type: "model_list";
+			// the /model walk: harness + alias name the pick lands on, and
+			// what the thinking step needs — each entry's stored level and
+			// the modes per provider (OpenRouter has no "max")
+			harness?: string;
+			alias?: string;
+			current: string | null;
 			default: string | null;
-			models: { spec: string; source: string; context_window: number | null }[];
+			models: { spec: string; source: string; context_window: number | null; think_mode?: string | null }[];
 			notes: string[];
+			think_modes?: Record<string, string[]>;
 	  }
 	| {
 			type: "session_list";
@@ -30,6 +41,27 @@ export type ServerMessage =
 			sessions: { id: string; name: string; last_event: string }[];
 	  }
 	| { type: "think_list"; current: string | null; modes: string[] }
+	| {
+			type: "mcp_catalog";
+			query: string;
+			connected: { name: string; source?: string; disabled?: boolean; connected?: boolean; tools?: number; command?: string; args?: string[]; env?: string[]; error?: string }[];
+			entries: { name: string; description?: string; version?: string; installable?: boolean; reason?: string; human_reason?: string; command?: string; args?: string[]; env?: string[]; repo?: string; url?: string }[];
+			total: number | null;
+			cache_age: number | null;
+			registry_error: string | null;
+			fetching?: boolean;
+	  }
+	| {
+			type: "mcp_result";
+			name: string;
+			ok: boolean;
+			installed?: boolean;
+			removed?: boolean;
+			tools?: string[];
+			why?: string;
+			fix?: string[];
+			log?: string[];
+	  }
 	| { type: "turn_end"; status: string; summary: string; turns: number; input_tokens?: number; output_tokens?: number }
 	| { type: "command_output"; text: string }
 	| { type: "setup_start" }
@@ -43,6 +75,12 @@ export type ServerMessage =
 			choices?: { value: string; label: string; description?: string }[];
 			current?: string | null;
 	  }
+	// serve parked mid-turn input for the running step to pick up (ack only —
+	// the TUI already drew the bubble when it sent it)
+	| { type: "input_pending"; text: string }
+	// serve handed mid-turn input back: the turn was interrupted or errored
+	// before the loop ever showed it to the model
+	| { type: "input_unsent"; texts: string[] }
 	| { type: "reload"; run_id: string }
 	| { type: "error"; message: string }
 	| { type: "bye" };
@@ -178,6 +216,28 @@ export class Bridge {
 
 	interrupt(): void {
 		this.send({ type: "interrupt" });
+	}
+
+	/** Ask serve to re-fetch the MCP catalog (retry after an error, or a
+	 *  new search from the catalog view). */
+	/** re-test a configured server (the catalog's reconnect / retry) */
+	sendMcpTest(name: string): void {
+		this.send({ type: "mcp_test", name });
+	}
+
+	sendMcpRefresh(query: string): void {
+		this.send({ type: "mcp_catalog_refresh", query });
+	}
+
+	/** Install a registry server by name (serve shows the command and env
+	 *  vars and asks for an explicit 'y' before writing anything). */
+	sendMcpInstall(name: string): void {
+		this.send({ type: "mcp_install", name });
+	}
+
+	/** Remove a configured server by name (the catalog's 'x' key). */
+	sendMcpRemove(name: string): void {
+		this.send({ type: "mcp_remove", name });
 	}
 
 	stop(): void {

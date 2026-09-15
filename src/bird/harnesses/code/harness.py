@@ -24,6 +24,7 @@ from ...tools import (
     Tool,
     WebFetchTool,
     WebSearchTool,
+    DeleteTool,
     WriteTool,
 )
 
@@ -40,7 +41,7 @@ def code_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool
     """
     tools: list[Tool] = [
         ReadTool(), ReadImageTool(), LsTool(), GrepTool(), GlobTool(),
-        EditTool(), WriteTool(), BashTool(),
+        EditTool(), WriteTool(), DeleteTool(), BashTool(),
     ]
     if with_kg:
         tools.append(KgQueryTool())

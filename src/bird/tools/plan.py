@@ -65,7 +65,8 @@ class PlanState:
         for i, s in enumerate(self.steps):
             marker = "->" if i == cur else "  "
             glyph = STATUS_GLYPHS.get(s.status, "?")
-            line = f"{marker} {i + 1}. {glyph} {s.title} — touch: {', '.join(s.files)}"
+            touch = ", ".join(s.files) if s.files else "no files (a check-only step)"
+            line = f"{marker} {i + 1}. {glyph} {s.title} — touch: {touch}"
             if s.affected:
                 line += f" | may affect: {', '.join(s.affected)}"
             if s.note:
@@ -100,7 +101,7 @@ def _blast_radius(ctx: ToolContext, files: list[str]) -> list[str]:
     """Files within AFFECTED_DEPTH graph hops of the step's own files. Best
     effort: no KG (or not ready yet) → empty, never an error."""
     kg = ctx.kg
-    if kg is None:
+    if kg is None or not files:
         return []
     try:
         if not kg.is_ready():
@@ -132,14 +133,21 @@ class PlanTool(Tool):
                         "title": {"type": "string", "description": "One line: what this step does"},
                         "files": {
                             "type": "array",
-                            "minItems": 1,
                             "maxItems": MAX_FILES_PER_STEP,
                             "items": {"type": "string"},
-                            "description": "Repo-relative paths this step creates or edits",
+                            "description": "Repo-relative paths this step creates or edits ([] for a check-only step)",
                         },
+                        "note": {"type": "string"},
                     },
                     "required": ["title", "files"],
-                    "additionalProperties": False,
+                    # Extra keys are IGNORED rather than rejected. 41 logged plan
+                    # calls were thrown out by validation and retried: 30 for a
+                    # verify step with `files: []` (the old minItems: 1), the
+                    # rest for a `summary` / `files_note` key the model added.
+                    # Two retries then abort — a plan is the one call that must
+                    # not fail on a harmless extra, since nothing proceeds
+                    # without it.
+                    "additionalProperties": True,
                 },
             },
         },
@@ -158,8 +166,9 @@ class PlanTool(Tool):
         steps = [
             PlanStep(
                 title=s["title"].strip(),
-                files=[f.strip() for f in s["files"]],
+                files=[f.strip() for f in s["files"] if f.strip()],
                 affected=_blast_radius(ctx, s["files"]),
+                note=" ".join(str(s.get("note") or "").split())[:120],
             )
             for s in args["steps"]
         ]

@@ -39,10 +39,24 @@ def run_arch_interactive(
     model: str = "architect",
     no_open: bool = False,
     on_status: Callable[[str], None] | None = None,
+    broker: Any | None = None,
+    store: Any | None = None,
 ) -> ArchSession:
     """Open the browser Workbench, run the session, and block until the user
     hands the design off (or closes the page). Mirrors cli._arch_main's
-    bring-up; kept separate so `bird arch`'s resume path stays untouched."""
+    bring-up; kept separate so `bird arch`'s resume path stays untouched.
+
+    `store` is the caller's context store. Unlike `code`, this harness does not
+    fork the lead's ToolContext — it builds a fresh one below — so the store has
+    to be handed over explicitly or the architect rediscovers everything the
+    lead already worked out.
+
+    `broker` is the caller's permission broker. The Workbench page renders no
+    permission prompts, so any gate the architect trips (a `read` outside the
+    repo — say, a prototype under ~/Library) must be answered by the caller's
+    UI: the lead passes its own broker and the TUI shows the card. Without
+    one, the session falls back to a broker bound to the page — and hangs on
+    the first gate."""
     import sys
     import time
     import webbrowser
@@ -58,6 +72,7 @@ def run_arch_interactive(
         ctx = ToolContext(
             repo_root=repo_root, kg=kg, record=recorder.event,
             client=client, registry=registry, run_dir=run_dir,
+            broker=broker, store=store,
         )
         runner = build_runner(
             "arch", spec=spec, client=client, registry=registry,
@@ -70,7 +85,7 @@ def run_arch_interactive(
             # no linger here, unlike `bird arch`: the lead is blocked on this
             # call and has a build to start.
         )
-        server = Server(repl, transport=transport)
+        server = Server(repl, transport=transport, broker=broker)
 
         arch = ArchSession(run_dir=run_dir)
 
@@ -116,7 +131,7 @@ def run_arch_headless(
     kg: Any | None = None,
     record: Callable[[str, dict], None] | None = None,
     model: str = "architect",
-    max_turns: int = 40,
+    max_turns: int | None = None,
     with_web: bool = True,
 ) -> ArchSession:
     """Design `task` with nobody in the room. Returns the ArchSession; the

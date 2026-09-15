@@ -139,7 +139,46 @@ export class HeaderBar implements Component {
 
 export class UserMessage implements Component {
 	invalidate(): void {}
+	// queued: the same geometry, two ink tiers. A queued item renders dim
+	// (border t.dim, body t.muted, no fill, ◌ QUEUED i/n label); promoting it
+	// to a real sent message is a flag flip, so the bubble's screen position
+	// barely moves on flush — no scroll jump.
+	private queued = false;
+	private queueIndex = 0;
+	private queueTotal = 0;
+	private selected = false;
+	// QUEUED = parked in the TUI, nothing has seen it. SENDING = already on
+	// its way to serve, waiting for the running step to pick it up. Two very
+	// different promises to the user, so they must not share a word.
+	private queueLabel = "QUEUED";
+
 	constructor(private text: string) {}
+
+	/** Edit-in-place: swap the body text of a queued item (geometry recomputed
+	 *  on the next render; the id/label/selection state is untouched). */
+	setText(text: string): void {
+		this.text = text;
+	}
+
+	/** Render as a queued (not yet sent) item: `◌ QUEUED i/n`, dim border,
+	 *  muted body, no fill. Selection lights only the border (t.fg). */
+	setQueued(index: number, total: number, selected = false, label = "QUEUED"): void {
+		this.queued = true;
+		this.queueIndex = index;
+		this.queueTotal = total;
+		this.selected = selected;
+		this.queueLabel = label;
+	}
+
+	/** Promote to a real sent message: accent border + accentSoft fill + YOU. */
+	promote(): void {
+		this.queued = false;
+		this.selected = false;
+	}
+
+	isQueued(): boolean {
+		return this.queued;
+	}
 
 	render(width: number): string[] {
 		// design: .msg max-width 88%, right-aligned accent-bordered bubble
@@ -147,6 +186,17 @@ export class UserMessage implements Component {
 		const wrapped = wrapTextWithAnsi(this.text, maxBox - 4);
 		const contentW = Math.max(...wrapped.map(visibleWidth), 3);
 		const boxW = Math.min(maxBox, contentW + 4);
+		if (this.queued) {
+			const border = this.selected ? t.fg : t.dim;
+			const box = roundedBox(wrapped.map((l) => t.muted(l)), { width: boxW, border });
+			const indent = " ".repeat(Math.max(0, width - boxW - 1));
+			const labelText = `◌ ${this.queueLabel} ${this.queueIndex}/${this.queueTotal}`;
+			const label =
+				" ".repeat(Math.max(0, width - visibleWidth(labelText) - 2)) +
+				t.muted.bold(labelText) +
+				(this.selected ? t.muted(" · selected") : "");
+			return [label, ...box.map((l) => indent + l)];
+		}
 		const box = roundedBox(
 			wrapped.map((l) => t.fg(l)),
 			{ width: boxW, border: t.accent, pad: t.accentSoftBg },
@@ -215,9 +265,16 @@ export class Notice implements Component {
 
 export class Thinking implements Component {
 	invalidate(): void {}
+	/** Esc pressed while the spinner is up — main.ts wires this to an
+	 *  interrupt. A property (not a method) so the assignment in main.ts
+	 *  type-checks and stays optional. */
+	onAbort?: () => void;
 	private frame = 0;
 	private timer: ReturnType<typeof setInterval> | null = null;
-	onAbort?: () => void;
+
+	// Render-only: the spinner is never a focus target, so it owns no input
+	// handling — Esc-to-interrupt lives in main.ts's global input listener,
+	// which runs before the focused component. Focus stays on the editor.
 
 	constructor(private tui: TUI) {}
 
@@ -231,10 +288,6 @@ export class Thinking implements Component {
 	stop(): void {
 		if (this.timer) clearInterval(this.timer);
 		this.timer = null;
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape)) this.onAbort?.();
 	}
 
 	render(width: number): string[] {
@@ -329,7 +382,7 @@ export interface DiffLine {
 
 export type PermissionSpec =
 	| { kind: "bash"; cmd: string }
-	| { kind: "edit" | "write"; file: string; lines: DiffLine[] }
+	| { kind: "edit" | "write" | "delete"; file: string; lines: DiffLine[] }
 	| { kind: "read_outside_repo"; tool: string; path: string }
 	| { kind: "mcp"; server: string; tool: string; args: string };
 
@@ -344,7 +397,8 @@ export type Resolution = "approved" | "denied";
 function normalizeSpec(spec: PermissionSpec): PermissionSpec {
 	const s = spec as Partial<Record<string, unknown>> & { kind?: string };
 	const kind =
-		s.kind === "bash" || s.kind === "write" || s.kind === "read_outside_repo" || s.kind === "mcp"
+		s.kind === "bash" || s.kind === "write" || s.kind === "delete" ||
+		s.kind === "read_outside_repo" || s.kind === "mcp"
 			? s.kind
 			: "edit";
 	if (kind === "bash") return { kind, cmd: String(s.cmd ?? "") };
@@ -390,6 +444,8 @@ export class PermissionCard implements Component {
 			const msg =
 				this.spec.kind === "bash"
 					? "✓ Approved for this session"
+					: this.spec.kind === "delete"
+						? "✓ Delete approved"
 					: this.spec.kind === "write"
 						? "✓ Write approved"
 						: this.spec.kind === "read_outside_repo"
@@ -406,6 +462,8 @@ export class PermissionCard implements Component {
 		const question =
 			this.spec.kind === "bash"
 				? "Run bash command?"
+				: this.spec.kind === "delete"
+					? "Delete file?"
 				: this.spec.kind === "write"
 					? "Write file?"
 					: this.spec.kind === "read_outside_repo"
@@ -419,6 +477,9 @@ export class PermissionCard implements Component {
 			body.push(t.accent("› ") + t.fg(truncateToWidth(this.spec.cmd, inner - 2)));
 		} else if (this.spec.kind === "read_outside_repo") {
 			body.push(t.muted.bold(truncateToWidth(this.spec.path, inner)));
+		} else if (this.spec.kind === "mcp") {
+			body.push(t.muted.bold(truncateToWidth(`${this.spec.server} · ${this.spec.tool}`, inner)));
+			if (this.spec.args) body.push(t.muted(truncateToWidth(this.spec.args, inner)));
 		} else {
 			body.push(t.muted.bold(truncateToWidth(this.spec.file, inner)));
 			for (const l of this.spec.lines) {
@@ -518,48 +579,89 @@ export class DispatchBanner implements Component {
 
 /* ---------- model picker ---------- */
 
+/** The rows whose value or label contains `filter`, case-insensitively.
+ *  pi-tui's SelectList.setFilter is a PREFIX match on the value, and every
+ *  model spec starts with its provider ("ollama:", "openrouter:") — so typing
+ *  "qwen" there could never find ollama:qwen3.8. The pickers filter with this
+ *  instead and rebuild their list from the survivors. */
+export function filterPickerItems(items: SelectItem[], filter: string): SelectItem[] {
+	const needle = filter.trim().toLowerCase();
+	if (!needle) return items;
+	return items.filter(
+		(i) => i.value.toLowerCase().includes(needle) || i.label.toLowerCase().includes(needle),
+	);
+}
+
 export interface ModelListEntry {
 	spec: string;
 	source: string;
 	context_window: number | null;
+	// the stored thinking level (off/low/medium/high/max) or null = auto
+	think_mode?: string | null;
 }
 
 export class ModelPicker implements Component {
 	invalidate(): void {}
 	onDone?: (spec: string | null) => void;
+	private items: SelectItem[];
+	private matches: SelectItem[];
 	private list: SelectList;
 	private filter = "";
 
-	constructor(models: ModelListEntry[], current: string, defaultSpec: string | null) {
+	/** `title` names the harness the pick is for ("Select model for design");
+	 *  `aliasLabel` is the alias it lands on, shown on the entry that alias
+	 *  already points at (default / architect / designer). */
+	constructor(
+		models: ModelListEntry[],
+		current: string | null,
+		defaultSpec: string | null,
+		private title = "Select model",
+		aliasLabel = "default",
+	) {
 		const items: SelectItem[] = models.map((m) => ({
 			value: m.spec,
 			label: (m.spec === current ? "● " : "  ") + m.spec,
 			description:
 				m.source +
 				(m.context_window ? ` · ${Math.round(m.context_window / 1024)}k ctx` : "") +
-				(m.spec === defaultSpec ? " · default" : ""),
+				(m.think_mode ? ` · think: ${m.think_mode}` : "") +
+				(m.spec === defaultSpec ? ` · ${aliasLabel}` : ""),
 		}));
-		this.list = new SelectList(items, 10, {
+		this.items = items;
+		this.matches = items;
+		this.list = this.makeList(items);
+	}
+
+	/** A fresh list over `items` — SelectList cannot swap its rows, and its
+	 *  selection resets on every filter change anyway. */
+	private makeList(items: SelectItem[]): SelectList {
+		const list = new SelectList(items, 10, {
 			selectedPrefix: (s) => t.accentBold(s),
 			selectedText: (s) => t.accentBold(s),
 			description: (s) => t.muted(s),
 			scrollInfo: (s) => t.dim(s),
 			noMatch: (s) => t.muted(s),
 		});
-		this.list.onSelect = (item) => this.onDone?.(item.value);
-		this.list.onCancel = () => this.onDone?.(null);
+		list.onSelect = (item) => this.onDone?.(item.value);
+		list.onCancel = () => this.onDone?.(null);
+		return list;
+	}
+
+	private applyFilter(): void {
+		this.matches = filterPickerItems(this.items, this.filter);
+		this.list = this.makeList(this.matches);
 	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.backspace)) {
 			this.filter = this.filter.slice(0, -1);
-			this.list.setFilter(this.filter);
+			this.applyFilter();
 			return;
 		}
 		// single printable char → filter; everything else (arrows, ⏎, esc) → list
 		if (data.length === 1 && data >= " " && data !== "\x7f") {
 			this.filter += data;
-			this.list.setFilter(this.filter);
+			this.applyFilter();
 			return;
 		}
 		this.list.handleInput(data);
@@ -570,8 +672,9 @@ export class ModelPicker implements Component {
 			" " +
 			t.accent("●") +
 			" " +
-			t.fg.bold("Select model") +
+			t.fg.bold(this.title) +
 			t.muted(this.filter ? `  filter: ${this.filter}` : "  type to filter · ⏎ select · esc cancel");
+		if (!this.matches.length) return [truncateToWidth(head, width), t.muted(`    no model matches "${this.filter}"`)];
 		return [truncateToWidth(head, width), ...this.list.render(Math.max(20, width - 2)).map((l) => "  " + l)];
 	}
 }
@@ -587,6 +690,8 @@ export interface SessionListEntry {
 export class SessionPicker implements Component {
 	invalidate(): void {}
 	onDone?: (id: string | null) => void;
+	private items: SelectItem[];
+	private matches: SelectItem[];
 	private list: SelectList;
 	private filter = "";
 
@@ -596,27 +701,41 @@ export class SessionPicker implements Component {
 			label: (s.id === current ? "● " : "  ") + s.name,
 			description: s.id + (s.last_event ? ` · ${s.last_event}` : ""),
 		}));
-		this.list = new SelectList(items, 10, {
+		this.items = items;
+		this.matches = items;
+		this.list = this.makeList(items);
+	}
+
+	/** A fresh list over `items` — SelectList cannot swap its rows, and its
+	 *  selection resets on every filter change anyway. */
+	private makeList(items: SelectItem[]): SelectList {
+		const list = new SelectList(items, 10, {
 			selectedPrefix: (s) => t.accentBold(s),
 			selectedText: (s) => t.accentBold(s),
 			description: (s) => t.muted(s),
 			scrollInfo: (s) => t.dim(s),
 			noMatch: (s) => t.muted(s),
 		});
-		this.list.onSelect = (item) => this.onDone?.(item.value);
-		this.list.onCancel = () => this.onDone?.(null);
+		list.onSelect = (item) => this.onDone?.(item.value);
+		list.onCancel = () => this.onDone?.(null);
+		return list;
+	}
+
+	private applyFilter(): void {
+		this.matches = filterPickerItems(this.items, this.filter);
+		this.list = this.makeList(this.matches);
 	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.backspace)) {
 			this.filter = this.filter.slice(0, -1);
-			this.list.setFilter(this.filter);
+			this.applyFilter();
 			return;
 		}
 		// single printable char → filter; everything else (arrows, ⏎, esc) → list
 		if (data.length === 1 && data >= " " && data !== "\x7f") {
 			this.filter += data;
-			this.list.setFilter(this.filter);
+			this.applyFilter();
 			return;
 		}
 		this.list.handleInput(data);
@@ -629,6 +748,7 @@ export class SessionPicker implements Component {
 			" " +
 			t.fg.bold("Resume session") +
 			t.muted(this.filter ? `  filter: ${this.filter}` : "  type to filter · ⏎ resume · esc cancel");
+		if (!this.matches.length) return [truncateToWidth(head, width), t.muted(`    no session matches "${this.filter}"`)];
 		return [truncateToWidth(head, width), ...this.list.render(Math.max(20, width - 2)).map((l) => "  " + l)];
 	}
 }
@@ -646,7 +766,14 @@ export class ThinkPicker implements Component {
 	onDone?: (mode: string | null) => void;
 	private list: SelectList;
 
-	constructor(modes: string[], current: string | null) {
+	/** `title` and `escLabel` let the /model walk reuse this as its thinking
+	 *  step, where esc means "keep the model's stored level", not cancel. */
+	constructor(
+		modes: string[],
+		current: string | null,
+		private title = "Select thinking mode",
+		private escLabel = "esc cancel",
+	) {
 		const items: SelectItem[] = modes.map((m) => ({
 			value: m,
 			label: (m === current ? "● " : "  ") + m,
@@ -672,10 +799,790 @@ export class ThinkPicker implements Component {
 			" " +
 			t.accent("●") +
 			" " +
-			t.fg.bold("Select thinking mode") +
-			t.muted("  ⏎ select · esc cancel");
+			t.fg.bold(this.title) +
+			t.muted(`  ⏎ select · ${this.escLabel}`);
 		return [truncateToWidth(head, width), ...this.list.render(Math.max(20, width - 2)).map((l) => "  " + l)];
 	}
+}
+
+/* ---------- MCP catalog ---------- */
+
+/** The TUI store, ported from the approved prototype (mcp-catalog-tui.html)
+ *  and mirroring src/bird/mcp/catalog.py (the REPL's engine) view for view:
+ *
+ *    browse   one surface, no mode switch — the `>` query line is always
+ *             live. Empty query = groups Connected → Available → Not
+ *             installable; any keystroke filters into one flat list that
+ *             keeps each row's status glyph. esc clears the query before
+ *             it closes.
+ *    detail   ⏎ on a row: full launch command (never truncated — wrapped at
+ *             argument boundaries with `\` and a 4-col hanging indent), env
+ *             as $VAR with a set/unset dot (values never read), repository,
+ *             and for unsupported servers "Why bird can't install this" plus
+ *             the manual mcp.json snippet.
+ *    confirm  i: the card. Confirmation is the literal key y (not ⏎, not
+ *             space) after a short arming delay; states that auto-approve
+ *             does not apply.
+ *    result   ✓ connected + tool count + sample names, or ✗ why + fixes +
+ *             last server log lines + "kept in mcp.json"; r retry, x remove.
+ *
+ *  Degraded: unreachable-no-cache (error card, r retry, c show connected),
+ *  stale cache (browsable, install disabled, header shows cache age), empty
+ *  registry, no matches. The data comes from serve's mcp_catalog message;
+ *  the writes go back as install/remove/test and return as mcp_result. */
+
+export interface McpConnectedEntry {
+	name: string;
+	source?: string;
+	disabled?: boolean;
+	connected?: boolean;
+	tools?: number;
+	command?: string;
+	args?: string[];
+	env?: string[];
+	error?: string;
+}
+
+export interface McpRegistryEntry {
+	name: string;
+	description?: string;
+	version?: string;
+	installable?: boolean;
+	reason?: string;
+	human_reason?: string;
+	command?: string;
+	args?: string[];
+	env?: string[];
+	repo?: string;
+	url?: string;
+}
+
+export interface McpCatalogData {
+	query: string;
+	connected: McpConnectedEntry[];
+	entries: McpRegistryEntry[];
+	total: number | null;
+	cache_age: number | null;
+	registry_error: string | null;
+	/** serve's instant first frame: connected servers only, page on its way */
+	fetching?: boolean;
+}
+
+export interface McpResultData {
+	name: string;
+	ok: boolean;
+	installed?: boolean;
+	removed?: boolean;
+	tools?: string[];
+	why?: string;
+	fix?: string[];
+	log?: string[];
+}
+
+type CatalogView = "browse" | "detail" | "confirm" | "result";
+type Degraded = "ok" | "unreachable" | "stale" | "empty";
+interface CatalogRow {
+	kind: "head" | "item";
+	title?: string;
+	n?: number;
+	entry?: McpRegistryEntry;
+	conn?: McpConnectedEntry;
+}
+/** what the result card is waiting on / showing */
+type Pending = "install" | "reconnect" | "remove" | null;
+
+/** how long the confirm card must be on screen before y counts — a held
+ *  key (or the stroke that opened the card) must never fall through */
+const CATALOG_ARM_MS = 450;
+/** stable frame height across views, so switching browse → detail → confirm
+ *  doesn't make the transcript jump (the prototype pads to a fixed frame) */
+const CATALOG_MIN_LINES = 22;
+const CATALOG_PAGE_ROWS = 18;
+/** typing filters the loaded page instantly; after this pause the same
+ *  query also goes to the registry's search API, whose results replace
+ *  the page (the registry holds far more than one page) */
+const CATALOG_SEARCH_DEBOUNCE_MS = 350;
+
+const kbd = (s: string): string => t.accentSoftBg(t.fg(` ${s} `));
+
+function humanReason(e: McpRegistryEntry): string {
+	if (e.human_reason) return e.human_reason;
+	const kind = (e.reason ?? "").split(" — ")[0].trim().toLowerCase();
+	if (kind === "docker" || kind.startsWith("oci")) return "needs Docker · bird launches local subprocesses only";
+	if (kind === "remote") return "remote (SSE/HTTP) endpoint · bird only speaks stdio today";
+	return e.reason || "not installable by bird";
+}
+
+function ellip(s: string, n: number): string {
+	if (s.length <= n) return s;
+	const cut = s.slice(0, n - 1);
+	const sp = cut.lastIndexOf(" ");
+	return (sp > n * 0.6 ? cut.slice(0, sp) : cut) + "…";
+}
+const padTo = (s: string, n: number): string => s + " ".repeat(Math.max(0, n - visibleWidth(s)));
+
+/** wrap at argument boundaries; 4-col hanging indent; trailing `\` */
+export function wrapCommand(command: string, args: string[], width: number): string[] {
+	const words = [command, ...args].filter((w) => w.length > 0);
+	const lines: string[] = [];
+	let cur = "";
+	for (const w of words) {
+		const piece = (cur ? " " : "") + w;
+		if (cur && cur.length + piece.length > width - 2) {
+			lines.push(cur + " \\");
+			cur = "    " + w;
+		} else cur += piece;
+	}
+	lines.push(cur);
+	return lines;
+}
+const paintVars = (s: string): string => s.replace(/\$[A-Z_][A-Z0-9_]*/g, (m) => t.accent(m));
+
+export class McpCatalog implements Component {
+	invalidate(): void {}
+	onClose?: () => void;
+	onInstall?: (name: string) => void;
+	onRemove?: (name: string) => void;
+	onTest?: (name: string) => void;
+	onRefresh?: (query: string) => void;
+	onOpen?: (url: string) => void;
+	/** the component needs a repaint on its own clock (arming delay) */
+	onChange?: () => void;
+
+	private connected: McpConnectedEntry[] = [];
+	private entries: McpRegistryEntry[] = [];
+	private total = 0;
+	private cacheAge: number | null = null;
+	private registryError: string | null = null;
+	private degraded: Degraded = "ok";
+	private fetching = false;
+	private searching = false;
+	private searchTimer: ReturnType<typeof setTimeout> | null = null;
+	/** the query the loaded entries answer (registry-side) */
+	private loadedQuery = "";
+	private showConnectedOffline = false;
+
+	private view: CatalogView = "browse";
+	private query = "";
+	private cursor = 0;
+	private target: McpRegistryEntry | null = null;
+	private armedAt = 0;
+	private armTimer: ReturnType<typeof setTimeout> | null = null;
+	private pending: Pending = null;
+	private result: McpResultData | null = null;
+
+	constructor(
+		data: McpCatalogData,
+		private envSet: (name: string) => boolean,
+	) {
+		this.setData(data);
+	}
+
+	/** a fresh mcp_catalog (initial, retry, or search) replaces the data in
+	 *  place — the view, cursor and query survive a refresh */
+	setData(data: McpCatalogData): void {
+		if (data.fetching && this.entries.length) {
+			// a search's instant frame: keep the current list on screen and
+			// just mark the header — the skeleton is for the empty first load
+			this.searching = true;
+			this.onChange?.();
+			return;
+		}
+		this.fetching = !!data.fetching;
+		this.searching = false;
+		if (!data.fetching) this.loadedQuery = data.query ?? "";
+		this.connected = (data.connected ?? []).filter((c) => c.name);
+		const configError = (data.connected ?? []).find((c) => !c.name && c.error)?.error ?? null;
+		this.entries = data.entries ?? [];
+		this.total = typeof data.total === "number" ? data.total : this.entries.length;
+		this.cacheAge = data.cache_age ?? null;
+		this.registryError = data.registry_error ?? configError ?? null;
+		if (this.fetching) this.degraded = "ok";
+		else if (data.registry_error) this.degraded = this.entries.length ? "stale" : "unreachable";
+		else if (!this.entries.length && !this.connected.length) this.degraded = "empty";
+		else this.degraded = "ok";
+		if (data.query && !this.query && data.fetching) this.query = data.query;
+		this.cursor = Math.min(this.cursor, Math.max(0, this.items().length - 1));
+		if (this.view === "detail" && this.target) {
+			const fresh = this.entries.find((e) => e.name === this.target?.name);
+			if (fresh) this.target = fresh;
+		}
+	}
+
+	/** an mcp_result for the pending install / reconnect / remove */
+	setResult(r: McpResultData): void {
+		if (this.target && r.name !== this.target.name) return;
+		this.result = r;
+		if (r.removed) {
+			this.connected = this.connected.filter((c) => c.name !== r.name);
+		} else if (r.installed || this.pending === "reconnect") {
+			const info: McpConnectedEntry = {
+				name: r.name,
+				source: "project",
+				connected: r.ok,
+				tools: r.tools?.length ?? 0,
+				error: r.ok ? undefined : r.why,
+			};
+			const i = this.connected.findIndex((c) => c.name === r.name);
+			if (i >= 0) this.connected[i] = { ...this.connected[i], ...info };
+			else this.connected.push(info);
+		}
+		this.view = "result";
+	}
+
+	/* ---------- list model ---------- */
+
+	private connFor(name: string): McpConnectedEntry | undefined {
+		return this.connected.find((c) => c.name === name);
+	}
+	private visibleEntries(): McpRegistryEntry[] {
+		const q = this.query.trim().toLowerCase();
+		if (!q) return this.entries;
+		return this.entries.filter((e) => `${e.name} ${e.description ?? ""}`.toLowerCase().includes(q));
+	}
+	private rows(): CatalogRow[] {
+		const out: CatalogRow[] = [];
+		if (this.query.trim()) {
+			for (const e of this.visibleEntries()) out.push({ kind: "item", entry: e, conn: this.connFor(e.name) });
+			return out;
+		}
+		const names = new Set(this.connected.map((c) => c.name));
+		const connectedRows: CatalogRow[] = this.entries
+			.filter((e) => names.has(e.name))
+			.map((e) => ({ kind: "item", entry: e, conn: this.connFor(e.name) }));
+		const seen = new Set(connectedRows.map((r) => r.entry!.name));
+		for (const c of this.connected) {
+			// configured servers missing from the registry page are local facts
+			// — they belong in the Connected group regardless
+			if (!seen.has(c.name))
+				connectedRows.push({
+					kind: "item",
+					entry: { name: c.name, description: c.command ? [c.command, ...(c.args ?? [])].join(" ") : "", installable: false, reason: "configured locally", command: c.command, args: c.args, env: c.env },
+					conn: c,
+				});
+		}
+		if (connectedRows.length) out.push({ kind: "head", title: "Connected", n: connectedRows.length }, ...connectedRows);
+		const available = this.entries.filter((e) => !names.has(e.name) && e.installable !== false);
+		if (available.length) out.push({ kind: "head", title: "Available", n: available.length }, ...available.map((e) => ({ kind: "item" as const, entry: e })));
+		const unsupported = this.entries.filter((e) => !names.has(e.name) && e.installable === false);
+		if (unsupported.length)
+			out.push({ kind: "head", title: "Not installable on this machine", n: unsupported.length }, ...unsupported.map((e) => ({ kind: "item" as const, entry: e })));
+		return out;
+	}
+	private items(): CatalogRow[] {
+		return this.rows().filter((r) => r.kind === "item");
+	}
+	private current(): CatalogRow | null {
+		return this.items()[this.cursor] ?? null;
+	}
+
+	/* ---------- keys ---------- */
+
+	handleInput(data: string): void {
+		const key = this.keyName(data);
+		if (key === null) return;
+		switch (this.view) {
+			case "browse":
+				this.keyBrowse(key);
+				break;
+			case "detail":
+				this.keyDetail(key);
+				break;
+			case "confirm":
+				this.keyConfirm(key);
+				break;
+			case "result":
+				this.keyResult(key);
+				break;
+		}
+	}
+
+	private keyName(data: string): string | null {
+		if (matchesKey(data, Key.up) || matchesKey(data, "ctrl+p")) return "up";
+		if (matchesKey(data, Key.down) || matchesKey(data, "ctrl+n")) return "down";
+		if (matchesKey(data, Key.pageUp)) return "pgup";
+		if (matchesKey(data, Key.pageDown)) return "pgdown";
+		if (matchesKey(data, Key.enter)) return "enter";
+		if (matchesKey(data, Key.escape)) return "esc";
+		if (matchesKey(data, Key.backspace)) return "backspace";
+		if (data.length === 1 && data >= " " && data !== "\x7f") return data;
+		return null;
+	}
+
+	private moveCursor(delta: number): void {
+		const n = this.items().length;
+		this.cursor = Math.max(0, Math.min(n - 1, this.cursor + delta));
+	}
+
+	private openConfirm(e: McpRegistryEntry): void {
+		this.target = e;
+		this.view = "confirm";
+		this.armedAt = Date.now();
+		if (this.armTimer) clearTimeout(this.armTimer);
+		// repaint once the y button arms so the card shows it is live
+		this.armTimer = setTimeout(() => {
+			this.armTimer = null;
+			this.onChange?.();
+		}, CATALOG_ARM_MS + 10);
+	}
+
+	private canInstall(row: CatalogRow | null): boolean {
+		return !!row?.entry && row.entry.installable !== false && !row.conn && this.degraded !== "stale";
+	}
+
+	private keyBrowse(key: string): void {
+		if (this.fetching) {
+			if (key === "q" || key === "esc") this.onClose?.();
+			return;
+		}
+		if (this.degraded === "unreachable" || this.degraded === "empty") {
+			if (key === "r") this.refresh();
+			else if (key === "c") this.showConnectedOffline = !this.showConnectedOffline;
+			else if (key === "q" || key === "esc") this.onClose?.();
+			return;
+		}
+		if (key === "down") this.moveCursor(1);
+		else if (key === "up") this.moveCursor(-1);
+		else if (key === "pgdown") this.moveCursor(10);
+		else if (key === "pgup") this.moveCursor(-10);
+		else if (key === "enter") {
+			const cur = this.current();
+			if (cur?.entry) {
+				this.target = cur.entry;
+				this.view = "detail";
+			}
+		} else if (key === "esc") {
+			// esc clears the query before it closes the catalog
+			if (this.query) {
+				this.query = "";
+				this.cursor = 0;
+				this.scheduleSearch();
+			} else this.onClose?.();
+		} else if (key === "backspace") {
+			this.query = this.query.slice(0, -1);
+			this.cursor = 0;
+			this.scheduleSearch();
+		} else if (key.length === 1) {
+			// single-key actions only while the query is empty; otherwise
+			// letters are search input
+			const cur = this.current();
+			if (!this.query && key === "q") this.onClose?.();
+			else if (!this.query && key === "j") this.moveCursor(1);
+			else if (!this.query && key === "k") this.moveCursor(-1);
+			else if (!this.query && key === "r") this.refresh();
+			else if (!this.query && key === "i" && cur?.conn) this.reconnect(cur.entry!.name);
+			else if (!this.query && key === "i" && this.canInstall(cur)) this.openConfirm(cur!.entry!);
+			else if (!this.query && key === "x" && cur?.conn) this.remove(cur.entry!.name);
+			else if (!this.query && key === "i") {
+				/* not installable here: swallow */
+			} else {
+				this.query += key;
+				this.cursor = 0;
+				this.scheduleSearch();
+			}
+		}
+	}
+
+	/** debounce: the registry sees the query once typing pauses; a query
+	 *  the loaded page already answers (same text, or cleared back to the
+	 *  browse page) is not re-fetched */
+	private scheduleSearch(): void {
+		if (this.searchTimer) clearTimeout(this.searchTimer);
+		this.searchTimer = setTimeout(() => {
+			this.searchTimer = null;
+			const q = this.query.trim();
+			if (q === this.loadedQuery) return;
+			this.searching = true;
+			this.onRefresh?.(q);
+			this.onChange?.();
+		}, CATALOG_SEARCH_DEBOUNCE_MS);
+	}
+
+	private keyDetail(key: string): void {
+		const e = this.target;
+		if (!e) return void (this.view = "browse");
+		const conn = this.connFor(e.name);
+		if (key === "esc" || key === "backspace") this.view = "browse";
+		else if (key === "q") this.onClose?.();
+		else if (key === "i" && conn) this.reconnect(e.name);
+		else if (key === "i" && e.installable !== false && this.degraded !== "stale") this.openConfirm(e);
+		else if (key === "x" && conn) this.remove(e.name);
+		else if (key === "o" && e.repo) this.onOpen?.(e.repo.startsWith("http") ? e.repo : `https://${e.repo}`);
+	}
+
+	private keyConfirm(key: string): void {
+		if (key === "y") {
+			if (Date.now() - this.armedAt < CATALOG_ARM_MS) return; // not armed yet
+			const e = this.target!;
+			this.pending = "install";
+			this.result = null;
+			this.view = "result";
+			this.onInstall?.(e.name);
+		} else if (key === "n" || key === "esc") this.view = "detail";
+		else if (key === "q") this.onClose?.();
+	}
+
+	private keyResult(key: string): void {
+		if (this.result === null) {
+			// still waiting on serve — only leaving is allowed
+			if (key === "esc" || key === "q") this.onClose?.();
+			return;
+		}
+		if (key === "enter" || key === "esc") {
+			// back to the top of the (regrouped) list, as the prototype does
+			this.view = "browse";
+			this.pending = null;
+			this.result = null;
+			this.cursor = 0;
+		} else if (key === "q") this.onClose?.();
+		else if (key === "r" && !this.result.ok && !this.result.removed && this.target) this.reconnect(this.target.name);
+		else if (key === "x" && !this.result.ok && !this.result.removed && this.target) this.remove(this.target.name);
+	}
+
+	private refresh(): void {
+		if (this.entries.length) this.searching = true;
+		else this.fetching = true;
+		this.onRefresh?.(this.query.trim());
+	}
+	private reconnect(name: string): void {
+		this.target = this.entries.find((e) => e.name === name) ?? this.target ?? { name };
+		if (this.target.name !== name) this.target = { name };
+		this.pending = "reconnect";
+		this.result = null;
+		this.view = "result";
+		this.onTest?.(name);
+	}
+	private remove(name: string): void {
+		this.target = this.entries.find((e) => e.name === name) ?? { name };
+		this.pending = "remove";
+		this.result = null;
+		this.view = "result";
+		this.onRemove?.(name);
+	}
+
+	/* ---------- rendering ---------- */
+
+	render(width: number): string[] {
+		// one column short of the viewport: a line that fills the last cell
+		// makes some terminals auto-wrap and shifts everything below it
+		const W = Math.max(60, width - 2);
+		let L: string[];
+		switch (this.view) {
+			case "browse":
+				L = this.renderBrowse(W);
+				break;
+			case "detail":
+				L = this.renderDetail(W);
+				break;
+			case "confirm":
+				L = this.renderConfirm(W);
+				break;
+			default:
+				L = this.renderResult(W);
+		}
+		return L.map((l) => truncateToWidth(l, width - 1));
+	}
+
+	private header(crumb: string, right = ""): string {
+		return " " + t.badge(" MCP ") + " " + crumb + (right ? "  " + right : "");
+	}
+
+	private glyph(r: CatalogRow): string {
+		if (r.conn) return r.conn.connected ? t.success("✓") : t.danger("✗");
+		if (r.entry && r.entry.installable === false) return t.muted("–");
+		return " ";
+	}
+	private status(r: CatalogRow): string {
+		if (r.conn) {
+			if (r.conn.disabled) return t.muted("disabled");
+			return r.conn.connected ? t.success(`${r.conn.tools ?? 0} tools`) : t.danger("not connected");
+		}
+		const e = r.entry;
+		if (!e) return "";
+		if (e.installable === false) {
+			const kind = (e.reason ?? "").split(" — ")[0].trim().toLowerCase();
+			if (kind === "docker" || kind.startsWith("oci")) return t.muted("needs docker");
+			if (kind === "remote") return t.muted("remote only");
+			return t.muted("unsupported");
+		}
+		const unset = (e.env ?? []).find((v) => !this.envSet(v));
+		if (unset) return t.accent(`needs $${unset}`);
+		return t.muted(e.version ? `v${e.version}` : "");
+	}
+
+	private itemRow(r: CatalogRow, selected: boolean, W: number): string {
+		const e = r.entry!;
+		const nameW = Math.min(42, Math.max(24, Math.floor(W * 0.4)));
+		const status = this.status(r);
+		// the description takes whatever the fixed columns leave, so a long
+		// status ("needs $GITHUB_PERSONAL_ACCESS_TOKEN") never pushes the row
+		// past the frame
+		const descW = Math.max(12, W - 8 - nameW - visibleWidth(status) - 1);
+		const name = padTo(ellip(e.name, nameW), nameW);
+		const desc = padTo(ellip(e.description ?? "", descW), descW);
+		const inner = `${this.glyph(r)} ${selected ? t.fg.bold(name) : name} ${t.muted(desc)} ${status}`;
+		const line = truncateToWidth(`  ${selected ? t.accent("▸") : " "} ${inner}`, W);
+		return selected ? t.panelBg(padTo(line, W)) : line;
+	}
+
+	private foot(L: string[], W: number, pos: string, act: string): string[] {
+		while (L.length < CATALOG_MIN_LINES) L.push("");
+		L.push(t.dim("├" + "─".repeat(Math.max(0, W - 2)) + "┤"));
+		const keys = `${kbd("↑↓")} move  ${kbd("⏎")} open  ${act}${kbd("esc")} back  ${kbd("q")} close`;
+		L.push(pos ? padTo(keys, W - visibleWidth(pos) - 1) + t.muted(pos) : keys);
+		return L;
+	}
+
+	private renderBrowse(W: number): string[] {
+		const L: string[] = [];
+		let note: string;
+		if (this.fetching) note = t.muted("fetching…");
+		else if (this.searching) note = t.accent(`searching the registry for “${this.query.trim()}”…`);
+		else if (this.loadedQuery) note = t.muted(`registry results for “${this.loadedQuery}”`);
+		else if (this.degraded === "stale" && this.cacheAge !== null) note = t.accent(`offline · ${humanCacheAge(this.cacheAge)}`);
+		else if (this.cacheAge !== null && this.cacheAge > 60) note = t.muted(`registry.modelcontextprotocol.io · ${humanCacheAge(this.cacheAge)}`);
+		else note = t.muted("registry.modelcontextprotocol.io");
+		L.push(this.header(t.fg.bold("Server catalog"), note));
+		L.push("");
+		L.push(t.dim("─".repeat(W)));
+		const hint = this.query ? "" : t.muted("type to search · esc to clear");
+		L.push(`  ${t.accent(">")} ${this.query}${t.btnPrimary(" ")}${hint}`);
+		L.push(t.dim("─".repeat(W)));
+
+		if (this.fetching) {
+			const n = this.connected.length;
+			L.push("");
+			L.push(`  ${t.muted(`Connected · ${n}`)}`);
+			for (const c of this.connected) {
+				const mark = c.connected ? t.success(`${c.tools ?? 0} tools`) : t.danger("not connected");
+				L.push(`    ${c.connected ? t.success("✓") : t.danger("✗")} ${c.name}  ${mark}`);
+			}
+			if (!n) L.push(`    ${t.muted("none configured yet")}`);
+			L.push("");
+			L.push(`  ${t.muted("Available")}`);
+			for (let i = 0; i < 6; i++) L.push(`    ${t.dim("▆".repeat(28 + ((i * 7) % 20)) + "   " + "▆".repeat(36 + ((i * 11) % 24)))}`);
+			L.push("");
+			L.push(`    ${t.muted(this.query ? `searching the registry for “${this.query}”…` : "Loading the registry…")}  ${t.muted("the list stays usable — connected servers are local.")}`);
+			return this.foot(L, W, "", "");
+		}
+		if (this.degraded === "unreachable" || this.degraded === "empty") {
+			L.push("");
+			if (this.degraded === "unreachable") {
+				L.push(`  ${t.danger("✗")} ${t.fg.bold("Couldn't reach the registry")}`);
+				for (const l of wrapTextWithAnsi(t.muted(this.registryError ?? ""), Math.max(20, W - 6))) L.push(`    ${l}`);
+				L.push(`    ${t.muted("Nothing cached yet, so there is nothing to browse offline.")}`);
+			} else {
+				L.push(`  ${t.fg.bold("The registry returned no servers.")}`);
+				L.push(`    ${t.muted("This usually means a registry-side outage. Your configured servers are unaffected.")}`);
+			}
+			L.push("");
+			L.push(`    ${kbd("r")} retry   ${kbd("c")} ${this.showConnectedOffline ? "hide" : "show"} connected servers (from mcp.json)   ${kbd("q")} close`);
+			L.push("");
+			const n = this.connected.length;
+			L.push(`  ${t.dim(`Your ${n} configured server${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} unaffected — the catalog is only for discovery.`)}`);
+			if (this.showConnectedOffline && n) {
+				L.push("");
+				L.push(`  ${t.muted(`Connected · ${n}`)}`);
+				for (const c of this.connected) {
+					const mark = c.connected ? t.success(`${c.tools ?? 0} tools`) : t.danger("not connected");
+					L.push(`    ${c.connected ? t.success("✓") : t.danger("✗")} ${c.name}  ${mark}${c.error ? t.muted(` · ${c.error}`) : ""}`);
+				}
+			}
+			return this.foot(L, W, "", "");
+		}
+
+		const R = this.rows();
+		if (!R.length) {
+			L.push("");
+			if (this.searching) {
+				L.push(`  ${t.fg.bold(`Nothing on this page matches “${this.query}”`)} ${t.muted("· asking the registry…")}`);
+			} else {
+				L.push(`  ${t.fg.bold(`No servers match “${this.query}”`)}`);
+				L.push(`    ${t.muted("Search covers name and description. Try a vendor name (“sentry”) or a capability (“sql”).")}`);
+			}
+			L.push("");
+			L.push(`    ${kbd("esc")} clear search   ${kbd("q")} close`);
+			return this.foot(L, W, "", "");
+		}
+		// its must be filtered from the SAME R objects — rows() builds fresh
+		// row objects on every call, so items() (which re-runs rows()) would
+		// never match by identity and the ▸ selection marker would never show
+		const its = R.filter((r) => r.kind === "item");
+		const curLine = R.findIndex((r) => r.kind === "item" && its.indexOf(r) === this.cursor);
+		const maxRows = CATALOG_PAGE_ROWS;
+		let scroll = 0;
+		if (curLine >= maxRows) scroll = Math.min(curLine - maxRows + 1, Math.max(0, R.length - maxRows));
+		for (const r of R.slice(scroll, scroll + maxRows)) {
+			if (r.kind === "head") {
+				L.push("");
+				L.push(`  ${t.muted(`${r.title} · ${r.n}`)}`);
+				continue;
+			}
+			L.push(this.itemRow(r, its.indexOf(r) === this.cursor, W));
+		}
+		if (scroll + maxRows < R.length) L.push(`    ${t.muted(`↓ ${R.length - scroll - maxRows} more on this page`)}`);
+		else if (!this.query && this.total > this.entries.length)
+			L.push(`    ${t.muted(`↓ end of page · ${this.total} total in the registry · type to search all of it`)}`);
+		if (this.degraded === "stale") L.push(`    ${t.accent("offline — install is disabled until the registry is reachable · r to retry")}`);
+		const pos = `${its.length ? this.cursor + 1 : 0}/${its.length}${this.query ? " matches" : this.total > this.entries.length ? ` shown · ${this.total} total` : " shown"}`;
+		const cur = this.current();
+		let act = "";
+		if (cur?.conn) act = `${kbd("i")} reconnect  ${kbd("x")} remove  `;
+		else if (this.canInstall(cur)) act = `${kbd("i")} install  `;
+		else if (cur?.entry) act = `${kbd("⏎")} why?  `;
+		return this.foot(L, W, pos, act);
+	}
+
+	private envLines(e: McpRegistryEntry): string[] {
+		if (!e.env?.length) return [t.muted("none")];
+		return e.env.map((v) =>
+			this.envSet(v)
+				? `${t.success("●")} $${v}  ${t.muted("set in your environment · value never shown")}`
+				: `${t.accent("○")} $${v}  ${t.accent("not set")} ${t.muted("· server will start but likely fail to connect")}`,
+		);
+	}
+
+	private renderDetail(W: number): string[] {
+		const e = this.target;
+		if (!e) return ["  (no server selected)"];
+		const conn = this.connFor(e.name);
+		const L: string[] = [];
+		L.push(this.header(`${t.muted("catalog ›")} ${t.fg.bold(e.name)}`, e.version ? t.muted(`v${e.version}`) : ""));
+		L.push("");
+		for (const l of wrapTextWithAnsi(e.description ?? "", Math.max(20, W - 4))) L.push(`  ${l}`);
+		L.push("");
+		if (conn) {
+			L.push(
+				conn.connected
+					? `  ${t.success("✓ connected")} · ${conn.tools ?? 0} tools exposed`
+					: `  ${t.danger("✗ installed but not connected")}${conn.error ? ` · ${conn.error}` : ""}`,
+			);
+		} else if (e.installable === false) {
+			L.push(`  ${t.muted("–")} ${t.fg.bold("Why bird can't install this")}`);
+			L.push(`    ${humanReason(e)}`);
+			if (e.reason) L.push(`    ${t.muted(`registry says: “${e.reason}”`)}`);
+		} else L.push(`  ${t.muted("not installed")}`);
+		L.push("");
+		L.push(`  ${t.muted(e.installable === false ? "Registry launch spec (not runnable by bird)" : "Launch command")}`);
+		const cmd = e.command || e.url || "";
+		if (cmd) for (const l of wrapCommand(cmd, e.args ?? [], W - 8)) L.push(`    ${t.panelBg(padTo(" " + paintVars(l), W - 10))}`);
+		else L.push(`    ${t.muted("(none listed)")}`);
+		L.push("");
+		L.push(`  ${t.muted("Required environment")}`);
+		for (const l of this.envLines(e)) L.push(`    ${l}`);
+		L.push("");
+		L.push(`  ${t.muted("Repository")}`);
+		L.push(e.repo ? `    ${e.repo}  ${t.muted("(o to open)")}` : `    ${t.muted("(none listed)")}`);
+		if (e.installable === false && !conn) {
+			L.push("");
+			L.push(`  ${t.muted("Run it yourself · add to mcp.json when bird supports this transport, or use a stdio bridge:")}`);
+			const short = e.name.split("/").pop() ?? e.name;
+			const snippet = e.url ? `"${short}": { "url": "${e.url}" }` : `"${short}": { "command": "${e.command ?? ""}", "args": ${JSON.stringify(e.args ?? [])} }`;
+			L.push(`    ${t.panelBg(` ${snippet} `)}`);
+		}
+		while (L.length < CATALOG_MIN_LINES) L.push("");
+		L.push(t.dim("├" + "─".repeat(Math.max(0, W - 2)) + "┤"));
+		let act: string;
+		if (conn) act = `${kbd("i")} reconnect  ${kbd("x")} remove`;
+		else if (e.installable !== false) act = this.degraded === "stale" ? t.muted("install disabled offline") : `${kbd("i")} install`;
+		else act = `${kbd("o")} open repository`;
+		L.push(`${act}  ${kbd("esc")} back to catalog`);
+		return L;
+	}
+
+	private renderConfirm(W: number): string[] {
+		const e = this.target;
+		if (!e) return ["  (no server selected)"];
+		const boxW = Math.min(84, W - 2);
+		const armed = Date.now() - this.armedAt >= CATALOG_ARM_MS;
+		const inner: string[] = [];
+		inner.push(`${t.fg.bold(`Install ${e.name}`)} ${e.version ? t.muted(`v${e.version}`) : ""}`);
+		inner.push(t.muted("This runs third-party code on this machine as your user."));
+		inner.push("");
+		inner.push(t.muted("bird will run"));
+		for (const l of wrapCommand(e.command ?? "", e.args ?? [], boxW - 8)) inner.push(`  ${paintVars(l)}`);
+		inner.push("");
+		inner.push(t.muted("and pass these from your environment at launch"));
+		for (const l of this.envLines(e)) inner.push(`  ${l}`);
+		inner.push("");
+		inner.push(`${t.muted("written to")}  .bird/mcp.json ${t.muted("(project scope)")}`);
+		inner.push("");
+		const y = armed ? t.btnPrimary(" y  install ") : t.accentSoftBg(t.muted(" y  install "));
+		inner.push(`${y}  ${t.accentSoftBg(t.fg(" n  cancel "))}`);
+		inner.push(t.muted("auto-approve does not apply here · press y explicitly"));
+		const L: string[] = [this.header(`${t.muted(`catalog › ${e.name} ›`)} ${t.fg.bold("confirm")}`), ""];
+		for (const c of roundedBox(inner, { width: boxW, border: t.dim })) L.push("  " + c);
+		L.push("");
+		L.push(`  ${t.muted("Environment values are expanded by the server process; bird never reads or stores them.")}`);
+		while (L.length < CATALOG_MIN_LINES) L.push("");
+		L.push(t.dim("├" + "─".repeat(Math.max(0, W - 2)) + "┤"));
+		L.push(`${kbd("y")} install  ${kbd("n")} / ${kbd("esc")} cancel`);
+		return L;
+	}
+
+	private renderResult(W: number): string[] {
+		const e = this.target;
+		const name = e?.name ?? "?";
+		const r = this.result;
+		const boxW = Math.min(84, W - 2);
+		const inner: string[] = [];
+		let crumb: string;
+		let keys: string;
+		if (r === null) {
+			const verb = this.pending === "remove" ? "removing" : this.pending === "reconnect" ? "reconnecting to" : "installing";
+			crumb = t.fg.bold(`${verb}…`);
+			inner.push(`${t.accent("…")} ${t.fg.bold(`${verb} ${name}`)}`);
+			inner.push(t.muted(this.pending === "remove" ? "updating mcp.json" : "starting the server and testing the connection"));
+			keys = `${kbd("esc")} close`;
+		} else if (r.removed || this.pending === "remove") {
+			crumb = t.fg.bold(r.ok ? "removed" : "remove failed");
+			inner.push(r.ok ? `${t.success("✓")} ${t.fg.bold(`${name} removed from mcp.json`)}` : `${t.danger("✗")} ${t.fg.bold(`couldn't remove ${name}`)}`);
+			if (!r.ok) inner.push(`  ${r.why ?? "unknown error"}`);
+			if (r.ok) inner.push(t.muted("Its tools are gone from the next message on."));
+			keys = `${kbd("⏎")} back to catalog  ${kbd("q")} close`;
+		} else if (r.ok) {
+			crumb = t.fg.bold("connected");
+			inner.push(`${t.success("✓")} ${t.fg.bold(`${name} connected`)}`);
+			const tools = r.tools ?? [];
+			const sample = tools.slice(0, 3);
+			const more = tools.length - sample.length;
+			inner.push(`  exposes ${t.fg.bold(`${tools.length} tool${tools.length === 1 ? "" : "s"}`)}${sample.length ? ` · ${sample.map((s) => t.muted(s)).join("  ")}${more > 0 ? t.muted(`  +${more}`) : ""}` : ""}`);
+			inner.push("");
+			inner.push(t.muted("Tools are available to the agent from your next message."));
+			keys = `${kbd("⏎")} back to catalog  ${kbd("q")} close`;
+		} else {
+			crumb = t.fg.bold("connection failed");
+			inner.push(`${t.danger("✗")} ${t.fg.bold(`${name} ${r.installed === false ? "could not be installed" : "installed, but didn't connect"}`)}`);
+			for (const l of wrapTextWithAnsi(r.why ?? "unknown error", boxW - 6)) inner.push(`  ${l}`);
+			const fixes = r.fix ?? [];
+			if (fixes.length) {
+				inner.push("");
+				for (const f of fixes) inner.push(`  ${t.muted("→")} ${f}`);
+			}
+			const log = (r.log ?? []).slice(-5);
+			if (log.length) {
+				inner.push("");
+				inner.push(t.muted("last lines from the server:"));
+				for (const l of log) inner.push(`  ${t.muted(truncateToWidth(l, boxW - 6))}`);
+			}
+			inner.push("");
+			inner.push(t.muted(r.installed === false ? "Nothing was written to mcp.json." : "Kept in mcp.json — it will retry on next launch."));
+			keys = r.installed === false ? `${kbd("⏎")} back to catalog` : `${kbd("r")} retry  ${kbd("x")} remove  ${kbd("⏎")} back to catalog`;
+		}
+		const L: string[] = [this.header(`${t.muted(`catalog › ${name} ›`)} ${crumb}`), ""];
+		for (const c of roundedBox(inner, { width: boxW, border: t.dim })) L.push("  " + c);
+		while (L.length < CATALOG_MIN_LINES) L.push("");
+		L.push(t.dim("├" + "─".repeat(Math.max(0, W - 2)) + "┤"));
+		L.push(keys);
+		return L;
+	}
+}
+
+export function humanCacheAge(seconds: number): string {
+	if (seconds < 90) return "cached just now";
+	if (seconds < 90 * 60) return `cached ${Math.floor(seconds / 60)}m ago`;
+	if (seconds < 36 * 3600) return `cached ${Math.floor(seconds / 3600)}h ago`;
+	return `cached ${Math.floor(seconds / 86400)}d ago`;
 }
 
 /* ---------- chat bar ghost text ---------- */
@@ -686,6 +1593,11 @@ export class ThinkPicker implements Component {
  *  replaces those blanks. It is inert — the moment there is text it's gone, so
  *  it can never be mistaken for content or end up submitted. */
 export class GhostEditor extends Editor {
+	// painted prefix on the content row (e.g. `edit ◌2 ›` while editing a
+	// queued item). The text lives in the editor; the prefix is paint, the
+	// same trick as the ghost text — never part of the value.
+	private prefix: string | null = null;
+
 	constructor(
 		tui: TUI,
 		theme: EditorTheme,
@@ -694,12 +1606,37 @@ export class GhostEditor extends Editor {
 		super(tui, theme);
 	}
 
+	/** Swap the placeholder shown when the bar is empty — the queue states
+	 *  ("queue a message…", "⏎ sends ◌1 · …", …) replace "/ for commands". */
+	setGhost(ghost: string): void {
+		this.ghost = ghost;
+	}
+
+	/** Paint a prefix before the cursor on the content row (null clears it). */
+	setPrefix(prefix: string | null): void {
+		this.prefix = prefix;
+	}
+
+	getPrefix(): string | null {
+		return this.prefix;
+	}
+
 	render(width: number): string[] {
 		const lines = super.render(width);
-		// only when genuinely empty, and only on the standard 3-row box
-		// (top rule / content / bottom rule) — anything else and we leave the
-		// editor's own output alone rather than risk corrupting a frame
-		if (lines.length < 3 || this.getText().length > 0) return lines;
+		// only on the standard 3-row box (top rule / content / bottom rule) —
+		// anything else and we leave the editor's own output alone rather
+		// than risk corrupting a frame
+		if (lines.length < 3) return lines;
+		// painted prefix (edit-in-place marker): painted BEFORE the text, the
+		// same trick as the ghost — never part of the value. Truncate the
+		// combined row so the prefix can never overflow the frame.
+		if (this.prefix !== null) {
+			const row = lines[1];
+			const painted = t.accent(this.prefix) + row;
+			lines[1] = visibleWidth(this.prefix) + visibleWidth(row) > width ? truncateToWidth(painted, width) : painted;
+			return lines;
+		}
+		if (this.getText().length > 0) return lines;
 		const row = lines[1];
 		// drop the trailing blanks; escapes (the cursor block) survive because
 		// the run ends in a reset, not whitespace
@@ -735,6 +1672,8 @@ const NEXT_MODE: Record<PermissionMode, PermissionMode> = {
 // auto-approved offer with no feedback is a corrupted answer.
 const AUTO_MODES: Record<PermissionMode, ReadonlySet<string>> = {
 	normal: new Set(),
+	// "delete" is deliberately in NEITHER set. Removing a file is the one action
+	// here with nothing to undo it, so it asks every time regardless of mode.
 	auto_edits: new Set(["edit", "write", "read_outside_repo"]),
 	full_auto: new Set(["edit", "write", "read_outside_repo", "bash"]),
 };
@@ -761,7 +1700,17 @@ export class HintLine implements Component {
 	// lands); until then the model name renders plain.
 	private theme: AccentTheme = PLAIN_THEME;
 
+	// queue state for the left slot: null = show the default ⇧⇥ hint;
+	// {n, held} = show the queue indicator instead. held means the queue
+	// survived an interrupt/error and waits for an explicit ⏎.
+	private queue: { n: number; held: boolean } | null = null;
+
 	constructor(private model: string) {}
+
+	/** Show queue state in the left slot instead of ⇧⇥ when non-empty. */
+	setQueue(n: number, held: boolean): void {
+		this.queue = n > 0 ? { n, held } : null;
+	}
 
 	/** Swap the resolved accent theme once the startup background query lands. */
 	setTheme(theme: AccentTheme): void {
@@ -808,7 +1757,15 @@ export class HintLine implements Component {
 	}
 
 	render(width: number): string[] {
-		const left = " " + t.muted("⇧⇥ to cycle");
+		// queue indicator replaces the ⇧⇥ hint while the queue is non-empty:
+		// accent while a turn runs, muted once held (interrupt/error) so the
+		// state change reads at a glance.
+		const left = this.queue
+			? " " +
+				(this.queue.held
+					? t.muted(`◌ ${this.queue.n} held · ⏎ send next`)
+					: t.accentBold(`◌ ${this.queue.n} queued · ↑ edit`))
+			: " " + t.muted("⇧⇥ to cycle");
 		const mode =
 			this.mode === "full_auto"
 				? t.danger.bold("⚠ FULL AUTO")
@@ -969,6 +1926,8 @@ export interface PromptChoice {
 export class ChoicePicker implements Component {
 	invalidate(): void {}
 	onDone?: (value: string | null) => void;
+	private items: SelectItem[];
+	private matches: SelectItem[];
 	private list: SelectList;
 	private filter = "";
 
@@ -976,32 +1935,47 @@ export class ChoicePicker implements Component {
 		private title: string,
 		choices: PromptChoice[],
 		current: string | null,
+		private escLabel = "esc keep current",
 	) {
 		const items: SelectItem[] = choices.map((c) => ({
 			value: c.value,
 			label: (c.value === current ? "● " : "  ") + c.label,
 			description: c.description ?? "",
 		}));
-		this.list = new SelectList(items, 10, {
+		this.items = items;
+		this.matches = items;
+		this.list = this.makeList(items);
+	}
+
+	/** A fresh list over `items` — SelectList cannot swap its rows, and its
+	 *  selection resets on every filter change anyway. */
+	private makeList(items: SelectItem[]): SelectList {
+		const list = new SelectList(items, 10, {
 			selectedPrefix: (s) => t.accentBold(s),
 			selectedText: (s) => t.accentBold(s),
 			description: (s) => t.muted(s),
 			scrollInfo: (s) => t.dim(s),
 			noMatch: (s) => t.muted(s),
 		});
-		this.list.onSelect = (item) => this.onDone?.(item.value);
-		this.list.onCancel = () => this.onDone?.(null);
+		list.onSelect = (item) => this.onDone?.(item.value);
+		list.onCancel = () => this.onDone?.(null);
+		return list;
+	}
+
+	private applyFilter(): void {
+		this.matches = filterPickerItems(this.items, this.filter);
+		this.list = this.makeList(this.matches);
 	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.backspace)) {
 			this.filter = this.filter.slice(0, -1);
-			this.list.setFilter(this.filter);
+			this.applyFilter();
 			return;
 		}
 		if (data.length === 1 && data >= " " && data !== "\x7f") {
 			this.filter += data;
-			this.list.setFilter(this.filter);
+			this.applyFilter();
 			return;
 		}
 		this.list.handleInput(data);
@@ -1013,7 +1987,8 @@ export class ChoicePicker implements Component {
 			t.accent("●") +
 			" " +
 			t.fg.bold(this.title) +
-			t.muted(this.filter ? `  filter: ${this.filter}` : "  type to filter · ⏎ select · esc keep current");
+			t.muted(this.filter ? `  filter: ${this.filter}` : `  type to filter · ⏎ select · ${this.escLabel}`);
+		if (!this.matches.length) return [truncateToWidth(head, width), t.muted(`    no choice matches "${this.filter}"`)];
 		return [truncateToWidth(head, width), ...this.list.render(Math.max(20, width - 2)).map((l) => "  " + l)];
 	}
 }

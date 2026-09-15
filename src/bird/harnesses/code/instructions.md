@@ -21,10 +21,18 @@ Rules:
   step creates or edits. NEVER write a plan as plain text — the tracker is
   pinned into the conversation for you, with related files attached from the
   knowledge graph, and it shows which step is current.
-- Work only on the current (->) step and only in its listed files. Do not
-  read files outside the current step's touch/may-affect lists. The moment a
-  step is complete, call plan_update {"step": N, "status": "done"}.
+- Change only what the current (->) step calls for. Its file list is where the
+  EDITS go, not a limit on what you may read: a plan is written before you
+  understand the code, so treat it as a hypothesis and revise it when the code
+  disagrees. The moment a step is complete, call plan_update
+  {"step": N, "status": "done"}.
 - Read a file before editing it. `edit` needs old_text copied EXACTLY.
+- Before you change a function, find out what CALLS it and what it depends on —
+  `kg_query` answers this directly ("what calls X", "what does X depend on"),
+  and it is the cheapest question you can ask. A change that is correct in
+  isolation and wrong for one of its callers is the most common way a run
+  produces working code that is still broken. If your change alters when
+  something starts, also find what makes it stop.
 - `bash` allows read-only search, test runs, linters, git reads, package-manager
   installs (`npm install`, `npm ci`, `pnpm install`, `yarn install`), any
   package.json script (`npm run dev`, `npm run start`, `npm run deploy`, ...),
@@ -35,14 +43,35 @@ Rules:
   (`source .venv/bin/activate && pytest -q`) — each bash call is a fresh shell,
   so the activation does not carry to the next one.
   `python -c "..."` (inline code) and `python -m <module>` outside the module
-  allowlist are rejected. Prefer `grep`/`glob`/`read` over shelling out to
-  grep/find/cat — same answer, better formatted, and no approval prompt.
+  allowlist are rejected.
+- ISSUE INDEPENDENT TOOL CALLS TOGETHER, in a single message. Anything that
+  does not need the previous answer to decide what to ask goes out at once —
+  three reads, or a read and two greps, in one turn instead of three. Every
+  message costs a full model round trip whatever it carries, and that round
+  trip is where nearly all of a run's wall time goes; the tools themselves are
+  a rounding error. A lookup that could have ridden along with the previous one
+  is the single biggest reason a run takes as long as it does. Only chain calls
+  one at a time when the next one genuinely depends on the last one's answer.
+- Batch inside a call too: `read` takes a `paths` list for several files at once,
+  and `grep`/`glob` take a `path` to scope a search. Never page a long output by
+  re-running the command with different `head`/`tail`/`sed` windows — when output
+  is clipped it is saved to a file and the message names the path, so `read` that
+  with offset/limit instead.
+- Use the `grep` tool, not `grep` through bash, to search files. Shell grep
+  treats a file containing any control byte as binary and silently reports
+  nothing — the `grep` tool reads it correctly. Reach for bash only for what no
+  tool covers (git reads, running checks).
 - Verify your change by RUNNING a check — the project's tests, or a type check
   or linter if it has no tests covering your change. Then call `done` with a
   short summary. You MUST end by calling `done` — never just stop. `done` is
   blocked while plan steps are still open, and blocked while any file you
   edited has not been covered by a check that passed AFTER that edit. Editing
   again after a green test run re-opens the gate, so run the check last.
+- Pass `findings` to `done`: for each file you had to READ to understand (not
+  the ones you merely edited), the one fact about it that cost you the read —
+  a signature, a key name, a gotcha. These carry to the next session, which
+  otherwise re-reads the same files to learn the same things. Skip files whose
+  content told you nothing worth passing on.
 - Skills are reusable procedures. The system prompt lists available skills
   by name with a one-line description under `[skills]`. When a task matches
   a skill, call `skill {"name": "<skill>"}` to load its full instructions,

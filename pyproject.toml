@@ -39,6 +39,13 @@ bird = ["skills/builtin/*.md", "models.json"]
 # static/ is the built Workbench (source in arch-ui/, `npm run build`); the
 # asset filenames are content-hashed, hence the glob.
 "bird.harnesses.arch" = ["instructions.md", "static/index.html", "static/assets/*"]
+# the design harness hit the same gap: its instructions, the editor bridge and
+# the builtin themes all ride here. A theme is a directory (THEME.md or
+# DESIGN.md, plus tokens.css — vendored ones may add manifest.json and other
+# files) or a bare <name>.md file directly under themes/. The recursive glob
+# ships every theme file shape, so a vendored theme can't silently lose an
+# asset the way the old instructions.md path did.
+"bird.harnesses.design" = ["instructions.md", "editor-bridge.js", "static/index.html", "static/assets/*", "themes/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

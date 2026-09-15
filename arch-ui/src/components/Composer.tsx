@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { you } from "../board/chat";
-import { getUi, nextLocalId } from "../board/ui";
+import { nextLocalId } from "../board/ui";
 import type { Attachment } from "../board/types";
-import { sendBoard, sendInput, useSession } from "../wire/session";
+import { useChatHost } from "../chat/host";
+import { composeMessageText } from "../chat/attach";
 import { useArriving } from "../hooks/useArriving";
 import { IconClip, IconDoc, IconWarn, IconX } from "./icons";
 
@@ -52,11 +53,15 @@ const drawnMessage = (n: number) =>
   `I've made ${n} ${n === 1 ? "change" : "changes"} on the board, please check.`;
 
 export function Composer({ tip, disabled, reason }: Props) {
-  const { pendingEdits } = useSession();
+  /* where this message goes, and what was selected when it went — the board
+     this rail sits beside decides, through the host seam */
+  const host = useChatHost();
+  const { pendingEdits } = host;
   const [text, setText] = useState("");
   const [atts, setAtts] = useState<Attachment[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const draft = useRef<HTMLTextAreaElement | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const errTimer = useRef(0);
@@ -117,6 +122,7 @@ export function Composer({ tip, disabled, reason }: Props) {
           size: f.size,
           img,
           url: img ? URL.createObjectURL(f) : null,
+          file: f,
         } satisfies Attachment;
       });
       if (take.length < ok.length) {
@@ -142,15 +148,15 @@ export function Composer({ tip, disabled, reason }: Props) {
   const carriesFiles = (e: React.DragEvent) =>
     Boolean(e.dataTransfer) && [...(e.dataTransfer.types || [])].includes("Files");
 
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const body = text.trim();
+    const typed = text.trim();
     const sent = atts;
-    if (disabled) return;
-    if (!body && !sent.length) {
+    if (disabled || uploading) return;
+    if (!typed && !sent.length) {
       /* nothing typed, but something drawn — send that instead of an empty
          message. One gesture, one turn. */
-      if (pendingEdits > 0) sendBoard();
+      if (pendingEdits > 0) host.sendBoard();
       return;
     }
 
@@ -162,30 +168,35 @@ export function Composer({ tip, disabled, reason }: Props) {
     /* The thumbnails stay in the thread so you can see what you showed it.
        The harness's own transcript echoes the text back on `run_start`, so
        only an attachment-only message needs its own turn here. */
-    if (sent.length) you(body || undefined, sent);
+    if (sent.length) you(typed || undefined, sent);
 
-    /* Whatever box is live when you press Send is what the message is about.
+    /* Whatever is live when you press Send is what the message is about.
        Read at submit, not held in state: the selection can change while you
        are still typing, and the one that counts is the one you were looking at
-       when you sent it. Notes are not components, so only boxes travel. */
-    const sel = getUi().selected;
-    const subjects = sel && sel.t === "node" ? [sel.id] : [];
+       when you sent it. The host decides what counts as a subject. */
+    const subjects = host.subjects();
 
-    if (body) {
-      sendInput(body, subjects);
-    } else {
-      /* Files are read by the person, not the harness: this page has no upload
-         channel, so say what arrived rather than pretend it was delivered. */
-      sendInput(
-        `[the user attached ${sent.length} file(s): ${sent.map((a) => a.name).join(", ")}]`,
-        subjects,
+    /* Uploading is the one async step between Send and the message leaving:
+       held under a flag so a double-click cannot ship the same bytes twice,
+       and so the send button stands down until the references exist. */
+    setUploading(true);
+    try {
+      const body = await composeMessageText(
+        typed,
+        sent.map((a) => a.file).filter((f): f is File => Boolean(f)),
+        host.upload ?? null,
       );
+      host.sendInput(body, subjects);
+    } finally {
+      setUploading(false);
     }
   };
 
   /* Typing and drawing go together: whatever is on the board travels with the
-     message, so Send is live when either has something in it. */
-  const canSend = (Boolean(text.trim()) || atts.length > 0 || pendingEdits > 0) && !disabled;
+     message, so Send is live when either has something in it. Uploads hold
+     Send down: the references do not exist until they finish. */
+  const canSend = (Boolean(text.trim()) || atts.length > 0 || pendingEdits > 0)
+    && !disabled && !uploading;
 
   return (
     <form className="composer" id="composer" data-od-id="composer" onSubmit={submit}
@@ -219,8 +230,8 @@ export function Composer({ tip, disabled, reason }: Props) {
           rows={1}
           value={text}
           disabled={disabled}
-          placeholder={disabled ? reason : "Say what's wrong, or point at something on the board…"}
-          aria-label="Message the architect"
+          placeholder={disabled ? reason : host.placeholder}
+          aria-label={host.who}
           onChange={(e) => { ours.current = false; setText(e.target.value); }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -243,7 +254,24 @@ export function Composer({ tip, disabled, reason }: Props) {
             <IconClip />
           </button>
           <span className="tip" id="tip">{tip}</span>
-          <button className="send" id="send" type="submit" disabled={!canSend}>Send</button>
+          {/* One button, two verbs: Send when idle, Stop while a turn runs.
+              A separate Stop appearing beside Send mid-turn catches the
+              habitual double-send click aimed where Send was and kills the
+              turn that just started — the click-steal this shape exists to
+              prevent. Morphing in place keeps the same slot under the cursor,
+              so a second click there is always deliberate. Mid-turn input
+              stays live (the nudge path that steers a long-thinking model
+              without killing it); a page that wires no stop verb keeps a
+              plain Send even mid-turn. */}
+          {host.running && host.stop ? (
+            <button className="send stop" id="btn-stop" type="button"
+                    title="Stop the current turn" aria-label="Stop the current turn"
+                    data-od-id="stop-turn" onClick={host.stop}>
+              Stop
+            </button>
+          ) : (
+            <button className="send" id="send" type="submit" disabled={!canSend}>Send</button>
+          )}
         </div>
 
         <input

@@ -406,7 +406,7 @@ def test_all_schemas_under_token_budget():
     from .test_tools import SCHEMA_TOKEN_BUDGET
 
     tools = code_harness_tools(with_kg=True)
-    assert len(tools) == 15
+    assert len(tools) == 16
     wire = json.dumps([t.spec().to_openai() for t in tools])
     approx_tokens = len(wire) / 4
     assert approx_tokens < SCHEMA_TOKEN_BUDGET, (
@@ -426,7 +426,7 @@ def test_repl_completer_builtin_commands(tmp_path):
     from bird.llm.wire.openai_compat import OpenAICompatClient
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
@@ -478,7 +478,7 @@ def test_repl_completer_includes_skills(tmp_path):
     from bird.llm.types import Message, Usage, LLMResponse
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     skills = [
@@ -545,7 +545,7 @@ def test_repl_completer_non_slash_returns_none(tmp_path):
     from bird.llm.types import Message, Usage, LLMResponse
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     recorder = SessionRecorder(tmp_path / ".bird" / "sessions" / "t")
@@ -584,7 +584,7 @@ def test_serve_ready_includes_skills(monkeypatch, tmp_path):
     from bird.serve import Server
 
     class FakeClient:
-        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+        def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
             return LLMResponse(message=Message(role="assistant", content="ok"), usage=Usage(0, 0), stop_reason="stop", model=spec.spec)
 
     skills = [

@@ -91,6 +91,19 @@ def _decisions_section(state: ArchState) -> list[str]:
     return lines
 
 
+def _evidence_line(a) -> str:
+    """Who runs this shape and at what scale, when the architect looked."""
+    ev = a.evidence or {}
+    who, scale = ev.get("who", ""), ev.get("scale", "")
+    if not who and not scale:
+        return ""
+    line = "*Seen at:* " + " · ".join(p for p in (who, scale) if p)
+    sources = [str(u) for u in ev.get("sources") or [] if u]
+    if sources:
+        line += " (" + ", ".join(sources) + ")"
+    return line
+
+
 def _not_taken_section(state: ArchState) -> list[str]:
     """The shapes that lost, and why. The single most common question a builder
     asks later is "why not X" — this is the answer, and it costs nothing to
@@ -106,6 +119,10 @@ def _not_taken_section(state: ArchState) -> list[str]:
             lines.append(a.summary)
             lines.append("")
         lines.append(f"**Not taken:** {a.rejected_reason}")
+        ev = _evidence_line(a)
+        if ev:
+            lines.append("")
+            lines.append(ev)
         boxes = [n.label or n.id for n in state.nodes_in(a.id)]
         if boxes:
             lines.append("")

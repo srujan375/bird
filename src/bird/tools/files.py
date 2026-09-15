@@ -149,19 +149,78 @@ def _looks_binary(path: Path) -> bool:
 
 class ReadTool(Tool):
     name = "read"
-    description = "Read a file. Returns the exact file content."
+    description = (
+        "Read a file with `path`, or several at once with `paths`. Returns exact "
+        "file content."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Repo-relative file path"},
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Repo-relative files to read in one call — on its own, or "
+                    "alongside `path`. Prefer one batched read over one read per "
+                    "file — turns are the scarce resource."
+                ),
+            },
             "offset": {"type": "integer", "description": "1-based line to start from"},
             "limit": {"type": "integer", "description": "Max lines to return"},
         },
-        "required": ["path"],
+        # Deliberately no `required`: the real rule is "path or paths", and the
+        # schema used to say `required: ["path"]` while the description invited
+        # `paths`. A model that took the invitation — `{"paths": [...]}`, the
+        # obvious form — had the call rejected, burned a validation retry, and
+        # fell back to one file per call, which is the exact waste batching
+        # exists to prevent. run() enforces the real rule instead, in the
+        # model's own vocabulary.
         "additionalProperties": False,
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """One file, or a batch.
+
+        A batch exists because reconnaissance was costing one turn per file: a
+        run that needs four files to understand a change spent four turns
+        getting them, and the nudge that fires at six turns of reading was
+        counting those four. One bad file does not sink the batch — its error
+        is reported in place and the rest still come back, since the usual
+        reason to batch is not being sure which of them matters.
+        """
+        extra = args.get("paths")
+        single = args.get("path")
+        if extra is None or extra == []:
+            if not single:
+                raise ToolError(
+                    "read needs a file to read: pass `path` for one file, or "
+                    "`paths` for several."
+                )
+            return self._read_one(args, ctx)
+        if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
+            raise ToolError("`paths` must be a list of repo-relative file paths.")
+        # a file named in both `path` and `paths` was still meant once
+        targets: list[str] = []
+        for path in [single, *extra] if single else list(extra):
+            if path and path not in targets:
+                targets.append(path)
+        parts: list[str] = []
+        ok: list[str] = []
+        for path in targets:
+            sub = {k: v for k, v in args.items() if k != "paths"}
+            sub["path"] = path
+            try:
+                parts.append(f"===== {path} =====\n{self._read_one(sub, ctx).output}")
+                ok.append(path)
+            except ToolError as e:
+                parts.append(f"===== {path} =====\nError: {e}")
+        return ToolResult(
+            output="\n\n".join(parts),
+            details={"paths": ok, "requested": len(targets), "read": len(ok)},
+        )
+
+    def _read_one(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         p = ctx.resolve_path(args["path"])
         gate_outside_repo_read(ctx, args["path"], p, self.name)
         if p.is_dir():
@@ -568,6 +627,52 @@ class WriteTool(Tool):
         )
 
 
+class DeleteTool(Tool):
+    """Remove a file the run itself created or no longer needs.
+
+    Exists because a harness that can write but not delete leaves its own litter
+    behind: a session that wrote a scratch probe, could not remove it, and
+    settled for overwriting the file with a tombstone comment — which is still
+    a stray file in the user's repo.
+
+    Files only, never directories. Recursive delete is the one mistake in this
+    toolset that cannot be walked back, and a run that genuinely needs a tree
+    gone can say so a file at a time — slow enough to stay deliberate.
+    """
+
+    name = "delete"
+    requires_permission = True
+    description = "Delete a file. Refuses directories."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Repo-relative file path"},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+    def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        rel = args["path"]
+        p = ctx.resolve_repo_path(rel)
+        if p.is_dir():
+            raise ToolError(
+                f"{rel} is a directory. `delete` removes one file at a time — a "
+                f"recursive delete is the one thing here that cannot be undone."
+            )
+        if not p.exists():
+            raise ToolError(f"{rel} does not exist, so there is nothing to delete.")
+        size = p.stat().st_size
+        try:
+            p.unlink()
+        except OSError as e:
+            raise ToolError(f"cannot delete {rel}: {e}") from e
+        return ToolResult(
+            output=f"Deleted {rel} ({size} bytes).",
+            details={"path": rel, "bytes": size},
+        )
+
+
 # ---------------------------------------------------------------- search
 
 # Directories that are enormous and machine-generated. Walking into one from a
@@ -633,6 +738,23 @@ def _rel(p: Path, root: Path) -> str:
         return str(p)
 
 
+def _normalize_grep_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Map the other-agent grep shape (-i/-n/-A/-B/-C, output_mode) onto this
+    tool's own arguments. Explicit native arguments win over an alias that
+    says the same thing; `-n` is accepted and dropped (line numbers are always
+    shown)."""
+    a = dict(args)
+    if a.pop("-i", False):
+        a["ignore_case"] = True
+    a.pop("-n", None)
+    spans = [int(a.pop(k) or 0) for k in ("-A", "-B", "-C") if k in a]
+    if spans:
+        a["context"] = max(int(a.get("context") or 0), *spans)
+    if a.pop("output_mode", None) in ("files_with_matches", "count"):
+        a["files_only"] = True
+    return a
+
+
 class GrepTool(Tool):
     """Regex search over file contents.
 
@@ -659,12 +781,27 @@ class GrepTool(Tool):
             "ignore_case": {"type": "boolean", "description": "Case-insensitive"},
             "files_only": {"type": "boolean", "description": "Return paths, not lines"},
             "context": {"type": "integer", "description": "Context lines per match"},
+            "head_limit": {"type": "integer", "description": "Max result lines"},
+            # The shape another agent's grep tool takes (-i/-n/-A/-B/-C,
+            # output_mode). Models trained on it send it here — 14 logged calls
+            # in three days, each a rejected turn and a retry — and none of it
+            # means anything this tool cannot do, so it is accepted and mapped
+            # (_normalize_grep_args). Bare on purpose: the toolset has a token
+            # budget (test_all_schemas_under_token_budget), and a model that
+            # sends these already knows what they mean.
+            "-i": {"type": "boolean"},
+            "-n": {"type": "boolean"},
+            "-A": {"type": "integer"},
+            "-B": {"type": "integer"},
+            "-C": {"type": "integer"},
+            "output_mode": {"type": "string"},
         },
         "required": ["pattern"],
         "additionalProperties": False,
     }
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        args = _normalize_grep_args(args)
         pattern = args["pattern"]
         path_str = args.get("path") or "."
         root = ctx.resolve_path(path_str)
@@ -732,6 +869,11 @@ class GrepTool(Tool):
                     lines.append("--")
             if truncated:
                 break
+
+        limit = int(args.get("head_limit") or 0)
+        if limit > 0 and len(lines) > limit:
+            lines = lines[:limit]
+            truncated = True
 
         if not lines:
             hint = ""

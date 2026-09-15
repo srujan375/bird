@@ -4,7 +4,16 @@ a harness mounts is the harness definition's business (bird.harnesses.*)."""
 from .base import Tool, ToolContext, ToolError, ToolResult
 from .bash import BashTool
 from .done import DoneTool
-from .files import EditTool, GlobTool, GrepTool, LsTool, ReadImageTool, ReadTool, WriteTool
+from .files import (
+    DeleteTool,
+    EditTool,
+    GlobTool,
+    GrepTool,
+    LsTool,
+    ReadImageTool,
+    ReadTool,
+    WriteTool,
+)
 from .kg_query import KgQueryTool
 from .plan import PlanState, PlanTool, PlanUpdateTool
 from .skill import SkillTool
@@ -21,6 +30,7 @@ __all__ = [
     "GrepTool",
     "GlobTool",
     "EditTool",
+    "DeleteTool",
     "WriteTool",
     "BashTool",
     "KgQueryTool",

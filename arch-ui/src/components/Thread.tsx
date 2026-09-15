@@ -1,8 +1,7 @@
-import { useEffect, useRef, useState } from "react";
-import { frame } from "../board/viewApi";
-import { flash } from "../board/ui";
-import type { AskBlock, BoardLine, Turn } from "../board/chat";
-import { sendPick } from "../wire/session";
+import { useEffect, useRef } from "react";
+import type { BoardLine, Turn } from "../board/chat";
+import { useChatHost } from "../chat/host";
+import { Picker } from "./Picker";
 import type { Attachment } from "../board/types";
 import { useArriving } from "../hooks/useArriving";
 import { Rich, RichLines } from "./Rich";
@@ -11,112 +10,29 @@ import { IconDoc } from "./icons";
 const human = (n: number) =>
   n < 1024 ? n + " B" : n < 1048576 ? Math.round(n / 1024) + " KB" : (n / 1048576).toFixed(1) + " MB";
 
+function Tick() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.4"
+         strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3.5 8.5l3 3 6-6.5" />
+    </svg>
+  );
+}
+
 /** The whole of the model's internals, in one line you can ignore. */
 function BoardLineRow({ line }: { line: BoardLine }) {
+  const host = useChatHost();
   return (
     <button
       type="button"
       className="board-line"
       data-od-id="board-line"
-      onClick={() => { frame(line.ids, 120, 1.15); flash(line.ids); }}
+      onClick={() => host.reveal(line.ids)}
     >
       <span className="dot" />
       <span>{line.text}</span>
       <span className="go">show me</span>
     </button>
-  );
-}
-
-/** The picker card. Cursor moves with the arrows without committing; Enter,
- *  Space, a click, or a digit answers with a row. After an answer the rivals
- *  dim but stay — they are the record of what was offered and not taken. */
-function Ask({ ask, flush }: { ask: AskBlock; flush: boolean }) {
-  const [cursor, setCursor] = useState(() => Math.max(0, ask.opts.findIndex((o) => o.rec)));
-  const group = useRef<HTMLDivElement | null>(null);
-  const focused = useRef(false);
-
-  const pick = (o: AskOption) => {
-    if (ask.spent) return;
-    setCursor(Math.max(0, ask.opts.indexOf(o)));
-    if (ask.onPick) ask.onPick(o); else sendPick(o.label);
-  };
-
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (ask.spent) return;
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      e.preventDefault();
-      e.stopPropagation();
-      setCursor((c) =>
-        Math.min(ask.opts.length - 1, Math.max(0, c + (e.key === "ArrowDown" ? 1 : -1))));
-    } else if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      const o = ask.opts[cursor];
-      if (o) pick(o);
-    } else if (e.key === "Tab") {
-      /* one stop: leave the whole group */
-      const rows = group.current?.querySelectorAll<HTMLElement>("button");
-      const last = rows && rows.length ? rows[rows.length - 1] : null;
-      if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        (group.current?.closest(".thread") as HTMLElement | null)?.focus();
-      }
-    }
-    /* Escape belongs to the board */
-  };
-
-  return (
-    <div className="ask" data-od-id="ask" style={flush ? { marginTop: 0 } : undefined}>
-      <q><Rich text={ask.question} /></q>
-      <div
-        className={"picker" + (ask.spent ? " spent" : "") + (ask.answeredInMessage ? " answered-in-message" : "")}
-        role="listbox"
-        aria-label={ask.question}
-        ref={group}
-        tabIndex={ask.spent ? -1 : 0}
-        onFocus={() => { focused.current = true; }}
-        onBlur={() => { focused.current = false; }}
-        onKeyDown={onKeyDown}
-      >
-        {ask.opts.map((o, i) => {
-          const picked = ask.spent && !ask.answeredInMessage && ask.pickedLabel === o.label;
-          return (
-            <button
-              key={i}
-              type="button"
-              role="option"
-              aria-selected={picked || (!ask.spent && i === cursor)}
-              className="row"
-              data-od-id={"reply-chip-" + i}
-              {...(o.rec ? { "data-rec": "1" } : {})}
-              {...(picked ? { "data-picked": "1" } : {})}
-              {...(!ask.spent && i === cursor ? { "data-cursor": "1" } : {})}
-              onMouseEnter={() => { if (!focused.current && !ask.spent) setCursor(i); }}
-              onClick={() => pick(o)}
-            >
-              <span className="digit">{i + 1}</span>
-              <span className="body">
-                <span className="lbl">
-                  {o.label}
-                  {picked ? <span className="badge">your call</span>
-                    : o.rec ? <span className="badge">recommended</span> : null}
-                </span>
-                {(o.cost || picked) && <span className="cost">{o.cost}</span>}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-      <p className={"ask-foot" + (ask.spent ? " spent" : "")} data-od-id="ask-foot">
-        {ask.spent
-          ? ask.answeredInMessage
-            ? "answered in a message — neither option taken as-is"
-            : "answered · sent with your next message"
-          : <>
-              {[...Array(ask.opts.length).keys()].map((i) => <kbd key={i}>{i + 1}</kbd>)}
-              {" or click / or just type an answer"}
-            </>}
-      </p>
-    </div>
   );
 }
 
@@ -144,6 +60,7 @@ function Files({ files, onOpen }: { files: Attachment[]; onOpen: (a: Attachment)
 }
 
 function TurnBlock({ turn, onOpen }: { turn: Turn; onOpen: (a: Attachment) => void }) {
+  const host = useChatHost();
   const entering = useArriving();
   const cls = "turn" + (entering ? " entering" : "") + (turn.t === "you" ? " you" : "");
 
@@ -151,6 +68,41 @@ function TurnBlock({ turn, onOpen }: { turn: Turn; onOpen: (a: Attachment) => vo
     return (
       <div className={cls}>
         <div className="thinking"><i /><i /><i /></div>
+      </div>
+    );
+  }
+  if (turn.t === "progress") {
+    /* the research turn: what the architect is doing, one line per kind of
+       work, in place of the dots; kept afterwards as the first minute's record */
+    const active = turn.steps.findIndex((s) => !s.done);
+    return (
+      <div className={cls} data-od-id="progress">
+        <div className="progress">
+          {turn.steps.map((s, i) => (
+            <div
+              key={s.step}
+              className="pg-row"
+              {...(s.done ? { "data-done": "1" } : {})}
+              {...(!s.done && i === active ? { "data-active": "1" } : {})}
+            >
+              <span className="pg-mark">{s.done ? <Tick /> : !s.done && i === active ? <i /> : null}</span>
+              <span>{s.text}</span>
+            </div>
+          ))}
+          {active >= 0 ? <div className="pg-eta">about two minutes</div> : null}
+        </div>
+      </div>
+    );
+  }
+  if (turn.t === "card") {
+    return (
+      <div className={cls}>
+        <details className="card" data-od-id="card">
+          <summary><span className="dot" /><span>{turn.title}</span><span className="go">read</span></summary>
+          <div className="card-body">
+            {turn.text.split(/\n{2,}/).map((para, i) => <p className="say" key={i}><RichLines text={para} /></p>)}
+          </div>
+        </details>
       </div>
     );
   }
@@ -181,10 +133,28 @@ function TurnBlock({ turn, onOpen }: { turn: Turn; onOpen: (a: Attachment) => vo
     );
   }
   return (
-    <div className={cls}>
+    <div className={cls} data-turn={turn.id}>
       {turn.lines.map((l, i) => <p className="say" key={i}><Rich text={l} /></p>)}
       {turn.line ? <BoardLineRow line={turn.line} /> : null}
-      {turn.ask ? <Ask ask={turn.ask} flush={turn.lines.length === 0} /> : null}
+      {/* Only the record lives here. The live question is the dock's, pinned
+          above the composer, so it never scrolls away while the architect
+          keeps writing. */}
+      {turn.ask && turn.ask.spent ? (
+        <Picker
+          host={turn.id}
+          ask={turn.ask}
+          flush={turn.lines.length === 0}
+          onConfirm={(o) => host.sendAnswer(turn.id, turn.ask!.picker.id, o)}
+          /* Change is the host's to offer. Arch never does: a pick goes
+             straight to the architect, and by the time you could press it
+             the answer has been acted on. The design intake does, until the
+             brief has gone out. */
+          onChange={host.askChange?.allowed(turn.ask.picker.id)
+            ? () => host.askChange!.reopen(turn.id, turn.ask!.picker.id)
+            : undefined}
+          lockedNote="sent"
+        />
+      ) : null}
     </div>
   );
 }

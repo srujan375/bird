@@ -68,19 +68,65 @@ def resolve_under(root: Path, path: str) -> Path:
     return p
 
 
+def _spill_target(ctx: "ToolContext | None", tool_name: str) -> tuple[Path, str] | None:
+    """Where to park an over-long tool output, as (abs path, repo-relative).
+
+    None when there is nowhere safe to write it, or when the session directory
+    sits outside the repo — `read` refuses paths it cannot reach, and handing
+    the model one it will be denied is worse than plain truncation.
+    """
+    if ctx is None or getattr(ctx, "run_dir", None) is None:
+        return None
+    ctx.spill_seq += 1
+    p = Path(ctx.run_dir) / "tool-output" / f"{tool_name}-{ctx.spill_seq}.txt"
+    try:
+        rel = p.resolve().relative_to(Path(ctx.repo_root).resolve())
+    except ValueError:
+        return None
+    return p, str(rel)
+
+
 @dataclass
 class ToolResult:
     output: str
     details: dict[str, Any] = field(default_factory=dict)
     is_error: bool = False
 
-    def clipped(self) -> "ToolResult":
+    def clipped(self, ctx: "ToolContext | None" = None, tool_name: str = "output") -> "ToolResult":
+        """Clip to the window, and keep the rest somewhere reachable.
+
+        Truncation used to be terminal: the tail was simply gone, and the only
+        way back to it was to run the command again behind a different
+        `head`/`sed`/`tail` window. One logged session spent EIGHTEEN
+        consecutive turns doing exactly that to page a `git diff` — nearly half
+        its budget — and died at the turn cap having made no edit. So the full
+        output goes to a file and the message says where: paging is a `read`
+        with an offset, which costs one call instead of one call per window.
+        """
         if len(self.output) <= MAX_OUTPUT_CHARS:
             return self
+        dropped = len(self.output) - MAX_OUTPUT_CHARS
+        head = self.output[:MAX_OUTPUT_CHARS]
+        target = _spill_target(ctx, tool_name)
+        if target is not None:
+            path, rel = target
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(self.output, encoding="utf-8")
+            except OSError:
+                target = None  # fall through to plain truncation
+        if target is None:
+            return ToolResult(
+                output=head + f"\n... [truncated {dropped} chars]",
+                details={**self.details, "truncated_from": len(self.output)},
+                is_error=self.is_error,
+            )
         return ToolResult(
-            output=self.output[:MAX_OUTPUT_CHARS]
-            + f"\n... [truncated {len(self.output) - MAX_OUTPUT_CHARS} chars]",
-            details={**self.details, "truncated_from": len(self.output)},
+            output=head
+            + f"\n... [truncated {dropped} chars. The FULL output is saved at {rel} — "
+            f'read it with read {{"path": "{rel}", "offset": N}}. Do NOT re-run this '
+            f"command with a different head/tail/sed window to see the rest.]",
+            details={**self.details, "truncated_from": len(self.output), "full_output": rel},
             is_error=self.is_error,
         )
 
@@ -91,15 +137,27 @@ class ToolContext:
     kg: Any | None = None  # context.kg.KG once built; duck-typed to avoid import cycle
     plan: Any | None = None  # tools.plan.PlanState once the model calls plan
     record: Callable[[str, dict], None] | None = None  # session event sink
+    # Mid-turn user input. Returns everything the user has typed since the
+    # last call, oldest first; the runner drains it at the top of each loop
+    # step (see engine/runner.py). None = nothing can inject (library use,
+    # tests, and every sub-harness fork — an injection is aimed at the session
+    # the user is watching, not at whatever that session dispatched).
+    pending_input: Callable[[], list[str]] | None = None
     bash_categories: tuple[str, ...] = ("search", "test", "lint", "git_read")
     client: Any | None = None  # llm.wire.openai_compat.OpenAICompatClient — used by web_fetch to ask the model
     skills: list[Any] | None = None  # skills.Skill list; None = no skills loaded
     arch: Any | None = None  # harnesses.arch.session.ArchSession in arch sessions
+    design: Any | None = None  # harnesses.design.session.DesignSession in design sessions
     # lead-harness wiring: the lead's dispatch tools spin up sub-harnesses, so
     # they need the registry to resolve models and a dir to nest sub-sessions
     # under; last_bundle is the arch->code seam (the finalized design, stashed
     # by `architect` and seeded into the `code` sub-session)
     registry: Any | None = None  # llm.registry.Registry
+    harness: str = "code"  # which harness owns this ctx; set by build_runner
+    # context.store.ContextStore — what this session has already worked out.
+    # Shared by REFERENCE across the dispatch fork (replace() is shallow), so a
+    # sub-harness's findings flow back to the lead and on to the next dispatch.
+    store: Any | None = None
     run_dir: Path | None = None  # this session's dir; sub-sessions nest beneath it
     last_bundle: str | None = None  # seed_context handed from architect to code
     # permissions.Broker — duck: .request(payload) -> (approved, feedback).
@@ -123,6 +181,8 @@ class ToolContext:
     unverified_paths: list[str] = field(default_factory=list)  # edited since the last passing check
     last_verify: dict[str, Any] | None = None  # {"command", "exit_code"} of the last check run
     done_blocked_once: bool = False  # the model has been told; `unverified_reason` now unlocks
+    # names the spill files written when a tool output overruns the window
+    spill_seq: int = 0
 
     def emit(self, event_type: str, data: dict[str, Any]) -> None:
         if self.record:
@@ -135,7 +195,17 @@ class ToolContext:
         and whether a check has passed *since* they were touched. A passing
         check clears the ledger; a later edit refills it, so "ran the tests,
         then kept editing" can never read as "tested".
+
+        It is also where the context store learns what this harness has looked
+        at — every read passes through here, so the index needs no cooperation
+        from the model and no per-harness wiring.
         """
+        if self.store is not None and name == "read" and not result.is_error:
+            paths = result.details.get("paths") or []
+            single = result.details.get("path")
+            if single:
+                paths = [*paths, single]
+            self.store.mark_seen([p for p in paths if isinstance(p, str)], self.harness)
         if name == "bash":
             from .bash import is_verification_command  # deferred: bash imports this module
 
@@ -258,6 +328,6 @@ class Tool:
     def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """run() with ToolError converted to a model-visible error result."""
         try:
-            return self.run(args, ctx).clipped()
+            return self.run(args, ctx).clipped(ctx, self.name)
         except ToolError as e:
             return ToolResult(output=f"Error: {e}", details={"error": str(e)}, is_error=True)

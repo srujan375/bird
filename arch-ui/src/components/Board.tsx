@@ -12,6 +12,8 @@ import { useNodeHeights } from "../hooks/useNodeHeights";
 import { useView } from "../hooks/useView";
 import { Annotation } from "./Annotation";
 import { Dock } from "./Dock";
+import { FrontierPanel } from "./FrontierPanel";
+import { Strip } from "./Strip";
 import { Lanes } from "./Lanes";
 import { fieldOrder, itemText, NodeCard, parseItem, type Nav, type NodeAct } from "./NodeCard";
 import { KIND_LIST } from "../board/vocab";
@@ -645,6 +647,8 @@ export function Board({ setTip }: { setTip: (t: string) => void }) {
       </div>
 
       <Dock tool={ui.tool} onPick={(t: Tool) => setTool(t)} />
+      <Strip />
+      <FrontierPanel />
       <Zoomer
         level={level}
         onIn={() => zoomAt((viewport.current?.clientWidth ?? 0) / 2, (viewport.current?.clientHeight ?? 0) / 2, view.current.k * 1.25)}

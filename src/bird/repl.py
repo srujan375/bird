@@ -20,6 +20,13 @@ try:
 except ImportError:  # Windows lacks readline; completion just won't work
     readline = None
 
+try:
+    import termios
+    import tty
+except ImportError:  # Windows lacks termios; the catalog needs a tty anyway
+    termios = None
+    tty = None
+
 from .activity import attach_printer
 from .attachments import ingest_images
 from .context.kg import KG, KGError
@@ -34,26 +41,35 @@ from .engine.session import (
     save_messages,
     suggest_name_with_llm,
 )
-from .llm.discovery import discover_models
+from .llm.discovery import discover_models, ollama_context_window
 from .llm.ollama import Ollama, OllamaError
-from .llm.registry import Registry, RegistryError
+from .llm.registry import DEFAULT_CONTEXT_WINDOW, Registry, RegistryError
 from .llm.types import Message
 
 HELP = """\
 Type a task in plain language, or a command:
   /help                 this help
-  /model [spec|filter]  pick from available models (Ollama local + OpenRouter
-                        catalog), or switch directly by alias/provider:model;
-                        the pick becomes the default; history survives the
+  /model                walk harness -> model -> thinking level; the pick is
+                        saved as that harness's model (Ollama local +
+                        OpenRouter catalog), and switches this session when
+                        it is the running harness — history survives the
                         swap, even across providers
-  /think [mode]         pick an Ollama thinking mode (off/low/medium/high/max),
-                        or set it directly; off disables thinking, the others
-                        set reasoning effort; carries across /model switches
+  /model <harness>      the same walk, starting at the model step
+  /model [harness] <spec> [mode] [tokens]
+                        set it directly: spec is an alias or provider:model
+                        (or a filter for the picker), mode a thinking level,
+                        tokens the context window; harness defaults to the
+                        running one
+  /think [mode]         pick a thinking mode (off/low/medium/high/max) for the
+                        running model, or set it directly; off disables
+                        thinking, the others set reasoning effort; carries
+                        across a direct /model <spec> switch
   /kg status            graph location, readiness, staleness
   /kg build|update      (re)build or incrementally update the graph
   /kg query <question>  query the graph directly
-  /mcp                  status of configured MCP servers
-  /mcp search <query>   search the official MCP registry
+  /mcp                  browse the MCP server catalog (interactive store)
+  /mcp status           text status of configured MCP servers
+  /mcp search <query>   search the official MCP registry (text)
   /mcp add <name>       install a server from the registry (asks first)
   /setup                the first-run walkthrough again: probe sources,
                         enter keys, pick + verify a default model
@@ -240,6 +256,7 @@ class Repl:
             self.messages[:] = compact(
                 self.messages, self.runner.spec.context_window,
                 self.registry, self.runner.client, record=self.runner.ctx.emit,
+                keep_paths=self.runner.hot_paths(),
             )
             print(f"compacted: ~{before} → ~{estimate_tokens(self.messages)} tokens")
         elif cmd == "/clear":
@@ -391,20 +408,125 @@ class Repl:
         print(f"{name} → {path} (live in this session too)")
 
     def _cmd_model(self, arg: str) -> None:
-        if not arg:
-            self._model_picker(filter_=None)
-        elif arg in self.registry.aliases or ":" in arg:
-            self._switch_model(arg)
-        else:
+        """`/model` walks harness -> model -> thinking level. Direct forms:
+        `/model <spec> [tokens]` sets the running harness (the old shape),
+        `/model <harness>` starts the walk at the model step, and
+        `/model <harness> <spec> [mode] [tokens]` sets everything at once.
+        A direct switch carries the running thinking level across; the word
+        `keep` instead leaves the new model on its own stored level (what the
+        TUI sends when the walk's thinking step is skipped with esc).
+        A trailing integer is the context window: without it a spec the
+        catalog has no context_length for silently falls back to
+        DEFAULT_CONTEXT_WINDOW, which compacts a large model at a fraction of
+        its real window and sends it back to re-read its own transcript."""
+        tokens = arg.split()
+        aliases = self._harness_aliases()
+        harness = tokens.pop(0) if tokens and tokens[0] in aliases else None
+        if not tokens:
+            if harness is None:
+                self._harness_picker()
+            else:
+                self._model_picker(harness, filter_=None)
+            return
+        spec = tokens.pop(0)
+        window: int | None = None
+        mode: str | None = None
+        carry_think = True
+        for tok in tokens:
+            if tok.isdigit():
+                window = int(tok)
+            elif tok in self.THINK_MODES:
+                mode = tok
+            elif tok == "keep":
+                carry_think = False
+            else:
+                print(f"unexpected {tok!r} — usage: /model [harness] <spec> [mode|keep] [tokens]")
+                return
+        harness = harness or self._running_harness()
+        if spec not in self.registry.aliases and ":" not in spec:
             # not an alias and not provider:model — treat as a picker filter
-            self._model_picker(filter_=arg)
+            self._model_picker(harness, filter_=spec)
+            return
+        self._apply_harness_model(harness, spec, window, mode, carry_think=carry_think)
 
-    # Thinking modes, in display order. The friendly label is what the
-    # user types and sees; the internal value is what the wire adapter
-    # receives as `reasoning_effort`. `off` maps to "none" (thinking disabled);
-    # the rest map to themselves. The adapter translates it per provider —
-    # ollama forwards it raw, OpenRouter maps it onto its nested `reasoning`
-    # object (see OPENROUTER_REASONING_EFFORT in openai_compat.py).
+    # --- harness -> alias plumbing -------------------------------------
+
+    @staticmethod
+    def _harness_aliases() -> dict[str, str]:
+        """harness name -> models.json alias, in display order (see
+        harnesses.registry.model_aliases)."""
+        from .harnesses.registry import model_aliases
+
+        return model_aliases()
+
+    def _running_harness(self) -> str:
+        """The harness this session runs — build_runner stamps it on the ctx."""
+        return getattr(self.runner.ctx, "harness", None) or "code"
+
+    def _current_model_for(self, harness: str) -> str | None:
+        """The model `harness` runs on: the live spec for the running harness
+        (which may differ from its alias after a --model override), else
+        whatever its alias points at."""
+        if harness == self._running_harness():
+            return self.runner.spec.spec
+        return self.registry.aliases.get(self._harness_aliases()[harness])
+
+    def _harness_rows(self) -> list[dict]:
+        """One row per harness for the picker (and serve's harness_list): the
+        alias, the model it resolves to, that model's thinking level, and the
+        other harnesses sharing the alias."""
+        aliases = self._harness_aliases()
+        rows = []
+        for name, alias in aliases.items():
+            model = self._current_model_for(name)
+            rows.append({
+                "name": name,
+                "alias": alias,
+                "model": model,
+                "think_mode": self._think_label_for(model) if model else None,
+                "shared_with": [h for h, a in aliases.items() if a == alias and h != name],
+            })
+        return rows
+
+    def _harness_picker(self) -> None:
+        """Step one of bare /model: list the harnesses (numbered) with their
+        current model and thinking level; on a real terminal, prompt for a
+        pick and continue to the model step."""
+        rows = self._harness_rows()
+        running = self._running_harness()
+        print("harness:")
+        width = max(len(r["name"]) for r in rows)
+        mwidth = max(len(r["model"] or "(unset)") for r in rows)
+        for i, r in enumerate(rows, 1):
+            marker = "*" if r["name"] == running else " "
+            think = r["think_mode"] or "auto"
+            shared = f", shared with {', '.join(r['shared_with'])}" if r["shared_with"] else ""
+            print(
+                f" {marker}{i:3d}. {r['name']:<{width}}  {r['model'] or '(unset)':<{mwidth}}"
+                f"  think: {think:<6}  [{r['alias']}{shared}]"
+            )
+        if not getattr(sys.stdin, "isatty", lambda: False)():
+            print("pick with /model <harness> [spec] [mode] [tokens]")
+            return
+        try:
+            choice = input("harness # (empty to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not choice:
+            return
+        if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
+            print(f"not a listed number: {choice!r}")
+            return
+        self._model_picker(rows[int(choice) - 1]["name"], filter_=None)
+
+    # --- thinking modes ---------------------------------------------------
+    # In display order. The friendly label is what the user types and sees;
+    # the internal value is what the wire adapter receives as
+    # `reasoning_effort`. `off` maps to "none" (thinking disabled); the rest
+    # map to themselves. The adapter translates it per provider — ollama
+    # forwards it raw, OpenRouter maps it onto its nested `reasoning` object
+    # (see OPENROUTER_REASONING_EFFORT in openai_compat.py).
     THINK_MODES = ("off", "low", "medium", "high", "max")
     _THINK_INTERNAL = {"off": "none"}  # everything else maps to itself
 
@@ -423,15 +545,27 @@ class Repl:
         """Thinking modes for the current model's provider."""
         return self.think_modes_for_provider(self.runner.spec.provider.name)
 
-    def _think_label(self) -> str | None:
-        """The friendly mode label for the spec's current reasoning_effort, or
-        None when no mode is set (Ollama's auto/default behavior)."""
-        value = self.runner.spec.extra.get("reasoning_effort")
+    def _think_label_of(self, value: str | None) -> str | None:
+        """reasoning_effort value -> friendly label; None when unset (Ollama's
+        auto/default behavior) or unrecognised."""
         if value is None:
             return None
         if value == "none":
             return "off"
         return value if value in self.THINK_MODES else None
+
+    def _think_label(self) -> str | None:
+        """The friendly mode label for the running spec's reasoning_effort, or
+        None when no mode is set."""
+        return self._think_label_of(self.runner.spec.extra.get("reasoning_effort"))
+
+    def _think_label_for(self, spec: str) -> str | None:
+        """The friendly label for any model: the live value for the running
+        spec (a /think with nowhere to persist is still in force), else what
+        its models.json entry carries."""
+        if spec == self.runner.spec.spec:
+            return self._think_label()
+        return self._think_label_of(self.registry.models.get(spec, {}).get("reasoning_effort"))
 
     def _cmd_think(self, arg: str) -> None:
         if arg:
@@ -461,24 +595,65 @@ class Repl:
             return
         self._set_think_mode(choice)
 
+    _CANCEL = object()  # the /model walk was abandoned mid-way (Ctrl-C / EOF)
+
+    def _think_prompt_for(self, spec: str) -> str | None | object:
+        """The thinking step of the /model walk: list the modes `spec`'s
+        provider supports with a `*` on its stored level and prompt for a
+        NAME. Empty keeps the stored level (None); Ctrl-C/EOF returns _CANCEL.
+        Only reached on a tty — the caller checked."""
+        modes = self.think_modes_for_provider(spec.split(":", 1)[0])
+        current = self._think_label_for(spec)
+        print(f"thinking for {spec}: {current if current is not None else '(auto)'}")
+        for mode in modes:
+            marker = "*" if mode == current else " "
+            print(f" {marker} {mode}")
+        while True:
+            try:
+                choice = input("mode (empty to keep): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return self._CANCEL
+            if not choice:
+                return None
+            if choice in modes:
+                return choice
+            print(f"unknown mode {choice!r} — valid: {', '.join(modes)}")
+
     def _set_think_mode(self, label: str) -> None:
-        """Validate and apply a thinking mode by its friendly label."""
-        modes = self.think_modes()
+        """Validate and apply a thinking mode to the running model by its
+        friendly label."""
+        self._apply_think(self.runner.spec.spec, label, live=True)
+
+    def _apply_think(self, spec: str, label: str, *, live: bool) -> None:
+        """Make `label` the thinking level of `spec`: persisted into its
+        models.json entry, and onto the running spec when `live` (the running
+        model is the one changing)."""
+        modes = self.think_modes() if live else self.think_modes_for_provider(spec.split(":", 1)[0])
         if label not in modes:
             print(f"unknown mode {label!r} — valid: {', '.join(modes)}")
             return
         internal = self._THINK_INTERNAL.get(label, label)
-        self.runner.spec.extra["reasoning_effort"] = internal
-        saved = self.registry.set_think_mode(self.runner.spec.spec, internal)
-        self.recorder.event("think_mode", {"mode": label})
+        if live:
+            self.runner.spec.extra["reasoning_effort"] = internal
+        saved = self.registry.set_think_mode(spec, internal)
+        self.recorder.event("think_mode", {"mode": label, "spec": spec})
         note = "" if saved else " (this session only)"
         print(f"thinking: {label}{note}")
 
-    def _model_picker(self, filter_: str | None) -> None:
-        """List discovered models (numbered); on a real terminal, prompt for a
-        pick. The pick switches the session AND becomes the persisted default."""
-        spec = self.runner.spec
-        print(f"model: {spec.spec} (context {spec.context_window})")
+    # --- the model step, and applying a pick ------------------------------
+
+    def _model_picker(self, harness: str, filter_: str | None) -> None:
+        """List discovered models (numbered) for `harness`; on a real
+        terminal, prompt for a pick, then for its thinking level. The pick
+        becomes the harness's persisted alias — and switches this session
+        when the harness is the running one."""
+        alias = self._harness_aliases()[harness]
+        current = self._current_model_for(harness)
+        if harness == self._running_harness():
+            print(f"model for {harness} ({alias}): {current} (context {self.runner.spec.context_window})")
+        else:
+            print(f"model for {harness} ({alias}): {current or '(unset)'}")
         models, notes = discover_models(self.registry)
         for note in notes:
             print(f"note: {note}")
@@ -488,15 +663,17 @@ class Repl:
             if not models:
                 print(f"no available model matches {filter_!r}")
                 return
-        default = self.registry.aliases.get("default")
+        configured = self.registry.aliases.get(alias)
         width = max((len(m.spec) for m in models), default=0)
         for i, m in enumerate(models, 1):
-            marker = "*" if m.spec == spec.spec else " "
+            marker = "*" if m.spec == current else " "
             ctx = f"  {m.context_window // 1024}k ctx" if m.context_window else ""
-            tag = "  (default)" if m.spec == default else ""
-            print(f" {marker}{i:3d}. {m.spec:<{width}}  [{m.source}]{ctx}{tag}")
+            think = self._think_label_for(m.spec)
+            think = f"  think: {think}" if think else ""
+            tag = f"  ({alias})" if m.spec == configured else ""
+            print(f" {marker}{i:3d}. {m.spec:<{width}}  [{m.source}]{ctx}{think}{tag}")
         if not getattr(sys.stdin, "isatty", lambda: False)():
-            print("pick with /model <spec>")
+            print(f"pick with /model {harness} <spec> [mode] [tokens]")
             return
         try:
             choice = input("model # (empty to cancel): ").strip()
@@ -509,33 +686,108 @@ class Repl:
             print(f"not a listed number: {choice!r}")
             return
         picked = models[int(choice) - 1]
-        self._switch_model(picked.spec, context_window=picked.context_window)
+        mode = self._think_prompt_for(picked.spec)
+        if mode is self._CANCEL:
+            return
+        # the walk showed this model's OWN stored level and the user kept or
+        # changed it — so the running model's level must not carry over
+        self._apply_harness_model(
+            harness, picked.spec, picked.context_window, mode, carry_think=False
+        )
 
-    def _switch_model(self, name: str, context_window: int | None = None) -> None:
-        if context_window and name not in self.registry.models:
+    def _apply_harness_model(
+        self,
+        harness: str,
+        spec: str,
+        window: int | None,
+        mode: str | None,
+        *,
+        carry_think: bool = True,
+    ) -> None:
+        """Point `harness`'s alias at `spec` (persisted), switch this session
+        when that alias is the running harness's (history preserved), then
+        apply `mode` as the model's thinking level when one was given."""
+        aliases = self._harness_aliases()
+        alias = aliases[harness]
+        live = alias == aliases[self._running_harness()]
+        if live:
+            if not self._switch_model(spec, context_window=window, alias=alias, carry_think=carry_think):
+                return
+            spec = self.runner.spec.spec  # canonical: an alias resolved to its spec
+        else:
+            if not window:
+                window = ollama_context_window(self.registry, spec)
+            if window and not self.registry.models.get(spec, {}).get("context_window"):
+                # let discovery's context length win over the conservative default
+                self.registry.models.setdefault(spec, {})["context_window"] = window
+            try:
+                spec = self.registry.resolve(spec).spec
+            except RegistryError as e:
+                print(f"error: {e}")
+                return
+            saved = self.registry.set_alias(alias, spec, window)
+            self.recorder.event("harness_model", {"harness": harness, "alias": alias, "spec": spec})
+            where = f"{alias} saved to {self.registry.path}" if saved else f"{alias} updated for this session"
+            print(f"{harness}: {spec} ({where}; takes effect on the next {harness} session)")
+        if mode is not None:
+            self._apply_think(spec, mode, live=live)
+
+    def _switch_model(
+        self,
+        name: str,
+        context_window: int | None = None,
+        *,
+        alias: str = "default",
+        carry_think: bool = True,
+    ) -> bool:
+        """Swap the running model to `name` (an alias or provider:model),
+        keeping the conversation, and persist it as `alias`. Returns False
+        when the swap did not happen (bad spec, Ollama can't provide it)."""
+        if not context_window:
+            # a direct /model <spec> names a model the picker never described;
+            # a local Ollama model can still say what window it serves
+            context_window = ollama_context_window(self.registry, name)
+        spec_key = self.registry.aliases.get(name, name)
+        if context_window and not self.registry.models.get(spec_key, {}).get("context_window"):
             # let discovery's context length win over the conservative default
-            self.registry.models[name] = {"context_window": context_window}
+            self.registry.models.setdefault(spec_key, {})["context_window"] = context_window
         try:
             new_spec = self.registry.resolve(name)
         except RegistryError as e:
             print(f"error: {e}")
-            return
+            return False
         if new_spec.provider.name == "ollama":
             try:
                 Ollama(new_spec.provider.native_url or "http://localhost:11434").ensure(new_spec.model)
             except OllamaError as e:
                 print(f"error: {e}")
-                return
+                return False
         old = self.runner.spec.spec
-        # carry the thinking mode across the swap so /model doesn't reset it
+        # a direct /model <spec> carries the thinking mode across the swap so
+        # it doesn't silently reset; the picker walk asks instead
         prior_effort = self.runner.spec.extra.get("reasoning_effort")
         self.runner.spec = new_spec
-        if prior_effort is not None:
+        if carry_think and prior_effort is not None:
             new_spec.extra["reasoning_effort"] = prior_effort
-        saved = self.registry.set_default(new_spec.spec, context_window)
-        self.recorder.event("model_switch", {"from": old, "to": new_spec.spec})
-        where = f"default saved to {self.registry.path}" if saved else "default updated for this session"
+        saved = self.registry.set_alias(alias, new_spec.spec, context_window)
+        self.recorder.event("model_switch", {"from": old, "to": new_spec.spec, "alias": alias})
+        where = f"{alias} saved to {self.registry.path}" if saved else f"{alias} updated for this session"
         print(f"model: {old} → {new_spec.spec} (history preserved; {where})")
+        # resolve() warns about this on stderr, which the TUI does not show —
+        # and an unnoticed wrong window is not cosmetic: it is the difference
+        # between compacting at the model's real limit and compacting at 32k.
+        if "context_window" not in self.registry.models.get(new_spec.spec, {}):
+            print(
+                f"warning: no context window known for {new_spec.spec}; assuming "
+                f"{DEFAULT_CONTEXT_WINDOW // 1024}k. If the model is larger, set it "
+                f"with `/model {new_spec.spec} <tokens>` — otherwise compaction "
+                f"discards context the model still had room for."
+            )
+            self.recorder.event(
+                "context_window_assumed",
+                {"spec": new_spec.spec, "assumed": DEFAULT_CONTEXT_WINDOW},
+            )
+        return True
 
     def _cmd_kg(self, arg: str) -> None:
         if self.kg is None:
@@ -566,15 +818,25 @@ class Repl:
             print("usage: /kg [status|build|update|query <question>]")
 
     def _cmd_mcp(self, arg: str) -> None:
-        """In-session MCP surface: /mcp shows which configured servers
-        connected and how many tools each exposed (read-only — management
-        stays in `bird mcp`); /mcp search and /mcp add reach the registry,
-        with add always asking first — a registry entry is arbitrary code."""
+        """In-session MCP surface. Bare /mcp on a tty opens the interactive
+        catalog (the store view); /mcp status is the text status, and
+        /mcp search and /mcp add remain as text fallbacks for non-interactive
+        use — add always asks first, because a registry entry is arbitrary
+        code."""
         from .mcp.config import McpError, load_mcp_servers
 
         parts = arg.split(maxsplit=1)
         action = parts[0].lower() if parts else "status"
         rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if not parts and getattr(sys.stdin, "isatty", lambda: False)():
+            # bare /mcp on a tty: the catalog store. Everything below stays
+            # available as the text fallback (and for /mcp status|search|add).
+            try:
+                self._mcp_catalog()
+            except McpError as e:
+                print(f"error: {e}")
+            return
 
         if action == "status":
             clients = {c.spec.name: c for c in self.runner.ctx.mcp_clients}
@@ -673,6 +935,206 @@ class Repl:
         )
         # write through the same code path as the CLI — one writer for mcp.json
         cmd_add(args, self.runner.ctx.repo_root)
+
+    # ------------------------------------------------- interactive catalog
+
+    def _mcp_connected_infos(self) -> list:
+        """The Connected group's data: live clients (tool counts) plus
+        configured-but-not-connected servers from mcp.json."""
+        from .mcp.catalog import ConnectedInfo
+        from .mcp.config import load_mcp_servers
+
+        clients = {c.spec.name: c for c in self.runner.ctx.mcp_clients}
+        infos = []
+        try:
+            specs = load_mcp_servers(self.runner.ctx.repo_root)
+        except Exception:
+            specs = []
+        for spec in specs:
+            client = clients.get(spec.name)
+            if client is not None and client._alive():
+                infos.append(ConnectedInfo(spec.name, True, len(client.tools)))
+            else:
+                infos.append(ConnectedInfo(spec.name, False, 0))
+        return infos
+
+    def _mcp_fetch_catalog(self, query: str = ""):
+        """One catalog_page attempt -> (state, error). A stale cache keeps
+        the list browsable; only unreachable-with-no-cache is a blank wall."""
+        from .mcp import catalog as cat
+        from .mcp.config import McpError
+        from .mcp.discover import catalog_page
+
+        connected = self._mcp_connected_infos()
+        entries, info, error = [], {}, None
+        try:
+            entries, info = catalog_page(query)
+        except McpError as e:
+            error = str(e)
+        state = cat.state_from_fetch(entries, info, connected, error)
+        state.env_set = lambda v: v in os.environ
+        return state, error
+
+    def _mcp_catalog(self) -> None:
+        """The interactive store: raw-key loop over the catalog state
+        machine. Keys go to catalog.handle_key; the returned actions
+        (install/open/retry/remove/close) are performed here — the state
+        functions stay pure. Install always goes through the confirmation
+        path (broker offer or tty y/N — never default yes) and the
+        management.py write path."""
+        from .mcp import catalog as cat
+        from .mcp.config import McpError
+
+        state, error = self._mcp_fetch_catalog()
+        if state.degraded == "unreachable":
+            # nothing to browse and nothing cached — print the degraded text
+            # card instead of trapping the terminal in an empty loop
+            print("✗ Couldn't reach the registry")
+            print(f"  {error}")
+            print("  Nothing cached yet, so there is nothing to browse offline.")
+            print(f"  Your {len(state.connected)} configured server(s) are "
+                  f"unaffected — the catalog is only for discovery.")
+            print("  Retry with /mcp in a moment, or add manually: "
+                  "bird mcp add <name> --command <cmd>")
+            return
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while True:
+                print("\x1b[2J\x1b[H", end="")
+                for line in cat.render(state):
+                    print(line)
+                key = self._read_raw_key()
+                if key is None:
+                    break
+                action = cat.handle_key(state, key)
+                if action == "close" or key is None:
+                    break
+                if action == "retry":
+                    state, _ = self._mcp_fetch_catalog(state.query.strip())
+                elif action == "open":
+                    if state.target and state.target.repo:
+                        print(f"repository: {state.target.repo}")
+                elif action == "install":
+                    if state.degraded == "stale":
+                        # install is disabled on a stale cache — the entry
+                        # shown may no longer be what the registry serves
+                        state.view = "browse"
+                        print("install disabled while offline (cached list) — "
+                              "retry when the registry is reachable")
+                        continue
+                    self._mcp_catalog_install(state)
+                elif action == "remove":
+                    self._mcp_catalog_remove(state)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print()
+
+    def _read_raw_key(self):
+        """One keypress from the raw terminal, translated to the catalog's
+        key names. None on EOF."""
+        ch = sys.stdin.read(1)
+        if not ch:
+            return None
+        if ch == "\x1b":
+            nxt = sys.stdin.read(1)
+            if nxt == "[":
+                c = sys.stdin.read(1)
+                return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(c, "")
+            return "esc"
+        if ch == "\r" or ch == "\n":
+            return "enter"
+        if ch == "\x7f" or ch == "\x08":
+            return "backspace"
+        if ch == "\t":
+            return "tab"
+        if ch == "\x04":  # ctrl-D closes like q
+            return "close"
+        return ch
+
+    def _mcp_catalog_install(self, state) -> None:
+        """The confirm card's 'install' action: explicit confirmation (the
+        card already required a literal armed 'y'; the broker offer or tty
+        y/N below is the session-level gate), then the management.py write
+        path and a live connection test feeding the result card."""
+        import time as _time
+
+        from .mcp.catalog import ConnectedInfo
+        from .mcp.config import McpError, parse_servers
+        from .mcp.discover import fetch_server, package_to_entry
+        from .mcp.management import install_from_registry, test_connection
+
+        name = state.target.name
+        # the session-level confirmation: broker offer, or tty y/N. Offers
+        # stay manual in every auto-approve mode by design; never default yes.
+        broker = self.runner.ctx.broker
+        if broker is not None:
+            approved, feedback = broker.request({
+                "kind": "offer",
+                "question": f"Install MCP server '{name}' from the registry? "
+                            f"It will run as a local subprocess.",
+            })
+            answer = feedback.strip().lower() if approved else ""
+        elif getattr(sys.stdin, "isatty", lambda: False)():
+            try:
+                answer = input("install this server? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+        else:
+            answer = ""
+        if answer not in ("y", "yes"):
+            state.view = "detail"
+            return
+        try:
+            entry, warnings = install_from_registry(
+                name, self.runner.ctx.repo_root, scope="project", confirm=True)
+        except McpError as e:
+            state.result = {"ok": False, "why": str(e), "fix": [], "log": []}
+            state.view = "result"
+            return
+        for w in warnings:
+            print(f"warning: {w}")
+        # live connection test for the result card
+        try:
+            spec = parse_servers({"servers": {name: entry}},
+                                 self.runner.ctx.repo_root, "project")[0]
+        except McpError as e:
+            state.result = {"ok": False, "why": str(e), "fix": [], "log": []}
+            state.view = "result"
+            return
+        started = _time.time()
+        ok, tools, err, log = test_connection(spec)
+        ms = int((_time.time() - started) * 1000)
+        if ok:
+            sample = [t.get("name", "?") for t in tools[:3]]
+            if len(tools) > 3:
+                sample.append(f"+{len(tools) - 3}")
+            state.result = {"ok": True, "ms": ms, "tools": len(tools),
+                            "sample": sample}
+            state.connected = [ConnectedInfo(name, True, len(tools))]
+        else:
+            fix = []
+            if any("$" in v for v in entry.get("env", {}).values()):
+                fix.append("export the required environment variable, then press r to retry")
+            fix.append("run the launch command in a shell to see the full output")
+            state.result = {"ok": False, "why": err, "fix": fix, "log": log[-5:]}
+        state.view = "result"
+
+    def _mcp_catalog_remove(self, state) -> None:
+        """The result card's 'x' action: remove the failed server from
+        mcp.json through the same writer the CLI uses."""
+        from .mcp.config import McpError
+        from .mcp.management import remove_server
+
+        name = state.target.name
+        try:
+            remove_server(name, self.runner.ctx.repo_root, scope="project")
+            state.result = {"ok": True, "removed": True}
+            state.connected = [c for c in state.connected if c.name != name]
+        except McpError as e:
+            state.result = {"ok": False, "why": str(e), "fix": [], "log": []}
+        state.view = "result"
 
     def _sessions_dir(self) -> Path:
         """Location of all past session directories: run_dir is

@@ -5,7 +5,12 @@ import json
 import httpx
 import pytest
 
-from bird.llm.ollama import DEFAULT_API_KEY_ENV, Ollama, OllamaError
+from bird.llm.ollama import (
+    DEFAULT_API_KEY_ENV,
+    DEFAULT_PULL_TIMEOUT_SECONDS,
+    Ollama,
+    OllamaError,
+)
 
 
 @pytest.fixture
@@ -186,3 +191,84 @@ def test_pull_401_with_key_says_rejected():
         assert "authentication required" not in str(exc.value)
     finally:
         o.close()
+
+
+def test_pull_sends_a_timeout():
+    """pull() used to pass timeout=None: a daemon that accepted the request and
+    then went quiet left the socket open with nothing arriving and nothing ever
+    raising — the same indefinite hang the wire adapter's read timeout exists
+    to kill. The per-request timeout must be set (and generous: a multi-GB pull
+    on a slow link is legitimate, the daemon streams progress the whole way)."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content="\n".join(
+                [json.dumps({"status": "pulling manifest"}), json.dumps({"status": "success"})]
+            ).encode(),
+        )
+
+    o = Ollama(timeout=5.0)
+    real_stream = o._http.stream
+
+    def spy_stream(method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return real_stream(method, url, **kwargs)
+
+    o._http.stream = spy_stream  # type: ignore[method-assign]
+    o._http._transport = httpx.MockTransport(handler)  # type: ignore[attr-defined]
+    try:
+        o.pull("qwen2.5:7b")
+        assert captured["timeout"] == DEFAULT_PULL_TIMEOUT_SECONDS
+        assert captured["timeout"] == 300
+    finally:
+        o.close()
+
+
+# --- context_length: /api/show ------------------------------------------
+
+
+def _show_client(reply) -> Ollama:
+    """An Ollama whose /api/show answers `reply` (a JSON body, an HTTP status,
+    or an exception to raise)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/show"
+        assert json.loads(request.content) == {"model": "qwen3.8:27b-mlx"}
+        if isinstance(reply, Exception):
+            raise reply
+        if isinstance(reply, int):
+            return httpx.Response(reply)
+        return httpx.Response(200, json=reply)
+
+    o = Ollama(timeout=5.0)
+    o._http._transport = httpx.MockTransport(handler)  # type: ignore[attr-defined]
+    return o
+
+
+def test_context_length_reads_the_architectures_limit():
+    o = _show_client(
+        {
+            "parameters": "temperature                    1\ntop_k                          20",
+            "model_info": {"general.architecture": "qwen3_5", "qwen3_5.context_length": 262144},
+        }
+    )
+    assert o.context_length("qwen3.8:27b-mlx") == 262144
+
+
+def test_context_length_prefers_a_modelfile_num_ctx():
+    # a Modelfile num_ctx is what the daemon actually loads the model at
+    o = _show_client(
+        {
+            "parameters": "num_ctx                        16384\ntemperature                    1",
+            "model_info": {"qwen3_5.context_length": 262144},
+        }
+    )
+    assert o.context_length("qwen3.8:27b-mlx") == 16384
+
+
+def test_context_length_is_none_when_the_daemon_cannot_say():
+    assert _show_client(404).context_length("qwen3.8:27b-mlx") is None
+    assert _show_client({"model_info": {"general.architecture": "x"}}).context_length("qwen3.8:27b-mlx") is None
+    assert _show_client(httpx.ConnectError("refused")).context_length("qwen3.8:27b-mlx") is None

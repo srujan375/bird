@@ -4,7 +4,13 @@ from pytest_httpx import IteratorStream
 
 from bird.llm.registry import ModelSpec, ProviderConfig
 from bird.llm.types import Message, ToolSpec
-from bird.llm.wire.openai_compat import MAX_TRANSPORT_ATTEMPTS, OpenAICompatClient, WireError
+from bird.llm.wire.openai_compat import (
+    CONNECT_TIMEOUT,
+    DEFAULT_READ_TIMEOUT,
+    MAX_TRANSPORT_ATTEMPTS,
+    OpenAICompatClient,
+    WireError,
+)
 
 
 @pytest.fixture
@@ -202,6 +208,28 @@ def test_exhausts_retries(client, spec, httpx_mock):
         client.complete(spec, [Message(role="user", content="x")])
 
 
+def test_retry_is_reported_to_the_caller(client, spec, httpx_mock):
+    """Transport retries used to happen in silence, between "the model was
+    asked" and "the model answered" — so a provider that went quiet was
+    indistinguishable from a slow one and the UI held a spinner for the whole
+    retry budget with nothing to render."""
+    httpx_mock.add_response(status_code=503)
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    seen = []
+    resp = client.complete(spec, [Message(role="user", content="x")], on_retry=seen.append)
+    assert resp.message.content == "ok"
+    assert len(seen) == 1
+    assert seen[0]["attempt"] == 1 and seen[0]["max_attempts"] == MAX_TRANSPORT_ATTEMPTS
+    assert seen[0]["delay"] > 0 and "503" in seen[0]["reason"]
+
+
+def test_retry_reporting_is_optional(client, spec, httpx_mock):
+    """No on_retry (library use, every test fake) must stay a silent no-op."""
+    httpx_mock.add_response(status_code=503)
+    httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
+    assert client.complete(spec, [Message(role="user", content="x")]).message.content == "ok"
+
+
 def test_connection_error_retried(client, spec, httpx_mock):
     httpx_mock.add_exception(httpx.ConnectError("refused"))
     httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
@@ -365,3 +393,131 @@ def test_abort_flag_sticks_until_cleared(client, spec, httpx_mock):
     client.clear_abort()
     httpx_mock.add_response(json=completion_body({"role": "assistant", "content": "ok"}))
     assert client.complete(spec, [Message(role="user", content="hi")]).message.content == "ok"
+
+
+def test_abort_reason_records_who_tore_the_request_down(client, spec, httpx_mock):
+    """Both causes raise WireAborted; the reason is what lets the runner — and
+    any log line — tell a user cancel from a watchdog expiry. A bare
+    "aborted" is how the silent design-session hang stayed undiagnosable."""
+    from bird.llm.wire.openai_compat import WireAborted
+
+    client.abort()  # serve.py's interrupt path: no reason given
+    assert client.abort_reason == "user"
+    with pytest.raises(WireAborted, match=r"aborted \(user\)"):
+        client.complete(spec, [Message(role="user", content="hi")], on_delta=lambda c: None)
+    client.clear_abort()
+    assert client.abort_reason is None
+
+    client.abort(reason="watchdog")  # the runner's turn budget
+    assert client.abort_reason == "watchdog"
+    with pytest.raises(WireAborted, match="watchdog"):
+        client.complete(spec, [Message(role="user", content="hi")], on_delta=lambda c: None)
+
+
+def test_stream_retry_names_the_timeout_that_caused_it(client, spec, httpx_mock):
+    """A stalled provider surfaces as httpx.ReadTimeout, which stringifies to
+    nothing — the report read "connection error: " and named no cause. The
+    class name IS the diagnosis, so it goes in the reason."""
+    httpx_mock.add_exception(httpx.ReadTimeout(""))
+    httpx_mock.add_response(
+        stream=sse(delta_chunk({"content": "ok"}, finish_reason="stop")),
+        headers={"content-type": "text/event-stream"},
+    )
+    seen = []
+    resp = client.complete(
+        spec,
+        [Message(role="user", content="x")],
+        on_delta=lambda c: None,
+        on_retry=seen.append,
+    )
+    assert resp.message.content == "ok"
+    assert len(seen) == 1 and "ReadTimeout" in seen[0]["reason"]
+
+
+def test_read_waits_longer_than_connect_does():
+    """One flat 300s budget meant a queued request cost five silent minutes per
+    attempt, and MAX_TRANSPORT_ATTEMPTS of those before any error surfaced. A
+    connect that slow is broken; only the wait for tokens stays generous."""
+    c = OpenAICompatClient()
+    try:
+        t = c._http.timeout
+        assert t.read == DEFAULT_READ_TIMEOUT
+        assert t.connect == CONNECT_TIMEOUT < t.read
+    finally:
+        c.close()
+    # the caller-facing knob is the read budget
+    c2 = OpenAICompatClient(timeout=45.0)
+    try:
+        assert c2._http.timeout.read == 45.0
+        assert c2._http.timeout.connect == CONNECT_TIMEOUT
+    finally:
+        c2.close()
+
+
+def test_stream_tool_call_arguments_are_delivered_as_they_arrive(client, spec, httpx_mock):
+    """The design page draws an artboard while the model is still writing it,
+    so a tool call's arguments have to leave the wire fragment by fragment
+    rather than whole with the message. Each fragment names the call's slot and
+    the function as far as it has been announced, and the fragments concatenate
+    to exactly the arguments_json the parsed message ends up carrying."""
+    httpx_mock.add_response(
+        stream=sse(
+            delta_chunk({"tool_calls": [{"index": 0, "id": "c1",
+                                          "function": {"name": "design_create", "arguments": ""}}]}),
+            delta_chunk({"tool_calls": [{"index": 0, "function": {"arguments": '{"html": "<h1>'}}]}),
+            delta_chunk({"tool_calls": [{"index": 0, "function": {"arguments": 'Hi</h1>"}'}}]}),
+            delta_chunk({"tool_calls": [{"index": 1, "id": "c2",
+                                          "function": {"name": "design_status", "arguments": "{}"}}]}),
+            delta_chunk({}, finish_reason="tool_calls"),
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
+    seen = []
+    resp = client.complete(
+        spec, [Message(role="user", content="x")],
+        on_delta=lambda c: None, on_tool_delta=lambda i, n, a: seen.append((i, n, a)),
+    )
+    assert seen == [
+        (0, "design_create", ""),
+        (0, "design_create", '{"html": "<h1>'),
+        (0, "design_create", 'Hi</h1>"}'),
+        (1, "design_status", "{}"),
+    ]
+    calls = resp.message.tool_calls
+    assert "".join(a for i, _, a in seen if i == 0) == calls[0].arguments_json
+    assert calls[0].arguments == {"html": "<h1>Hi</h1>"}
+    assert calls[1].name == "design_status"
+
+
+def test_stream_without_on_tool_delta_is_unchanged(client, spec, httpx_mock):
+    """A caller that never asked for fragments (the TUI, the plain REPL) sees
+    the message exactly as before: the arguments arrive whole."""
+    httpx_mock.add_response(
+        stream=sse(
+            delta_chunk({"tool_calls": [{"index": 0, "id": "c1",
+                                          "function": {"name": "read", "arguments": '{"pa'}}]}),
+            delta_chunk({"tool_calls": [{"index": 0, "function": {"arguments": 'th": "a.py"}'}}]}),
+            delta_chunk({}, finish_reason="tool_calls"),
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
+    resp = client.complete(spec, [Message(role="user", content="x")], on_delta=lambda c: None)
+    assert resp.message.tool_calls[0].arguments == {"path": "a.py"}
+
+
+def test_stream_drop_after_a_tool_fragment_is_not_retried(client, spec, httpx_mock):
+    """A fragment shown on a page is delivered: restarting the stream would
+    draw the same artboard twice, so a drop after one is a hard error."""
+    import json as _json
+
+    def body():
+        yield f"data: {_json.dumps(delta_chunk({'tool_calls': [{'index': 0, 'id': 'c1', 'function': {'name': 'design_create', 'arguments': '<'}}]}))}\n\n".encode()
+        raise httpx.ReadError("dropped")
+
+    httpx_mock.add_response(stream=IteratorStream(body()), headers={"content-type": "text/event-stream"})
+    with pytest.raises(WireError, match="dropped mid-response"):
+        client.complete(
+            spec, [Message(role="user", content="x")],
+            on_delta=lambda c: None, on_tool_delta=lambda i, n, a: None,
+        )
+    assert len(httpx_mock.get_requests()) == 1

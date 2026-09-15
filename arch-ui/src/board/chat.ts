@@ -1,32 +1,28 @@
 import { useSyncExternalStore } from "react";
+import { openingValue, optionAt, type PickerPayload } from "./picker";
 import type { Attachment } from "./types";
 
 /** The thread, as data.
  *
  *  Every turn the architect takes is one block: some lines, optionally a
- *  question with reply chips, optionally the single quiet line its board
- *  machinery is allowed. */
-
-export interface AskOption {
-  label: string;
-  /** the one-line consequence of taking this row */
-  cost?: string;
-  rec?: boolean;
-  favor?: "a" | "b";
-  act?: string;
-  /** re-ask instead of advancing — "show me the numbers first" */
-  stay?: boolean;
-  reply: string[];
-}
+ *  question with a picker under it, optionally the single quiet line its
+ *  board machinery is allowed. */
 
 export interface AskBlock {
-  question: string;
-  opts: AskOption[];
+  /** what the harness sent — the question, its rows, and how to confirm it */
+  picker: PickerPayload;
+  /** the row the radio group has checked, before it is confirmed. Selecting
+   *  is not answering: the confirm button is, which is the whole point of the
+   *  component. */
+  selected: string;
   spent: boolean;
   pickedLabel?: string;
+  /** the value behind pickedLabel, so a re-opened question opens on it */
+  pickedValue?: string;
   /** answered in prose — no row was taken as-is, so none may claim it was */
   answeredInMessage?: boolean;
-  onPick: (o: AskOption) => void;
+  /** picked while the architect was still writing: sent when the turn ends */
+  queued?: boolean;
 }
 
 export interface BoardLine {
@@ -48,7 +44,13 @@ export type Turn =
        *  it was. */
       about?: string[] }
   | { t: "quiet"; id: number; text: string }
-  | { t: "thinking"; id: number };
+  /** a longer piece from the model's machinery — a critique, a report —
+   *  folded under its title so it can be read without taking the thread over */
+  | { t: "card"; id: number; title: string; text: string }
+  | { t: "thinking"; id: number }
+  /** the research turn: what the architect is doing, one line per kind of
+   *  work, in place of the thinking dots and kept afterwards as the record */
+  | { t: "progress"; id: number; steps: { step: string; text: string; done: boolean }[] };
 
 export interface ChatState {
   turns: Turn[];
@@ -112,6 +114,10 @@ export function quiet(text: string): number {
   return push({ t: "quiet", id: nextTurnId(), text });
 }
 
+export function card(title: string, text: string): number {
+  return push({ t: "card", id: nextTurnId(), title, text });
+}
+
 /** An empty host block, for a turn that is only a question. */
 export function block(): number {
   return push({ t: "say", id: nextTurnId(), lines: [] });
@@ -121,27 +127,67 @@ export function boardLine(host: number, text: string, ids: string[]) {
   patchTurn(host, { line: { text, ids } } as Partial<Turn>);
 }
 
-export function ask(host: number, question: string, opts: AskOption[], onPick: (o: AskOption) => void) {
+/** Put a question on the table, under the turn that raised it. */
+export function ask(host: number, picker: PickerPayload) {
   patchTurn(host, {
-    ask: { question, opts, spent: false, onPick },
+    ask: { picker, selected: openingValue(picker), spent: false },
   } as Partial<Turn>);
-  setChat({ pendingAsk: question });
+  setChat({ pendingAsk: picker.id });
 }
 
-export function spendAsk(host: number, pickedLabel: string) {
+/** Move the checked row. Held here rather than in the component so the digit
+ *  shortcuts, which fire from anywhere on the page, and the radio group are
+ *  moving the same thing. */
+export function selectAsk(host: number, value: string) {
+  const turn = state.turns.find((t) => t.id === host);
+  if (!turn || turn.t !== "say" || !turn.ask || turn.ask.spent || turn.ask.queued) return;
+  patchTurn(host, { ask: { ...turn.ask, selected: value } } as Partial<Turn>);
+}
+
+export function spendAsk(host: number, pickedLabel: string, pickedValue?: string) {
   const turn = state.turns.find((t) => t.id === host);
   if (!turn || turn.t !== "say" || !turn.ask) return;
-  patchTurn(host, { ask: { ...turn.ask, spent: true, pickedLabel } } as Partial<Turn>);
+  patchTurn(host, { ask: { ...turn.ask, spent: true, queued: false, pickedLabel, pickedValue } } as Partial<Turn>);
   setChat({ pendingAsk: null });
 }
 
-/** The question still on the table, if any. Global shortcuts answer with this. */
-export function openAsk(): AskBlock | null {
+/** A row taken while the architect is still writing. The harness parks the
+ *  answer until the turn ends, so the dock says so rather than collapsing a
+ *  question that has not actually been answered yet. `spendAsk` on the
+ *  turn the answer starts is what settles it. */
+export function queueAsk(host: number, pickedLabel: string, pickedValue: string) {
+  const turn = state.turns.find((t) => t.id === host);
+  if (!turn || turn.t !== "say" || !turn.ask || turn.ask.spent) return;
+  patchTurn(host, { ask: { ...turn.ask, selected: pickedValue, queued: true, pickedLabel, pickedValue } } as Partial<Turn>);
+}
+
+/** Put an answered question back on the table — they pressed Change. It
+ *  opens on the row they took, so changing your mind is one click, not two. */
+export function reopenAsk(host: number) {
+  const turn = state.turns.find((t) => t.id === host);
+  if (!turn || turn.t !== "say" || !turn.ask || !turn.ask.spent) return;
+  const value = turn.ask.pickedValue ?? "";
+  const { pickedLabel: _l, pickedValue: _v, answeredInMessage: _m, ...rest } = turn.ask;
+  patchTurn(host, {
+    ask: { ...rest, spent: false, selected: optionAt(turn.ask.picker, value) ? value : rest.selected },
+  } as Partial<Turn>);
+  setChat({ pendingAsk: turn.ask.picker.id });
+}
+
+/** The question still on the table, and the turn holding it. Global shortcuts
+ *  answer with this. */
+export function openAsk(): { host: number; ask: AskBlock } | null {
   for (let i = state.turns.length - 1; i >= 0; i--) {
     const t = state.turns[i];
-    if (t.t === "say" && t.ask && !t.ask.spent) return t.ask;
+    if (t.t === "say" && t.ask && !t.ask.spent) return { host: t.id, ask: t.ask };
   }
   return null;
+}
+
+/** Whether this picker is already in the thread — the harness re-pushes its
+ *  whole state on every change, and a question is asked once. */
+export function hasAsk(id: string): boolean {
+  return state.turns.some((t) => t.t === "say" && t.ask?.picker.id === id);
 }
 
 /** A question settled without a pick — typed instead. Rows stay as the record

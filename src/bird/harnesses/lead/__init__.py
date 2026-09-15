@@ -25,7 +25,7 @@ from ...tools import (
     WebFetchTool,
     WebSearchTool,
 )
-from .tools import ArchitectTool, CodeTool
+from .tools import ArchitectTool, CodeTool, DesignTool
 
 INSTRUCTIONS_PATH = Path(__file__).with_name("instructions.md")
 
@@ -41,13 +41,13 @@ EXPLORE_NUDGE = (
 
 
 def lead_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool]:
-    """The lead's toolset: read-only exploration + research + the two dispatch
-    tools + done. No edit/write/bash — code changes are dispatched, never made
-    by the lead itself."""
+    """The lead's toolset: read-only exploration + research + the three dispatch
+    tools (architect, design, code) + done. No edit/write/bash — code changes
+    are dispatched, never made by the lead itself."""
     tools: list[Tool] = [ReadTool(), ReadImageTool(), LsTool()]
     if with_kg:
         tools.append(KgQueryTool())
     if with_web:
         tools.extend([WebSearchTool(), WebFetchTool()])
-    tools.extend([SkillTool(), ArchitectTool(), CodeTool(), DoneTool()])
+    tools.extend([SkillTool(), ArchitectTool(), DesignTool(), CodeTool(), DoneTool()])
     return tools

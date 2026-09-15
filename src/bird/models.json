@@ -123,6 +123,7 @@
   "aliases": {
     "default": "ollama:glm-5.3:cloud",
     "architect": "ollama:kimi-k3:cloud",
+    "designer": "ollama:glm-5.3-flash:cloud",
     "compactor": "ollama:gemma4:31b-cloud",
     "vision": "ollama:kimi-k2.7-code:cloud",
     "kg": "ollama:kimi-k2.7-code:cloud"

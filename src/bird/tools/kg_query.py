@@ -54,6 +54,7 @@ class KgQueryTool(Tool):
                 "question": question,
                 "hits": result.hit_count,
                 "confidence": result.confidence,
+                "stale": result.stale,
                 "expanded": result.expanded_tokens,
             },
         )

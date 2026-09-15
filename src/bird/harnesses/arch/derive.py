@@ -23,6 +23,8 @@ wall of re-rendered text in the conversation is the thing this replaced.
 
 from __future__ import annotations
 
+from typing import Any
+
 from .state import COST_ORDER, ArchState, Node
 
 FRONTIER_SHOWN = 4
@@ -62,7 +64,9 @@ def askable(state: ArchState) -> list[Node]:
     is fair game.
     """
     live = state.live_approaches()
-    nodes = [n for n in state.active_nodes() if not n.existing]
+    # closed by the user — "good enough" or "not this session's problem" — is
+    # the one thing that ends a branch without the architect's say-so
+    nodes = [n for n in state.active_nodes() if not n.existing and not n.closed]
     if len(live) > 1:
         return [n for n in nodes if n.shared()]
     return nodes
@@ -74,21 +78,46 @@ def _load_bearing(state: ArchState, node: Node) -> int:
     return len(state.edges_touching(node.id))
 
 
+def frontier_struct(state: ArchState) -> dict[str, Any]:
+    """The frontier as the page shows it: the fork if one is open, the branches
+    worth walking next (most expensive-to-get-wrong first, capped), how many
+    more there are, and what the user closed. The same walk `frontier()`
+    renders for the note, so what the user sees is what the architect is
+    working from."""
+    live = state.live_approaches()
+    fork = {"approaches": [a.name for a in live]} if len(live) > 1 else None
+    candidates = [n for n in askable(state) if n.depth != "detailed"]
+    candidates.sort(key=lambda n: (COST_ORDER.get(n.kind, 9), -_load_bearing(state, n), n.id))
+    shown = candidates[:FRONTIER_SHOWN]
+    return {
+        "fork": fork,
+        "open": [
+            {
+                "id": n.id, "label": n.label, "kind": n.kind, "depth": n.depth,
+                "why": "costliest to change later" if COST_ORDER.get(n.kind, 9) <= 2 else "unelaborated",
+            }
+            for n in shown
+        ],
+        "more": len(candidates) - len(shown),
+        "closed": [
+            {"id": n.id, "label": n.label, "how": n.closed}
+            for n in state.nodes.values() if n.closed
+        ],
+    }
+
+
 def frontier(state: ArchState) -> list[str]:
     """The branches worth walking next, most expensive-to-get-wrong first."""
-    live = state.live_approaches()
+    struct = frontier_struct(state)
     out: list[str] = []
-    if len(live) > 1:
-        names = " vs ".join(a.name for a in live)
+    if struct["fork"]:
+        names = " vs ".join(struct["fork"]["approaches"])
         out.append(
             f"the fork is still open: {names}. Everything downstream of it waits on "
             "which one wins — settle it before deepening anything that isn't shared."
         )
-    candidates = [n for n in askable(state) if n.depth != "detailed"]
-    candidates.sort(key=lambda n: (COST_ORDER.get(n.kind, 9), -_load_bearing(state, n), n.id))
-    for node in candidates[:FRONTIER_SHOWN]:
-        why = "costliest to change later" if COST_ORDER.get(node.kind, 9) <= 2 else "unelaborated"
-        out.append(f"{node.id} ({node.kind}, {node.depth}) — {why}")
+    for item in struct["open"]:
+        out.append(f"{item['id']} ({item['kind']}, {item['depth']}) — {item['why']}")
     return out
 
 
@@ -194,6 +223,12 @@ def note(state: ArchState, user_edits: list[str] | None = None) -> str:
     if user_edits:
         lines.append("the user just: " + " · ".join(user_edits[:EDITS_SHOWN]))
         lines.append("  (they are drawing, not just watching — answer it)")
+
+    closed = [n for n in state.nodes.values() if n.closed]
+    if closed:
+        lines.append("closed by the user: " + " · ".join(
+            f"{n.id} ({'good enough' if n.closed == 'settled' else 'out of scope'})" for n in closed
+        ) + " — leave these alone unless they ask")
 
     waiting = state.open_questions()
     if waiting:

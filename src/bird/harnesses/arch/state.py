@@ -28,10 +28,16 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+# the picker's row, under a name that cannot be mistaken for a decision's
+# Option below — they are different things that happen to share a word
+from ..picker import Ask, Option as AskOption
+
 KINDS: tuple[str, ...] = (
     "service", "store", "queue", "api", "ui", "llm", "external", "infra", "group",
 )
 EDGE_KINDS: tuple[str, ...] = ("sync", "async", "batch")
+# how a user closes a branch; "" is open
+CLOSED_STATES: tuple[str, ...] = ("settled", "out_of_scope")
 # a two-way slider on one object, not a one-way expand
 DEPTHS: tuple[str, ...] = ("stub", "sketch", "detailed")
 STATUSES: tuple[str, ...] = ("active", "greyed")
@@ -176,6 +182,10 @@ class Node:
     # is why no tool takes them.
     x: float | None = None
     y: float | None = None
+    # The user's way of ending a branch on purpose: "" (open), "settled" (good
+    # enough, stop asking) or "out_of_scope" (not this session's problem). A
+    # closed box leaves the frontier and the architect is told why.
+    closed: str = ""
 
     def shared(self) -> bool:
         return not self.approaches
@@ -204,6 +214,10 @@ class Approach:
     summary: str = ""
     status: str = "active"
     rejected_reason: str = ""
+    # Who runs this shape and at what scale, with sources — what stops a
+    # hundred-requests-a-day app being designed like a hyperscaler. Keys:
+    # who, scale, sources (a list of urls). Empty when nobody looked.
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -264,6 +278,10 @@ class Question:
     proposal rather than starting from a blank page. A question with no
     recommendation is an interview question, and this harness does not conduct
     interviews.
+
+    `options` are the rows it is offered with. A question that has them is
+    answered by picking one, in the page's picker; one without is answered in
+    prose, in the message box. Both end up here as `answer`.
     """
 
     id: str
@@ -271,10 +289,28 @@ class Question:
     recommendation: str = ""
     answer: str = ""
     status: str = "open"
+    options: list[AskOption] = field(default_factory=list)
+    # the noun for the decision — what the answered row is labelled with once
+    # the picker collapses. "Deploy target", not the question again.
+    summary: str = ""
 
     @property
     def open(self) -> bool:
         return self.status == "open"
+
+    def as_ask(self) -> Ask:
+        """This question as a picker payload. The rows are the model's own;
+        the confirm button names the pick rather than saying "Continue"."""
+        return Ask(
+            id=self.id,
+            prompt=self.question,
+            options=list(self.options),
+            summary_label=self.summary,
+            confirm_template="Go with {v}",
+            confirm_empty="Pick an answer",
+            answer=self.answer,
+            answered=self.status == "answered",
+        )
 
 
 # ------------------------------------------------------------- the state
@@ -507,6 +543,7 @@ class ArchState:
                 summary=a.get("summary", ""),
                 status=a.get("status", "active"),
                 rejected_reason=a.get("rejected_reason", ""),
+                evidence=dict(a.get("evidence") or {}),
             )
         for nid, n in (d.get("nodes") or {}).items():
             state.nodes[nid] = Node(
@@ -529,6 +566,7 @@ class ArchState:
                 parent=n.get("parent", "") or "",
                 x=n.get("x"),
                 y=n.get("y"),
+                closed=str(n.get("closed", "") or ""),
             )
         state.edges = [
             Edge(
@@ -552,6 +590,8 @@ class ArchState:
                 id=q["id"], question=q.get("question", ""),
                 recommendation=q.get("recommendation", ""),
                 answer=q.get("answer", ""), status=q.get("status", "open"),
+                options=[AskOption.from_dict(o) for o in q.get("options", [])],
+                summary=q.get("summary", ""),
             )
             for q in d.get("questions", [])
         ]

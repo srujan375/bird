@@ -26,6 +26,24 @@ def _unverified_detail(ctx: ToolContext) -> str:
     return f"Your last passing check (`{last['command']}`) ran BEFORE these edits."
 
 
+def _record_findings(raw: Any, ctx: ToolContext) -> list[dict[str, str]]:
+    """Put the run's findings in the shared store. Best-effort: a malformed
+    entry is skipped rather than failing a `done` that is otherwise valid —
+    losing a note is a smaller harm than refusing to end a finished run."""
+    if ctx.store is None or not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        path, note = item.get("path"), item.get("note")
+        if not isinstance(path, str) or not isinstance(note, str) or not note.strip():
+            continue
+        ctx.store.note(ctx.repo_root, path, ctx.harness, note)
+        out.append({"path": path, "note": note})
+    return out
+
+
 class DoneTool(Tool):
     name = "done"
     # Schema text is per-turn context for every turn (decision #6), so the
@@ -42,6 +60,22 @@ class DoneTool(Tool):
             "unverified_reason": {
                 "type": "string",
                 "description": "Why, if no check covers the change",
+            },
+            "findings": {
+                "type": "array",
+                "description": (
+                    "What the NEXT session would otherwise have to rediscover: "
+                    "per file, the one fact about it that cost you a read to learn."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["path", "note"],
+                    "additionalProperties": False,
+                },
             },
         },
         "required": ["summary"],
@@ -91,4 +125,10 @@ class DoneTool(Tool):
             )
             details["unverified"] = {"paths": list(paths), "reason": reason}
 
+        # The run is already stopping to summarize, so harvesting findings here
+        # costs no extra turn — which is the whole reason they hang off `done`
+        # rather than a tool of their own that a model has to remember to call.
+        recorded = _record_findings(args.get("findings"), ctx)
+        if recorded:
+            details["findings"] = recorded
         return ToolResult(output=args["summary"], details=details)

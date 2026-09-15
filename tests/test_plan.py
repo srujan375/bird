@@ -22,7 +22,7 @@ class FakeClient:
         self.script = list(script)
         self.requests = []  # message lists as seen at each completion
 
-    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None):
+    def complete(self, spec, messages, tools=None, temperature=None, max_tokens=None, on_delta=None, on_thinking=None, **kwargs):
         self.requests.append(list(messages))
         msg = self.script.pop(0)
         return LLMResponse(message=msg, usage=Usage(100, 10), stop_reason="stop", model=spec.spec)
@@ -316,7 +316,31 @@ def test_runner_plan_aware_explore_nudge(make_runner):
     assert result.status == "done"
     nudges = [
         m for m in result.messages
-        if m.role == "user" and "Edit or write its listed files NOW" in (m.content or "")
+        if m.role == "user" and "If you know what to change, edit now" in (m.content or "")
     ]
     assert len(nudges) == 1
     assert "step 1: One" in nudges[0].content and "f.py" in nudges[0].content
+
+
+
+def test_plan_accepts_a_check_only_step_and_extra_keys(ctx):
+    """41 logged plan calls were rejected by validation and retried: 30 for a
+    verify step with `files: []`, the rest for a `summary` / `files_note` key
+    the model added. Two retries then abort, on the one call nothing proceeds
+    without."""
+    import json
+
+    from bird.llm.types import ToolCall
+    from bird.llm.validate import validate_tool_call
+
+    steps = {"steps": [
+        {"title": "Edit the store", "files": ["src/store.py"], "note": "keep the old key"},
+        {"title": "Run the suite", "files": [], "summary": "pytest -q"},
+    ]}
+    call = ToolCall("1", "plan", steps, json.dumps(steps))
+    assert validate_tool_call(call, {"plan": PlanTool().spec()}) is None  # the wire accepts it
+    r = PlanTool().execute(steps, ctx)
+    assert not r.is_error, r.output
+    assert "no files (a check-only step)" in r.output
+    assert "(keep the old key)" in r.output
+    assert ctx.plan.steps[1].files == [] and ctx.plan.steps[1].affected == []

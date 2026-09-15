@@ -1,0 +1,276 @@
+/* The Workbench, on top of arch's board.css: its tokens, its 52px bar and
+   400px chat rail, its dotted board and floating docks, its picker and
+   composer. Only what the design board needs beyond that lives here. */
+
+/* ─── shell ───────────────────────────────────────────────────────────── */
+:root{ --lrail: 300px; }
+/* the left rail and the board share the column the chat leaves. The rail is
+   there only while something is selected (or the design is finalized); the
+   grid slides it in and out. */
+.work{
+  display:grid; grid-template-columns:var(--lrail) minmax(0,1fr); min-width:0; min-height:0;
+  transition:grid-template-columns .32s var(--ease-in-out);
+}
+.work[data-rail="off"]{ grid-template-columns:0 minmax(0,1fr); }
+.work[data-rail="off"] .rail{ padding-left:0; padding-right:0; border-right:0; overflow:hidden; }
+.appbar .brand{ display:flex; align-items:center; gap:9px; min-width:0; }
+.appbar .goal{ flex:none; }
+
+/* the session's state, on arch's categorical ramp */
+.pill{
+  display:inline-flex; align-items:center; gap:6px; padding:2px 9px; border-radius:999px;
+  font-size:10.5px; font-weight:600; letter-spacing:.08em; text-transform:uppercase;
+  background:var(--fg-soft); color:var(--ink-2); border:1px solid transparent; white-space:nowrap;
+}
+.pill::before{ content:""; width:5px; height:5px; border-radius:50%; background:currentColor; }
+.pill[data-status="asking"],
+.pill[data-status="generating"]{ background:oklch(97.5% 0.018 95);  border-color:oklch(69% 0.075 95 / .55);  color:oklch(45% 0.09 95); }
+.pill[data-status="ready"]     { background:oklch(97.5% 0.018 168); border-color:oklch(69% 0.075 168 / .55); color:oklch(45% 0.09 168); }
+.pill[data-status="showcase"]  { background:oklch(97.5% 0.018 250); border-color:oklch(69% 0.075 250 / .55); color:oklch(45% 0.09 250); }
+.pill[data-status="finalized"] { background:oklch(97.5% 0.018 302); border-color:oklch(69% 0.075 302 / .55); color:oklch(45% 0.09 302); }
+
+.bar-btn:disabled{ opacity:.4; cursor:default; }
+.bar-btn:disabled:hover{ background:none; color:var(--ink-2); }
+.bar-btn.finalize{ background:var(--accent); border-color:var(--accent); color:var(--surface); font-weight:500; }
+.bar-btn.finalize:hover:not(:disabled){ background:var(--accent-ink); border-color:var(--accent-ink); color:var(--surface); }
+.bar-btn.finalize:disabled{ background:none; border-color:transparent; color:var(--ink-2); }
+/* armed: the second click is the one that closes the session */
+.bar-btn.finalize.armed{ background:oklch(45% 0.09 302); border-color:oklch(45% 0.09 302); color:var(--surface); }
+.bar-btn.finalize.armed:hover:not(:disabled){ background:oklch(40% 0.1 302); border-color:oklch(40% 0.1 302); }
+.appbar .sub{ overflow:hidden; text-overflow:ellipsis; max-width:38vw; }
+
+/* ─── the rail ────────────────────────────────────────────────────────── */
+.rail{
+  display:flex; flex-direction:column; gap:14px; padding:14px 14px 16px; min-width:0;
+  border-right:1px solid var(--border); background:var(--bg);
+  overflow-y:auto; scrollbar-width:thin;
+}
+.sect{ flex:none; display:flex; flex-direction:column; gap:7px; }
+.sect-head{ display:flex; align-items:center; justify-content:space-between; gap:8px; min-width:0; }
+.lbl{ font-size:10.5px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-2); }
+.lbl.light{ font-weight:400; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.rail-empty{
+  padding:12px; border-radius:var(--r); border:1px dashed var(--border);
+  color:var(--ink-2); font-size:12.5px; line-height:1.5;
+}
+.rail-note{ margin:0; font-size:11.5px; line-height:1.5; color:var(--ink-2); }
+
+.layers{ display:flex; flex-direction:column; gap:1px; }
+.layer{
+  display:grid; grid-template-columns:14px minmax(0,1fr) auto; align-items:center; gap:5px;
+  min-height:25px; padding:0 7px 0 calc(6px + var(--depth, 0) * 14px); border-radius:6px; color:var(--ink-2);
+}
+.layer:hover{ background:var(--fg-soft); }
+.layer.on{ background:var(--accent-dim); }
+.layer .fold{
+  width:14px; height:14px; display:grid; place-items:center; border-radius:4px;
+  color:var(--muted); font-size:9px; line-height:1; transition:transform .15s var(--ease-in-out), color .15s;
+}
+.layer .fold:hover{ color:var(--fg); background:var(--fg-hair); }
+.layer .fold[aria-expanded="true"]{ transform:rotate(90deg); }
+.layer .fold-space{ width:14px; }
+.layer .pick{ display:flex; align-items:baseline; gap:6px; min-width:0; text-align:left; padding:3px 0; font-size:12.5px; line-height:1.35; }
+.layer .nm{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); }
+.layer.branch .nm{ font-weight:500; color:var(--ink-2); }
+.layer.on .nm{ color:var(--accent-ink); font-weight:600; }
+.layer .sum{ font-size:11px; color:var(--muted); white-space:nowrap; flex:none; }
+.layer .tag{ font-size:10px; color:var(--muted); white-space:nowrap; }
+.layer.on .tag{ color:var(--accent-ink); opacity:.7; }
+
+.insp-head{ display:flex; align-items:center; gap:8px; }
+.insp-head .kind{ font-size:13px; font-weight:500; color:var(--fg); }
+.insp-head .tag{ font-size:11.5px; padding:1px 6px; border-radius:4px; background:var(--fg-soft); }
+.insp-head .leaf{ margin-left:auto; font-size:10.5px; color:var(--ink-2); }
+.kv{ display:grid; grid-template-columns:76px minmax(0,1fr); gap:5px 10px; align-items:center; }
+.kv .k{ font-size:11.5px; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.fld{
+  min-width:0; width:100%; padding:3px 7px; border:1px solid var(--border); border-radius:6px;
+  background:var(--surface); color:var(--fg); font-family:var(--font-mono); font-size:11.5px;
+}
+.fld:focus{ outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-dim); }
+.fld:disabled{ background:var(--bg); color:var(--ink-2); }
+.fld::placeholder{ color:var(--muted); }
+.insp-actions{ display:flex; gap:6px; }
+.insp-actions button{
+  flex:1; padding:5px 10px; border:1px solid var(--border); border-radius:7px;
+  background:var(--surface); color:var(--ink-2); font-size:11.5px;
+}
+.insp-actions button:hover{ background:var(--fg-soft); color:var(--fg); }
+.insp-actions button.icon{ flex:none; width:28px; padding:5px 0; }
+
+.history{ display:flex; flex-direction:column; gap:1px; font-size:11px; }
+.history .ver{ display:flex; align-items:center; gap:8px; padding:3px 7px; border-radius:5px; color:var(--ink-2); }
+.history .ver.cur{ background:var(--fg-soft); }
+.history .ver.cur .id{ color:var(--fg); }
+.history .ver::before{ content:""; width:5px; height:5px; border-radius:50%; background:var(--fg); flex:none; }
+.history .ver[data-by="ai"]::before{ background:var(--accent); }
+.history .ver[data-by=""]::before{ background:var(--border); }
+.history .op{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.history .who{ margin-left:auto; flex:none; }
+.history .ver[data-by="ai"] .who{ color:var(--accent-ink); }
+
+.handoff{
+  display:flex; flex-direction:column; gap:9px; padding:11px 12px;
+  border-radius:var(--r); background:var(--surface); border:1px solid var(--border);
+}
+.handoff .file{ display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--fg); }
+.handoff .file svg{ color:var(--ink-2); flex:none; }
+.handoff .rule{ height:1px; background:var(--border); }
+.handoff .facts{ display:flex; flex-direction:column; gap:4px; font-size:10.5px; color:var(--ink-2); line-height:1.5; }
+.handoff .facts span{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.next{
+  display:flex; align-items:center; gap:9px; padding:11px 12px; border-radius:var(--r);
+  background:oklch(97.5% 0.018 302); border:1px solid oklch(69% 0.075 302 / .5);
+  font-size:12.5px; line-height:1.45; color:var(--fg);
+}
+.next svg{ color:oklch(69% 0.075 302); flex:none; }
+.next b{ font-weight:600; }
+
+/* ─── the board ───────────────────────────────────────────────────────── */
+/* the board owns every gesture on itself: trackpad pinch must zoom the
+   canvas, never the browser page */
+.viewport{ touch-action:none; cursor:grab; }
+.viewport[data-panning="1"]{ cursor:grabbing; }
+.world{ width:0; height:0; }
+
+.frame{ position:absolute; top:0; left:0; }
+.frame-name{
+  position:absolute; bottom:100%; left:0; margin-bottom:7px; transform-origin:0 100%;
+  display:flex; align-items:center; gap:7px; padding:0 0 0 1px;
+  font-size:11.5px; font-weight:500; color:var(--ink-2); white-space:nowrap; user-select:none;
+  background:none; border:0; text-align:left;
+}
+button.frame-name{ cursor:pointer; }
+button.frame-name:hover .nm{ color:var(--fg); }
+.frame.on > .frame-name{ color:var(--accent-ink); }
+.frame.chosen > .frame-name{ color:oklch(45% 0.09 302); }
+.frame-name .v{ font-size:10px; color:oklch(72% 0.012 250); }
+.frame-name .tick{ font-size:10px; color:oklch(45% 0.09 302); }
+/* the right end of the name row: the critic's note, if there is one, and the
+   card's delete control. Delete is two-step: the first click arms it
+   ("Delete?"), the second confirms — the arm decays after a moment, so a
+   stray click cannot take a card away. The pump refuses mid-turn deletes and
+   the page offers the control only between turns. */
+.frame-tools{
+  position:absolute; bottom:100%; right:0; margin-bottom:7px;
+  display:flex; align-items:center; gap:5px; transform-origin:100% 100%;
+}
+.frame-del,.frame-crit{
+  padding:1px 7px; border-radius:999px; border:1px solid var(--border);
+  background:color-mix(in oklch, var(--surface) 92%, transparent);
+  color:var(--ink-2); font-size:10px; font-weight:500; line-height:1.5;
+  cursor:pointer; white-space:nowrap; user-select:none;
+}
+.frame-del:hover,.frame-crit:hover{ color:var(--fg); }
+.frame-del.armed{
+  background:oklch(45% 0.09 302); border-color:oklch(45% 0.09 302); color:var(--surface);
+}
+.frame-crit{ border-color:oklch(69% 0.075 95 / .6); color:oklch(45% 0.09 95); background:oklch(97.5% 0.018 95 / .92); }
+.frame-crit.open{ background:oklch(45% 0.09 95); border-color:oklch(45% 0.09 95); color:var(--surface); }
+.frame-crit.stale{ border-style:dashed; opacity:.75; }
+/* the note itself, over the top of the artboard it is about */
+.crit-card{
+  position:absolute; top:8px; right:8px; z-index:5; width:340px; max-height:60%;
+  display:flex; flex-direction:column; transform-origin:100% 0;
+  border:1px solid var(--border); border-radius:10px;
+  background:color-mix(in oklch, var(--surface) 96%, transparent); backdrop-filter:blur(8px);
+  box-shadow:0 8px 28px oklch(18% 0.012 250 / .14);
+}
+.crit-head{ display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 8px 6px 12px; }
+.crit-x{ width:22px; height:22px; border-radius:6px; color:var(--ink-2); font-size:11px; }
+.crit-x:hover{ background:var(--fg-soft); color:var(--fg); }
+.crit-body{ overflow-y:auto; padding:0 12px 12px; font-size:12.5px; line-height:1.55; color:var(--fg); scrollbar-width:thin; }
+/* handing over: the frame's document is loading behind a see-through card,
+   the draft it replaces still showing underneath; the poster carries no
+   chrome of its own and sits below the frame */
+.frame.handing-over iframe{ background:transparent; box-shadow:none; }
+.frame.poster{ z-index:0; pointer-events:none; }
+.frame.poster iframe{ box-shadow:0 10px 30px oklch(18% 0.012 250 / .10), 0 0 0 1px var(--border); }
+.frame iframe{
+  display:block; border:0; border-radius:8px; background:var(--surface);
+  box-shadow:0 10px 30px oklch(18% 0.012 250 / .10), 0 0 0 1px var(--border);
+  transition:box-shadow .2s var(--ease-in-out), opacity .4s var(--ease-in-out);
+}
+.frame.on iframe{ box-shadow:0 10px 30px oklch(18% 0.012 250 / .10), 0 0 0 1px var(--accent), 0 0 0 4px var(--accent-dim); }
+.frame.chosen iframe{ box-shadow:0 10px 30px oklch(18% 0.012 250 / .10), 0 0 0 1px oklch(69% 0.075 302), 0 0 0 4px oklch(69% 0.075 302 / .15); }
+.frame.dim{ opacity:.5; }
+.frame .shield{ position:absolute; inset:0; }
+.frame.lit iframe{ animation:halo 1.9s var(--ease-out) 2; }
+/* the frame is being written: a live edge, since the document has no bridge to outline with */
+.frame.drafting iframe{ box-shadow:0 10px 30px oklch(18% 0.012 250 / .10), 0 0 0 1px var(--accent), 0 0 0 4px var(--accent-dim); }
+
+.busy{
+  position:absolute; top:-9px; right:-8px; z-index:2;
+  display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:999px;
+  background:var(--accent); color:var(--surface); font-size:10px; font-weight:600;
+  box-shadow:0 2px 8px oklch(18% 0.012 250 / .18); transform-origin:100% 0;
+}
+.busy::before{ content:""; width:4px; height:4px; border-radius:50%; background:currentColor; animation:blip 1.25s var(--ease-in-out) infinite; }
+
+/* the quick menu over the selected element: board coordinates, stage-scaled */
+.selmenu{
+  position:absolute; z-index:6; transform-origin:0 100%; margin-top:-10px;
+  display:flex; align-items:center; gap:1px; padding:3px;
+  background:color-mix(in oklch, var(--surface) 92%, transparent); backdrop-filter:blur(6px);
+  border:1px solid var(--border); border-radius:11px;
+  box-shadow:0 2px 10px oklch(18% 0.012 250 / .07);
+  translate:0 -100%;
+}
+.selmenu button{ padding:3px 9px; border-radius:7px; font-size:11.5px; color:var(--ink-2); white-space:nowrap; }
+.selmenu button:hover{ background:var(--fg-soft); color:var(--fg); }
+.selmenu .sep{ width:1px; height:14px; background:var(--border); margin:0 3px; }
+
+/* ─── the canvas loader ───────────────────────────────────────────────── */
+.canvas-loader{
+  position:absolute; inset:0; z-index:3; pointer-events:none;
+  display:grid; grid-template-columns:repeat(4, minmax(110px, 170px)); gap:22px;
+  justify-content:center; align-content:center; padding:24px;
+}
+.skeleton-card{
+  position:relative; overflow:hidden; aspect-ratio:1280 / 900; border-radius:8px;
+  background:var(--grid); box-shadow:0 10px 30px oklch(18% 0.012 250 / .08), 0 0 0 1px var(--border);
+}
+.skeleton-card::after{
+  content:""; position:absolute; inset:0;
+  background:linear-gradient(100deg, transparent 32%, oklch(100% 0 0 / .7) 50%, transparent 68%);
+  background-size:200% 100%; animation:shimmer 1.6s linear infinite;
+}
+.skeleton-card:nth-child(2)::after{ animation-delay:.18s; }
+.skeleton-card:nth-child(3)::after{ animation-delay:.36s; }
+.skeleton-card:nth-child(4)::after{ animation-delay:.54s; }
+.canvas-loader-title{
+  grid-column:1 / -1; font-family:var(--font-display); font-size:14.5px; font-weight:600;
+  letter-spacing:-.01em; text-align:center; color:var(--fg);
+}
+.canvas-loader-sub{ grid-column:1 / -1; max-width:46ch; justify-self:center; font-size:12.5px; line-height:1.5; text-align:center; color:var(--ink-2); }
+.canvas-working{ position:absolute; left:0; right:0; top:0; height:2px; z-index:3; overflow:hidden; pointer-events:none; }
+.canvas-working-bar{
+  position:absolute; top:0; bottom:0; left:0; width:30%; border-radius:999px;
+  background:var(--accent); box-shadow:0 0 10px var(--accent-dim);
+  animation:working-slide 1.25s var(--ease-in-out) infinite;
+}
+@keyframes shimmer{ from{ background-position:200% 0; } to{ background-position:-200% 0; } }
+@keyframes working-slide{ from{ transform:translateX(-110%); } to{ transform:translateX(340%); } }
+
+@media (max-width:940px){
+  .work{ grid-template-columns:minmax(0,1fr); }
+  .rail{ display:none; }
+}
+@media (prefers-reduced-motion:reduce){
+  .skeleton-card::after{ animation:none; opacity:.55; }
+  .canvas-working-bar{ animation:none; width:100%; opacity:.3; }
+  .busy::before{ animation:none; }
+}
+
+/* frames sit where the harness orders them: nothing to tidy */
+#z-tidy{ display:none; }
+
+/* ─── the showcase ────────────────────────────────────────────────────── */
+/* the canvas is gone: one full-viewport render of the elevated artboard.
+   The iframe scrolls natively — the bridge stands its wheel interception
+   down in showcase — so nothing here owns a gesture. */
+.showcase{ display:flex; min-width:0; min-height:0; }
+.showcase iframe{
+  flex:1; width:100%; height:100%; border:0; background:#fff;
+  box-shadow:0 10px 30px oklch(18% 0.012 250 / .10), 0 0 0 1px oklch(69% 0.075 250 / .35);
+}

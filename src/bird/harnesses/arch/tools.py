@@ -26,6 +26,7 @@ from ...tools.files import LsTool, ReadImageTool, ReadTool
 from ...tools.kg_query import KgQueryTool
 from ...tools.skill import SkillTool
 from ...tools.web import WebFetchTool, WebSearchTool
+from ..picker import Option as AskOption
 from . import derive
 from .session import ArchSession
 from .state import (
@@ -415,6 +416,18 @@ class ApproachTool(Tool):
                 "type": "string",
                 "description": "why it lost. Required to grey one out.",
             },
+            "evidence": {
+                "type": "object",
+                "description": "who runs this shape and at what scale, with sources. "
+                               "The line that keeps a small system from being designed "
+                               "like a hyperscaler's.",
+                "properties": {
+                    "who": {"type": "string", "description": "e.g. 'Bitly, Rebrandly'"},
+                    "scale": {"type": "string", "description": "e.g. '~10k req/s' or 'hobby scale'"},
+                    "sources": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": False,
+            },
         },
         "additionalProperties": False,
     }
@@ -436,6 +449,12 @@ class ApproachTool(Tool):
         for field_name in ("summary", "status", "rejected_reason"):
             if args.get(field_name) is not None:
                 setattr(candidate, field_name, _str(args[field_name]))
+        if isinstance(args.get("evidence"), dict):
+            ev = args["evidence"]
+            candidate.evidence = {
+                "who": _str(ev.get("who")), "scale": _str(ev.get("scale")),
+                "sources": _strlist(ev.get("sources")),
+            }
         _check(state.validate_approach, candidate)
         state.approaches[aid] = candidate
         session.touched("approach", aid)
@@ -572,6 +591,47 @@ class DecideTool(Tool):
 # ------------------------------------------------------------- questions
 
 
+def _ask_options(raw: Any) -> list[AskOption]:
+    """The rows a question is offered with, in the picker's vocabulary.
+
+    The model writes `label` and `cost`; the picker calls them `label` and
+    `description`, because on the page the second line is what taking the row
+    costs you. The value is the label — arch's answers are read by a person
+    and by the architect, and a slug is worse for both.
+    """
+    if not isinstance(raw, list):
+        raise ToolError("options must be a list of {label, cost} rows.")
+    rows: list[AskOption] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ToolError("each option is an object with a label.")
+        label = _str(item.get("label"))
+        if not label:
+            raise ToolError("every option needs a label.")
+        rows.append(AskOption(
+            value=label,
+            label=label,
+            description=_str(item.get("cost")),
+            rec=bool(item.get("rec")),
+            favor=_str(item.get("favor")),
+        ))
+    return rows
+
+
+def _validate_ask(q: Question) -> None:
+    """Refuse a picker that cannot be rendered rather than shipping it to the
+    page. The rules are the picker's own (picker.py) — two rows minimum, one
+    recommendation, no duplicate labels."""
+    if not q.options:
+        return
+    try:
+        q.as_ask().validate()
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    if sum(1 for o in q.options if o.rec) > 1:
+        raise ToolError("at most one option may be marked rec — two recommendations is neither.")
+
+
 class QuestionTool(Tool):
     name = "question"
     description = (
@@ -594,9 +654,13 @@ class QuestionTool(Tool):
                 "type": "array",
                 "description": (
                     "the choices, declared explicitly so the user can pick one. "
-                    "2–3 rows; label is at most five words; cost is the one-line "
-                    "consequence of taking it; rec marks the row you'd pick (at "
-                    "most one); favor names the approach this pick keeps alive."
+                    "They render as a picker in the board's conversation and come "
+                    "back as an answer on this question — so a question with "
+                    "options is answered in one click, and one without is answered "
+                    "in prose. 2–4 rows; label is at most five words; cost is the "
+                    "one-line CONSEQUENCE of taking it, not a restatement of the "
+                    "label; rec marks the row you'd pick (at most one); favor names "
+                    "the approach this pick keeps alive."
                 ),
                 "items": {
                     "type": "object",
@@ -605,11 +669,17 @@ class QuestionTool(Tool):
                         "cost": {"type": "string", "description": "the consequence, in one line"},
                         "rec": {"type": "boolean", "description": "the row you'd pick — at most one"},
                         "favor": {"type": "string", "description": "approach id this pick retires the rivals of"},
-                        "stay": {"type": "boolean", "description": "this row re-asks instead of advancing"},
                     },
                     "required": ["label"],
                     "additionalProperties": False,
                 },
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "the noun for the decision — 'Deploy target', not the question "
+                    "again. It labels the answered row once the picker collapses."
+                ),
             },
             "id": {"type": "string", "description": "to answer or defer one already parked"},
             "answer": {"type": "string"},
@@ -634,6 +704,9 @@ class QuestionTool(Tool):
                 q.recommendation = _str(args["recommendation"])
             if args.get("options") is not None:
                 q.options = _ask_options(args["options"])
+            if args.get("summary") is not None:
+                q.summary = _str(args["summary"])
+            _validate_ask(q)
             if args.get("answer") is not None:
                 q.answer = _str(args["answer"])
                 q.status = "answered"
@@ -649,13 +722,22 @@ class QuestionTool(Tool):
             id=session.next_question_id(),
             question=text,
             recommendation=_str(args.get("recommendation")),
+            options=_ask_options(args["options"]) if args.get("options") is not None else [],
+            summary=_str(args.get("summary")),
         )
+        _validate_ask(q)
         state.questions.append(q)
         session.touched("question", q.id)
         if not q.recommendation:
             return _confirm(
                 f"Parked {q.id}. It has no recommendation — ask it in your reply WITH the "
                 "answer you'd give, or they are starting from a blank page.",
+                session,
+            )
+        if q.options:
+            return _confirm(
+                f"Parked {q.id} with {len(q.options)} rows — it is on their screen as a "
+                "picker, so don't type the rows out again. Say why you'd take yours.",
                 session,
             )
         return _confirm(f"Parked {q.id}. Ask it in your reply, with your recommendation.", session)
@@ -877,6 +959,18 @@ class ImportRepoTool(Tool):
 
 # what counts as progress for the engine's explore nudge
 MUTATING_TOOLS = frozenset({"canvas", "approach", "decide", "question", "brief"})
+
+
+def arch_board_tools() -> list[Tool]:
+    """Just the board: the six recording tools plus import_repo. What an
+    outside engine gets over MCP — it brings its own read, search and web,
+    and the picker is the page's, so nothing else from the arch set
+    belongs on that wire."""
+    return [
+        ImportRepoTool(),
+        CanvasTool(), ApproachTool(), DecideTool(), QuestionTool(), BriefTool(),
+        HandoffTool(),
+    ]
 
 
 def arch_harness_tools(with_kg: bool = True, with_web: bool = True) -> list[Tool]:

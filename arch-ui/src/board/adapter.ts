@@ -27,6 +27,8 @@ import { KIND_FACTS, KIND_LIST, KIND_SIDES } from "./vocab";
  *  summary, and that reason is most of what the lane is still there for. */
 const HEAD = 46;
 const HEAD_OUT = 122;
+/** the evidence line under a lane's name, when the architect looked */
+const HEAD_EVIDENCE = 20;
 /** An approach with nothing drawn under it is a rectangle and a paragraph, so
  *  it is sized to the paragraph. */
 const EMPTY_LANE_W = 470;
@@ -97,6 +99,8 @@ function columnOf(arch: ArchState, n: WireNode): string {
   return SHARED;
 }
 
+const hasEvidence = (e?: { who?: string; scale?: string }) => Boolean(e && (e.who || e.scale));
+
 interface Column {
   key: string;
   /** which step of the stylesheet's territory ramp this column wears — "s" for
@@ -111,6 +115,7 @@ interface Column {
    *  noise, so the boxes are laid out and the rectangle is not drawn. */
   chrome: boolean;
   nodes: WireNode[];
+  evidence?: { who?: string; scale?: string; sources?: string[] };
 }
 
 function columns(arch: ArchState): Column[] {
@@ -162,6 +167,7 @@ function columns(arch: ArchState): Column[] {
       taken: a.status === "active" && lost.length > 0 && live.length === 1,
       chrome: true,
       nodes: bucket.get(id) ?? [],
+      evidence: hasEvidence(a.evidence) ? a.evidence : undefined,
     };
   };
 
@@ -242,6 +248,7 @@ export function toBoard(
     approaches: n.approaches,
     existing: n.existing,
     out: isGreyed(arch, n),
+    closed: n.closed || undefined,
     parent: n.parent && arch.nodes[n.parent] ? n.parent : undefined,
     group: kids.has(n.id)
       ? { folded: isFolded(n.id), count: kids.get(n.id)!.length, w: 0, h: 0 }
@@ -356,7 +363,10 @@ export function toBoard(
   /** Which column each box ended up in. */
   const home = new Map<string, string>();
   for (const c of cols) for (const n of c.nodes) home.set(n.id, c.key);
-  const chromeOn = new Map(cols.map((c) => [c.key, c.chrome ? (c.out ? HEAD_OUT : HEAD) : 0]));
+  const chromeOn = new Map(cols.map((c) => [
+    c.key,
+    c.chrome ? (c.out ? HEAD_OUT : HEAD) + (c.evidence && !c.out ? HEAD_EVIDENCE : 0) : 0,
+  ]));
   const head = (col: string) => chromeOn.get(col) ?? 0;
 
   /* Down the page is decided at the top level: an edge between two members
@@ -437,6 +447,7 @@ export function toBoard(
         lanes.push({
           k: c.key, slot: c.slot, name: c.name, note: c.note,
           x: e.x, y: e.y, w: e.w, h: e.h, out: c.out, taken: c.taken,
+          evidence: c.out ? undefined : c.evidence,
         });
       }
     }
@@ -451,6 +462,7 @@ export function toBoard(
       lanes.push({
         k: c.key, slot: c.slot, name: c.name, note: c.note,
         x: right, y: top, w: EMPTY_LANE_W, h, out: c.out, taken: c.taken,
+        evidence: c.out ? undefined : c.evidence,
       });
       right += EMPTY_LANE_W + 40;
       bottom = Math.max(bottom, top + h);

@@ -3,7 +3,7 @@
 import httpx
 import pytest
 
-from bird.llm.discovery import discover_models
+from bird.llm.discovery import discover_models, ollama_context_window
 from bird.llm.registry import ProviderConfig, Registry
 
 
@@ -12,9 +12,15 @@ def make_registry(providers=None, models=None):
 
 
 class FakeOllama:
-    def __init__(self, up=True, models=()):
+    def __init__(self, up=True, models=(), context=None):
         self.up = up
         self.models = list(models)
+        self.context = dict(context or {})  # name -> what /api/show would say
+        self.show_calls: list[str] = []
+
+    def context_length(self, name):
+        self.show_calls.append(name)
+        return self.context.get(name)
 
     def is_up(self):
         return self.up
@@ -129,3 +135,97 @@ def test_cloud_catalog_needs_key(monkeypatch):
     models, notes = discover_models(reg, ollama=FakeOllama(models=[]))
     assert models == []
     assert any("OLLAMA_API_KEY" in n for n in notes)
+
+
+def test_ollama_models_carry_the_daemons_context_window(monkeypatch):
+    """A local model the picker lists must come with its real window — a
+    pick without one is recorded at DEFAULT_CONTEXT_WINDOW and warned about."""
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    reg = make_registry(
+        providers={"ollama": OLLAMA},
+        models={"ollama:ornith": {"context_window": 4096}},
+    )
+    fake = FakeOllama(
+        models=["ornith:latest", "qwen3.8:27b-mlx", "tiny"],
+        context={"ornith:latest": 262144, "qwen3.8:27b-mlx": 262144},
+    )
+    models, notes = discover_models(reg, ollama=fake)
+    by_spec = {m.spec: m for m in models}
+    assert by_spec["ollama:qwen3.8:27b-mlx"].context_window == 262144
+    assert by_spec["ollama:tiny"].context_window is None  # daemon couldn't say
+    assert by_spec["ollama:ornith"].context_window == 4096  # configured wins, unasked
+    assert fake.show_calls == ["qwen3.8:27b-mlx", "tiny"]
+    assert notes == []
+
+
+def test_ollama_context_window_only_asks_for_unconfigured_local_specs():
+    reg = make_registry(
+        providers={"ollama": OLLAMA},
+        models={
+            "ollama:ornith": {"context_window": 4096},
+            # a /think choice alone: an entry that never learned its window
+            "ollama:thinky": {"reasoning_effort": "low"},
+        },
+    )
+    reg.aliases["default"] = "ollama:ornith"
+    fake = FakeOllama(context={"qwen3.8:27b-mlx": 262144, "thinky": 8192})
+    assert ollama_context_window(reg, "ollama:qwen3.8:27b-mlx", ollama=fake) == 262144
+    assert ollama_context_window(reg, "ollama:thinky", ollama=fake) == 8192
+    assert ollama_context_window(reg, "ollama:unknown", ollama=fake) is None
+    # configured, aliased, and foreign specs never reach the daemon; a cloud
+    # spec is answered from the static table (or None when it isn't in it)
+    assert ollama_context_window(reg, "ollama:ornith", ollama=fake) is None
+    assert ollama_context_window(reg, "default", ollama=fake) is None
+    assert ollama_context_window(reg, "ollama:qwen3.8:cloud", ollama=fake) is None
+    assert ollama_context_window(reg, "ollama:gpt-oss:120b-cloud", ollama=fake) is None
+    assert ollama_context_window(reg, "openrouter:qwen/qwen3.8", ollama=fake) is None
+    assert fake.show_calls == ["qwen3.8:27b-mlx", "thinky", "unknown"]
+
+
+def test_ollama_context_window_reads_the_cloud_table():
+    """A :cloud spec has no /api/show to ask, so its window comes from the
+    static table — the value a pick persists instead of the 32k default."""
+    reg = make_registry(providers={"ollama": OLLAMA})
+    fake = FakeOllama()
+    assert ollama_context_window(reg, "ollama:glm-5.3:cloud", ollama=fake) == 1000000
+    assert ollama_context_window(reg, "ollama:gpt-oss:120b-cloud", ollama=fake) is None
+    # a cloud spec whose entry already learned its window is left alone
+    reg.models["ollama:kimi-k3:cloud"] = {"context_window": 900000}
+    assert ollama_context_window(reg, "ollama:kimi-k3:cloud", ollama=fake) is None
+    assert fake.show_calls == []  # the daemon is never asked about a cloud model
+
+
+def test_cloud_catalog_models_carry_the_tables_window(monkeypatch):
+    """The hosted catalog lists no window, so the picker must fill it from the
+    table — otherwise picking a cloud model records 32k and warns."""
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    reg = make_registry(providers={"ollama": OLLAMA})
+    models, notes = discover_models(
+        reg,
+        ollama=FakeOllama(models=[]),
+        ollama_cloud=FakeOllama(models=["glm-5.3", "kimi-k3", "gpt-oss:120b"]),
+    )
+    by_spec = {m.spec: m.context_window for m in models}
+    assert by_spec["ollama:glm-5.3:cloud"] == 1000000
+    assert by_spec["ollama:kimi-k3:cloud"] == 900000
+    assert by_spec["ollama:gpt-oss:120b-cloud"] is None  # not in the table
+    assert notes == []
+
+
+def test_ollama_context_window_without_an_ollama_provider():
+    reg = make_registry(providers={"openrouter": OPENROUTER})
+    assert ollama_context_window(reg, "ollama:qwen3.8", ollama=FakeOllama()) is None
+
+
+def test_configured_entry_without_a_window_gets_the_daemons(monkeypatch):
+    """/think on a freshly picked local model writes reasoning_effort alone;
+    that entry must not hide the window the daemon can report."""
+    monkeypatch.setenv("OLLAMA_API_KEY", "k")
+    reg = make_registry(
+        providers={"ollama": OLLAMA},
+        models={"ollama:qwen3.8:27b-mlx": {"reasoning_effort": "none"}},
+    )
+    fake = FakeOllama(models=["qwen3.8:27b-mlx"], context={"qwen3.8:27b-mlx": 262144})
+    models, _ = discover_models(reg, ollama=fake)
+    (m,) = models
+    assert (m.spec, m.source, m.context_window) == ("ollama:qwen3.8:27b-mlx", "configured", 262144)

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ..engine.runner import MAX_TURNS, Runner
+from ..engine.runner import Runner
 from ..llm.registry import ModelSpec, Registry
 from ..llm.wire.openai_compat import OpenAICompatClient
 from ..tools import Tool, ToolContext
@@ -88,12 +88,29 @@ def _lead_def() -> HarnessDef:
     )
 
 
+def _design_def() -> HarnessDef:
+    from .design.tools import design_edit_tools
+
+    return HarnessDef(
+        name="design",
+        tools=design_edit_tools,
+        instructions_path=Path(__file__).parent / "design" / "instructions.md",
+        default_model="designer",
+        done_tool="design_finalize",
+        interactive=True,
+        # "" switches the engine's explore nudge off: reading artboards is the
+        # designer's work, not procrastination (the runner explains)
+        explore_nudge="",
+    )
+
+
 # name -> lazy factory (lazy so importing the registry doesn't pull every
 # harness package, and to keep import cycles impossible)
 HARNESSES: dict[str, Callable[[], HarnessDef]] = {
     "code": _code_def,
     "arch": _arch_def,
     "lead": _lead_def,
+    "design": _design_def,
 }
 
 
@@ -104,6 +121,16 @@ def get(name: str) -> HarnessDef:
         raise KeyError(f"unknown harness '{name}' (known: {', '.join(HARNESSES)})") from None
 
 
+def model_aliases() -> dict[str, str]:
+    """harness name -> the models.json alias its model resolves from, in
+    display order. This is what /model walks: a harness is picked first, and
+    the model chosen for it lands on this alias — the same alias cli.py
+    resolves when the harness starts, so the next `bird <harness>` honours
+    the pick. Two harnesses may share an alias (code and lead both run on
+    `default`); the picker says so rather than pretending they are separate."""
+    return {name: get(name).default_model for name in HARNESSES}
+
+
 def build_runner(
     name: str,
     *,
@@ -111,7 +138,7 @@ def build_runner(
     client: OpenAICompatClient,
     registry: Registry,
     ctx: ToolContext,
-    max_turns: int = MAX_TURNS,
+    max_turns: int | None = None,
     with_kg: bool = True,
     with_web: bool = True,
     seed_context: str | None = None,
@@ -161,6 +188,7 @@ def build_runner(
     # the ledger is a property of the harness, and starts empty: a ctx forked
     # from a parent session (lead -> code) would otherwise inherit — by
     # reference — whatever the parent had already edited
+    ctx.harness = name  # attribution for anything the run records (store findings)
     ctx.require_verification = d.require_verification
     ctx.unverified_paths = []
     ctx.last_verify = None

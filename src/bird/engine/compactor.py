@@ -13,13 +13,19 @@ import json
 from typing import Callable
 
 from ..llm.registry import Registry, RegistryError
-from ..llm.types import Message
+from ..llm.types import Message, ToolCall
 from ..llm.wire.openai_compat import OpenAICompatClient, WireAborted, WireError
 
 TRIGGER_FRACTION = 0.90
 KEEP_RECENT_TOOL_RESULTS = 5
 KEEP_RECENT_THINKING = 1
 STUB_THRESHOLD_CHARS = 400
+# Actively-worked files whose content survives stubbing (newest copy only).
+# Stubbing is otherwise pure recency, so a file read early and edited late is
+# the first thing dropped — and the model reads it straight back, which is how
+# one compaction becomes a treadmill (a logged run read one file 8 times
+# across 3 compactions). Capped so pinning can never starve compaction itself.
+MAX_PINNED_RESULTS = 5
 
 
 def estimate_tokens(messages: list[Message]) -> int:
@@ -38,22 +44,83 @@ def needs_compaction(messages: list[Message], context_window: int) -> bool:
     return estimate_tokens(messages) > TRIGGER_FRACTION * context_window
 
 
-def stub_tool_results(messages: list[Message]) -> tuple[list[Message], int]:
-    """Replace all but the last N large tool results with one-line stubs."""
+def _read_path(call: ToolCall | None) -> str | None:
+    """The one file a read call fetched, or None if it was not a single-file
+    read. A batched `paths` read returns several files in one result, so that
+    result is not any single path's content and cannot be pinned by path."""
+    if call is None or call.name != "read" or not call.arguments:
+        return None
+    if call.arguments.get("paths"):
+        return None
+    path = call.arguments.get("path")
+    return path if isinstance(path, str) else None
+
+
+def _pinned_indices(
+    messages: list[Message], keep_paths: frozenset[str], candidates: set[int]
+) -> set[int]:
+    """Tool results pinned back out of `candidates`: the newest copy of each
+    file the run is actively working on.
+
+    Restricted to `candidates` on purpose. Selecting the globally newest copies
+    would spend the whole budget on results the recency window was keeping
+    anyway, leaving the older at-risk ones — the exact reads a mid-edit model
+    has to repeat — unprotected.
+    """
+    if not keep_paths:
+        return set()
+    calls = {tc.id: tc for m in messages for tc in m.tool_calls}
+    newest: dict[str, int] = {}
+    for i, m in enumerate(messages):
+        if m.role != "tool":
+            continue
+        path = _read_path(calls.get(m.tool_call_id))
+        if path is not None and path in keep_paths:
+            newest[path] = i
+    # A file whose newest copy already sits inside the recency window survives
+    # without help; pinning an older duplicate of it would only re-add content
+    # that is still in the transcript.
+    at_risk = [i for i in newest.values() if i in candidates]
+    return set(sorted(at_risk, reverse=True)[:MAX_PINNED_RESULTS])
+
+
+def _stub_plan(
+    messages: list[Message], keep_paths: frozenset[str]
+) -> tuple[set[int], set[int]]:
+    """(indices to stub, indices pinned back out of them)."""
     tool_indices = [i for i, m in enumerate(messages) if m.role == "tool"]
-    stub_candidates = set(tool_indices[:-KEEP_RECENT_TOOL_RESULTS])
+    candidates = set(tool_indices[:-KEEP_RECENT_TOOL_RESULTS])
+    pinned = _pinned_indices(messages, keep_paths, candidates)
+    return candidates - pinned, pinned
+
+
+def stub_tool_results(
+    messages: list[Message], keep_paths: frozenset[str] = frozenset()
+) -> tuple[list[Message], int]:
+    """Replace all but the last N large tool results with one-line stubs.
+
+    `keep_paths` names the files the run is actively editing; the newest copy
+    of each is pinned in place. A stub also says which file it dropped and how
+    to get it back — the old placeholder named neither, so a model that still
+    needed the content had nothing to act on but a guess, and guessing is what
+    it re-read from.
+    """
+    calls = {tc.id: tc for m in messages for tc in m.tool_calls}
+    stub_candidates, _ = _stub_plan(messages, keep_paths)
     out: list[Message] = []
     stubbed = 0
     for i, m in enumerate(messages):
         if i in stub_candidates and m.content and len(m.content) > STUB_THRESHOLD_CHARS:
-            first_line = m.content.split("\n", 1)[0][:80]
-            out.append(
-                Message(
-                    role="tool",
-                    content=f"[result elided ({len(m.content)} chars): {first_line}...]",
-                    tool_call_id=m.tool_call_id,
+            path = _read_path(calls.get(m.tool_call_id))
+            if path is not None:
+                note = (
+                    f"[content of {path} elided ({len(m.content)} chars) — re-read it "
+                    f'with read {{"path": "{path}"}} if you still need it]'
                 )
-            )
+            else:
+                first_line = m.content.split("\n", 1)[0][:80]
+                note = f"[result elided ({len(m.content)} chars): {first_line}...]"
+            out.append(Message(role="tool", content=note, tool_call_id=m.tool_call_id))
             stubbed += 1
         else:
             out.append(m)
@@ -141,11 +208,16 @@ def compact(
     registry: Registry,
     client: OpenAICompatClient,
     record: Callable[[str, dict], None] | None = None,
+    keep_paths: frozenset[str] = frozenset(),
 ) -> list[Message]:
     """Full policy: stub first (free), summarize only if still over, trim as
-    a last resort. Logs one `compaction` event describing what happened."""
+    a last resort. Logs one `compaction` event describing what happened.
+
+    `keep_paths` is the caller's set of actively-worked files whose content
+    should survive stage 1 (see `stub_tool_results`)."""
     before = estimate_tokens(messages)
-    messages, stubbed = stub_tool_results(messages)
+    pinned = len(_stub_plan(messages, keep_paths)[1])
+    messages, stubbed = stub_tool_results(messages, keep_paths)
     messages, stubbed_thinking = stub_thinking(messages)
     stage = "stub"
     if needs_compaction(messages, context_window):
@@ -170,6 +242,7 @@ def compact(
                 "stage": stage,
                 "stubbed": stubbed,
                 "stubbed_thinking": stubbed_thinking,
+                "pinned": pinned,
                 "tokens_before": before,
                 "tokens_after": after,
             },

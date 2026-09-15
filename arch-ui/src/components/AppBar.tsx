@@ -8,9 +8,11 @@ interface Props {
   exportLabel: string;
   onExport: () => void;
   onToggleChat: () => void;
+  /** questions waiting in the dock while the rail is away */
+  waiting?: number;
 }
 
-export function AppBar({ goal, sub, chatOpen, unread, exportLabel, onExport, onToggleChat }: Props) {
+export function AppBar({ goal, sub, chatOpen, unread, exportLabel, onExport, onToggleChat, waiting = 0 }: Props) {
   return (
     <header className="appbar" data-od-id="appbar">
       <h1 className="goal" id="goal" title={goal} data-od-id="session-goal">{goal}</h1>
@@ -34,6 +36,9 @@ export function AppBar({ goal, sub, chatOpen, unread, exportLabel, onExport, onT
       >
         <IconChat />
         <span>Chat</span>
+        {!chatOpen && waiting > 0
+          ? <span className="waiting" data-od-id="chat-waiting">{waiting} question{waiting > 1 ? "s" : ""}</span>
+          : null}
         <i className="unread" aria-hidden="true" />
       </button>
     </header>

@@ -40,9 +40,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 import networkx as nx
@@ -121,6 +122,17 @@ def _out_of_scope(question: str) -> str | None:
         )
     return None
 SEMANTIC_TEXT_CATEGORIES = ("document", "paper")
+# A stale verdict is re-used until the graph is rebuilt; a fresh one is
+# re-checked after this long. is_stale() walks the repo (~180ms here) against a
+# ~20ms query, so it can never run per call.
+STALENESS_TTL_SECONDS = 30.0
+STALE_NOTICE = (
+    "[STALE GRAPH — files have changed since this graph was built. The symbol "
+    "locations below may be out of date: treat every [path:line] as a hint, and "
+    "`read` the file to confirm before you edit it. Structure (what calls what) "
+    "is still broadly right; exact lines are not.]"
+)
+
 KG_ALIAS = "kg"  # models.json role that names the semantic-extraction model
 # bird provider → the graphify backend that speaks its wire protocol. Every bird
 # provider is OpenAI-compatible, so "openai" is the right default for a
@@ -292,6 +304,117 @@ def is_artifact(path: Path) -> bool:
     return path.suffix in _SNIFF_EXTS and _looks_minified(path)
 
 
+# Extensions the repo map treats as program source. Manifests, docs, styles and
+# lockfiles are indexed (package.json alone contributes 85 nodes here) but a
+# map that leads with them answers "what is this codebase" with its metadata.
+_SOURCE_EXTS = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java",
+    ".kt", ".rb", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".scala",
+    ".php", ".ex", ".exs", ".sh",
+}
+_TEST_DIRS = {"tests", "test", "__tests__", "spec", "specs"}
+# Edges that describe structure (a file contains a symbol, a class has a
+# method) or annotation (a rationale note hangs off a symbol). They inflate a
+# node's degree without saying anything about who USES it — a file with 178
+# children would otherwise be every map's top hub.
+_STRUCTURAL_RELATIONS = {"contains", "method", "rationale_for"}
+# Pragma-ish first lines that are not a purpose statement.
+_NOT_A_PURPOSE = ("#!", "# -*-", "# coding", "// @ts-", "/* eslint", "// eslint", "\"use strict\"", "'use strict'")
+
+
+def _is_source_path(p: str) -> bool:
+    return os.path.splitext(p)[1].lower() in _SOURCE_EXTS
+
+
+def _is_test_path(p: str) -> bool:
+    parts = _norm_path(p).split("/")
+    if set(parts[:-1]) & _TEST_DIRS:
+        return True
+    name = parts[-1].lower()
+    stem = name.rsplit(".", 1)[0]
+    return (
+        name.startswith(("test_", "conftest"))
+        or stem.endswith(("_test", ".test", ".spec", "_spec"))
+    )
+
+
+def _file_purpose(path, limit: int = 96) -> str:
+    """The author's one-line answer to "what is this file": the first sentence
+    of a module docstring or of a leading comment block. Empty when there is
+    none or the file cannot be read — the map then falls back to symbols
+    alone. Reads at most 2KB, so pricing fifteen of these into a system prompt
+    is a rounding error next to one model call.
+
+    The whole first paragraph is gathered before the sentence is cut, because
+    a docstring's first line routinely ends mid-thought ("the setup
+    walkthrough, key management and the") and the period is on line two."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(2048)
+    except OSError:
+        return ""
+    raw = [ln.strip() for ln in head.splitlines()]
+    i = 0
+    while i < len(raw) and (not raw[i] or raw[i].startswith(_NOT_A_PURPOSE)):
+        i += 1
+    if i >= len(raw):
+        return ""
+    first = raw[i]
+    para: list[str] = []
+    if first.startswith(('"""', "\'\'\'")):
+        q, rest = first[:3], first[3:]
+        if q in rest:
+            para.append(rest.split(q)[0])
+        else:
+            if rest.strip():
+                para.append(rest)
+            for ln in raw[i + 1:]:
+                if not ln:
+                    break
+                if q in ln:
+                    tail = ln.split(q)[0]
+                    if tail.strip():
+                        para.append(tail)
+                    break
+                para.append(ln)
+    elif first.startswith("/*"):
+        rest = first.lstrip("/*")
+        if "*/" in rest:
+            para.append(rest.split("*/")[0])
+        else:
+            if rest.strip():
+                para.append(rest)
+            for ln in raw[i + 1:]:
+                body = ln.lstrip("*").strip()
+                if not body:
+                    break
+                if "*/" in ln:
+                    tail = ln.split("*/")[0].lstrip("*")
+                    if tail.strip():
+                        para.append(tail)
+                    break
+                para.append(body)
+    elif first.startswith(("//", "#")):
+        for ln in raw[i:]:
+            if not ln.startswith(("//", "#")):
+                break
+            body = ln.lstrip("/#").strip()
+            if not body:
+                break
+            para.append(body)
+    else:
+        return ""
+    text = " ".join(x.strip() for x in para).strip()
+    if not text or text.startswith(("import ", "from ", "export ", "package ", "use ")):
+        return ""
+    cut = text.find(". ")
+    if 0 < cut < limit:
+        text = text[:cut + 1]
+    if len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return text
+
+
 def _norm_path(p: str) -> str:
     p = str(p).replace("\\", "/")
     while p.startswith("./"):
@@ -317,6 +440,9 @@ class KGQueryResult:
     hit_count: int
     expanded_tokens: list[str] = field(default_factory=list)
     mode: str = "bfs"
+    # the graph no longer matches the working tree — answers are still useful
+    # for structure, but line numbers may point at code that has since moved
+    stale: bool = False
     # "exact"  at least one query term is a symbol/path token in the graph
     # "weak"   seeds came only from substring/fuzzy expansion — the traversal
     #          ran, but nothing in the question actually names anything indexed
@@ -374,11 +500,42 @@ class KG:
         self._graph_cache: nx.Graph | None = None
         self._graph_mtime: float | None = None
         self._artifacts_cache: tuple[float | None, list[str]] | None = None
+        self._stale_cache: tuple[float, float, bool] | None = None  # (graph mtime, checked at, verdict)
 
     # ---------- lifecycle ----------
 
     def is_ready(self) -> bool:
         return self.graph_path.exists() and not self._building_marker.exists()
+
+    def _is_stale_cached(self) -> bool:
+        """is_stale() with a cache, because the query path cannot afford it raw.
+
+        Readiness has never meant freshness: `is_ready()` asks only whether a
+        graph exists, so a graph built before a hundred edits answers with the
+        same confidence as one built a second ago. That is how a query returns
+        `[main.ts:L217]` for a symbol that moved to L229 — a citation the model
+        has no way to distrust, pointing at real code in the wrong place.
+
+        Cached two ways. A stale verdict stands until the graph itself is
+        rebuilt, because staleness only grows as files are edited. A fresh
+        verdict is re-checked after STALENESS_TTL_SECONDS, so a burst of
+        queries in one turn pays for the repo walk once.
+        """
+        try:
+            mtime = self.graph_path.stat().st_mtime if self.graph_path.exists() else 0.0
+        except OSError:
+            return False
+        now = time.monotonic()
+        if self._stale_cache is not None:
+            cached_mtime, checked_at, verdict = self._stale_cache
+            if cached_mtime == mtime and (verdict or now - checked_at < STALENESS_TTL_SECONDS):
+                return verdict
+        try:
+            verdict = self.is_stale()
+        except Exception:  # a freshness hint must never take a query down
+            return False
+        self._stale_cache = (mtime, now, verdict)
+        return verdict
 
     def is_stale(self) -> bool:
         if not self.graph_path.exists():
@@ -406,9 +563,13 @@ class KG:
         self._building_marker.touch()
         try:
             detection = detect(self.repo_root)
-            extraction = self._merge_extractions(
-                self._extract_code(detection["files"].get("code", []), collect_files, extract),
-                self._extract_semantic(detection["files"]),
+            code_entries = detection["files"].get("code", [])
+            extraction = self._canonicalize_extraction(
+                self._merge_extractions(
+                    self._extract_code(code_entries, collect_files, extract),
+                    self._extract_semantic(detection["files"]),
+                ),
+                code_entries,
             )
             G = build_from_json(extraction, root=str(self.repo_root))
             if G.number_of_nodes() == 0:
@@ -445,17 +606,31 @@ class KG:
         if not changed_code and not changed_semantic and not deleted and not stale_artifacts:
             return KGStats(*self._counts(), action="fresh")
 
-        extraction = self._merge_extractions(
-            self._extract_code(changed_code, collect_files, extract),
-            self._extract_semantic(changed),
+        # Canonicalise before merging: a narrow change set makes the extractor
+        # strip a deeper prefix, which renames every node in the changed files
+        # and turns this update into an append instead of a replace.
+        extraction = self._canonicalize_extraction(
+            self._merge_extractions(
+                self._extract_code(changed_code, collect_files, extract),
+                self._extract_semantic(changed),
+            ),
+            changed_code,
         )
         # prune_sources is deleted files plus anything the artifact filter now
         # rejects; build_merge's replace-on-re-extract reconciles changed files
         # (graphify #1344/#1178).
+        # Ghost spellings of the files we just re-extracted: build_merge would
+        # never touch them (they are not in the new chunk, so nothing replaces
+        # them), so name them explicitly and let an old graph clean itself.
+        ghosts = self._ghost_source_files(
+            {str(n.get("source_file") or "") for n in extraction.get("nodes") or []} - {""}
+        )
+        if ghosts:
+            self._graph_cache = None  # the prune invalidates whatever we just read
         G = build_merge(
             [extraction],
             graph_path=str(self.graph_path),
-            prune_sources=(deleted + stale_artifacts) or None,
+            prune_sources=(deleted + stale_artifacts + ghosts) or None,
             root=str(self.repo_root),
         )
         communities = cluster(G)
@@ -725,9 +900,291 @@ class KG:
         mtime = self.graph_path.stat().st_mtime
         if self._graph_cache is None or self._graph_mtime != mtime:
             data = json.loads(self.graph_path.read_text(encoding="utf-8"))
-            self._graph_cache = json_graph.node_link_graph(data, edges="links")
+            G = json_graph.node_link_graph(data, edges="links")
+            self._graph_cache = self._canonicalize(G)
             self._graph_mtime = mtime
         return self._graph_cache
+
+    def _repo_files(self) -> dict[str, list[str]]:
+        """Real repo-relative paths, indexed by basename.
+
+        Built once per graph load and only consulted for paths the graph got
+        wrong, so the walk cost is paid once and only when it buys something.
+        """
+        index: dict[str, list[str]] = {}
+        for path in self.repo_root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                rel = path.relative_to(self.repo_root)
+            except ValueError:
+                continue
+            if any(part in ARTIFACT_DIRS for part in rel.parts):
+                continue
+            index.setdefault(rel.name, []).append(rel.as_posix())
+        return index
+
+    def _path_resolver(self, hints: list[str] | None = None):
+        """raw path as recorded -> real repo-relative path, when exactly one matches.
+
+        `hints` are the files actually being extracted; they are consulted first
+        because they are certain. Anything else — an import that reaches outside
+        the batch — falls back to a repo walk. An ambiguous suffix (two
+        `index.ts` in different packages) is left exactly as it was: guessing
+        would answer confidently about the wrong file, which is worse than a
+        duplicate.
+        """
+        hint_list = list(hints or [])
+        index: dict[str, list[str]] | None = None
+        cache: dict[str, str] = {}
+
+        def resolve(raw: str) -> str:
+            if not raw:
+                return raw
+            if raw in cache:
+                return cache[raw]
+            nonlocal index
+            rel = raw.lstrip("./")
+            out = raw
+            if (self.repo_root / rel).is_file():
+                out = rel
+            else:
+                hits = [c for c in hint_list if c == rel or c.endswith("/" + rel)]
+                if len(hits) != 1:
+                    if index is None:
+                        index = self._repo_files()
+                    hits = [
+                        c for c in index.get(PurePosixPath(rel).name, [])
+                        if c == rel or c.endswith("/" + rel)
+                    ]
+                if len(hits) == 1:
+                    out = hits[0]
+            cache[raw] = out
+            return out
+
+        return resolve
+
+    @staticmethod
+    def _id_prefix(rel: str) -> str:
+        """The node-id prefix graphify derives from a file path: the path minus
+        extension, slugified.
+
+        Delegated to graphify's own `normalize_id` rather than reimplemented.
+        A rewritten id has to land exactly where graphify's next merge looks
+        for it — `dedup._id_prefixes` documents the `<path>_<entity>` scheme —
+        so the two must never drift apart. (Verified identical to a local
+        implementation across all 299 paths in this repo's graph.)
+        """
+        from graphify.ids import normalize_id
+
+        stem = PurePosixPath(rel)
+        if stem.suffix:
+            stem = stem.with_suffix("")
+        return normalize_id(str(stem))
+
+    def _canonicalize_extraction(self, extraction: dict, inputs: list) -> dict:
+        """Make extraction paths repo-relative BEFORE the graph is built.
+
+        graphify's extractor strips the common prefix of whatever file list it
+        is handed, so the same file is recorded under a different path — and so
+        a different node id — depending on how wide the batch was. A full build
+        sees the whole repo and records `tui/src/main.ts`; an update that
+        touched only the TUI records `src/main.ts`; one that touched only
+        `tui/src/` records `main.ts`. build_merge matches on id, so every
+        narrower update ADDED a fresh copy of every node in the changed files
+        instead of replacing them.
+
+        That is how one function became three nodes carrying three line numbers,
+        two of them stale, and how 41% of this repo's graph became duplicates
+        that competed for the same result budget while pointing `read` at files
+        that do not exist. Fixed here rather than at load so the graph is right
+        on disk and the next update recognises what it already has.
+        """
+        nodes = extraction.get("nodes") or []
+        if not nodes:
+            return extraction
+        hints: list[str] = []
+        for entry in inputs or []:
+            try:
+                hints.append(Path(entry).resolve().relative_to(self.repo_root).as_posix())
+            except (ValueError, OSError):
+                continue
+        resolve = self._path_resolver(hints)
+
+        remap: dict[str, str] = {}
+        for nd in nodes:
+            raw = str(nd.get("source_file") or "")
+            canon = resolve(raw)
+            if not canon or canon == raw:
+                continue
+            nd["source_file"] = canon
+            if str(nd.get("label") or "") == raw:  # file/module nodes are labelled by path
+                nd["label"] = canon
+            old_p, new_p = self._id_prefix(raw), self._id_prefix(canon)
+            nid = str(nd.get("id") or "")
+            if old_p and new_p and (nid == old_p or nid.startswith(old_p + "_")):
+                new_id = new_p + nid[len(old_p):]
+                if new_id != nid:
+                    remap[nid] = new_id
+                    nd["id"] = new_id
+
+        if remap:
+            for coll in ("edges", "hyperedges"):
+                for e in extraction.get(coll) or []:
+                    for key in ("source", "target"):
+                        if e.get(key) in remap:
+                            e[key] = remap[e[key]]
+                    for key in ("nodes", "members"):
+                        v = e.get(key)
+                        if isinstance(v, list):
+                            e[key] = [remap.get(x, x) for x in v]
+            seen: set = set()
+            deduped = []
+            for nd in nodes:  # a rewrite can land two nodes on one id
+                if nd.get("id") in seen:
+                    continue
+                seen.add(nd.get("id"))
+                deduped.append(nd)
+            extraction["nodes"] = deduped
+        return extraction
+
+    def _ghost_source_files(self, canonical: set[str]) -> list[str]:
+        """Stale path spellings of the files being re-extracted, still in the graph.
+
+        build_merge's replace-set is keyed on source_file, so it only drops the
+        nodes filed under the path the NEW chunk carries. Canonicalising the
+        chunk stops the bleeding, but a graph that already holds the same file
+        under a stripped-prefix spelling keeps those nodes forever — they are
+        never re-extracted, so nothing ever replaces them.
+
+        Listing them as prune_sources lets an existing graph heal itself on the
+        next update instead of needing a full rebuild. build_merge subtracts
+        re-extracted files from the prune set, and these spellings are by
+        definition NOT in the new chunk, so the subtraction cannot eat them.
+
+        Reads the raw file rather than `_load_graph`, whose repair pass has
+        already resolved these away — the point here is to find them on disk.
+        """
+        if not self.graph_path.exists() or not canonical:
+            return []
+        try:
+            data = json.loads(self.graph_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        present = {
+            str(n.get("source_file") or "") for n in data.get("nodes") or []
+        }
+        present.discard("")
+        ghosts: set[str] = set()
+        for rel in canonical:
+            parts = PurePosixPath(rel).parts
+            for i in range(1, len(parts)):
+                alt = "/".join(parts[i:])
+                # only a spelling that is IN the graph, is not this path, and
+                # names no real file — a genuine `src/index.ts` elsewhere in the
+                # repo is somebody's actual source, not a ghost
+                if alt != rel and alt in present and not (self.repo_root / alt).is_file():
+                    ghosts.add(alt)
+        return sorted(ghosts)
+
+    def _canonicalize(self, G: nx.Graph) -> nx.Graph:
+        """Repair paths the extractor recorded from the wrong root, then merge
+        the duplicate nodes that repair exposes.
+
+        graphify indexes sub-projects from their own directory as well as from
+        the repo root, so one file arrives under several spellings. On this repo
+        `tui/src/main.ts` was also indexed as `src/main.ts` and `main.ts` —
+        neither of which exists — giving three nodes per symbol with three
+        different line numbers, two of them stale. 41% of all nodes were
+        duplicates, and every one of them competed for the same
+        MAX_RESULT_NODES budget while pointing `read` at files it would reject.
+
+        Correctness first: a spelling is only rewritten when exactly one real
+        file matches it. An ambiguous suffix (two `index.ts` in different
+        packages) is left exactly as it was — a wrong merge would answer
+        confidently about the wrong file, which is worse than a duplicate.
+        """
+        canon_file = self._path_resolver()
+
+        # The key carries file_type and _origin, not just (file, label). An
+        # AST-extracted dependency `react` and a semantically-extracted concept
+        # `react` in the same package.json are two DIFFERENT assertions about
+        # the repo, and collapsing them would delete the semantic layer this
+        # graph pays a model to produce. Only like merges with like.
+        groups: dict[tuple[str, str, str, str], list] = {}
+        for nid, nd in G.nodes(data=True):
+            f = canon_file(str(nd.get("source_file") or ""))
+            label = str(nd.get("label", nid))
+            # source_location is part of the identity, not decoration. Seven
+            # distinct `.run()` methods share one file and one label in
+            # arch/tools.py; four `.to_openai()` share llm/types.py. Merging on
+            # (file, label) alone fuses them into one node and destroys exactly
+            # what a "which one?" query needs. The scope bug this repair exists
+            # for duplicates a node at the SAME line under a different path
+            # spelling, so keeping the line is both safe and sufficient.
+            kind = (
+                str(nd.get("file_type") or ""),
+                str(nd.get("_origin") or ""),
+                str(nd.get("source_location") or ""),
+            )
+            # A file/module node carries its own path AS its label, so the
+            # rewrite has to reach the label too — otherwise the phantom
+            # spellings survive as three separate file nodes all pointing at
+            # one real file, and a hit on one of them sends `read` somewhere
+            # that does not exist.
+            if f and label != f and PurePosixPath(label).suffix and canon_file(label) == f:
+                label = f
+            if not f:
+                # No path means no path-spelling duplicate — this is an
+                # external or builtin reference (`Any`, `Path`, `Exception`)
+                # that graphify records once per importing file. Merging those
+                # is not a repair, it is a different graph: it would fuse 31
+                # per-file references into one degree-31 hub and change what
+                # every query about them returns. Out of scope; leave alone.
+                groups.setdefault(("", label, *kind, nid), []).append(nid)
+                continue
+            groups.setdefault((f, label, *kind), []).append(nid)
+
+        mapping: dict = {}
+        survivors: dict = {}
+        changed = False
+        for (f, label, *_rest), members in groups.items():
+            if len(members) > 1:
+                # Keep the node whose ORIGINAL path was already the real one:
+                # its source_location came from the build that saw the true
+                # file, so its line numbers are the ones worth keeping.
+                members = sorted(
+                    members,
+                    key=lambda n: (
+                        str(G.nodes[n].get("source_file") or "") != f,
+                        str(G.nodes[n].get("label", "")) != label,
+                        str(n),
+                    ),
+                )
+                changed = True
+            keep = members[0]
+            attrs = dict(G.nodes[keep])
+            if f and attrs.get("source_file") != f:
+                attrs["source_file"] = f
+                changed = True
+            if attrs.get("label") != label:
+                attrs["label"] = label
+                attrs["norm_label"] = label
+                changed = True
+            survivors[keep] = attrs
+            for n in members:
+                mapping[n] = keep
+
+        if not changed:
+            return G
+        H = nx.relabel_nodes(G, mapping, copy=True)
+        for nid, attrs in survivors.items():
+            if nid in H:
+                H.nodes[nid].update(attrs)
+        # merging two nodes turns an edge between them into a self-loop, which
+        # is not a relationship anybody asked about
+        H.remove_edges_from(list(nx.selfloop_edges(H)))
+        return H
 
     @staticmethod
     def _vocabulary(G: nx.Graph) -> tuple[Counter[str], dict[str, set[str]], dict[str, set[str]]]:
@@ -856,6 +1313,8 @@ class KG:
                 "question if what you need is not here]"
             )
 
+        stale = self._is_stale_cached()
+
         if confidence == "weak":
             nearest = self._nearest_vocab(question, vocab)
             lines.insert(0, (
@@ -868,41 +1327,123 @@ class KG:
                 "same question reworded a third time.]"
             ))
 
+        if stale:
+            # first line, so it survives the budget clip below and qualifies
+            # everything under it rather than trailing off the end
+            lines.insert(0, STALE_NOTICE)
+
         text = "\n".join(lines)
         char_budget = budget * 4
         if len(text) > char_budget:
             text = text[:char_budget] + f"\n... [truncated at ~{budget} tokens; pass a larger budget]"
         return KGQueryResult(
             text=text, hit_count=len(sub_nodes), expanded_tokens=expanded,
-            mode=mode, confidence=confidence,
+            mode=mode, confidence=confidence, stale=stale,
         )
 
-    def digest(self, max_files: int = 15, max_symbols: int = 6) -> str:
-        """Compact orientation block for a system prompt: the files with the
-        most symbols plus the highest-degree hub nodes — the pre-computed
-        answer to the 'what is this codebase?' query every session starts with."""
-        def short_label(nd: dict, nid) -> str:
-            return _short_label(nd, nid, 48)  # tighter than query output
+    def digest(self, max_files: int = 15, max_symbols: int = 5) -> str:
+        """Compact orientation block for a system prompt — the pre-computed
+        answer to the "what is this codebase?" question every session starts
+        with.
 
+        Source files first, ranked by how many symbols they define; test files
+        are summarised on one line. The old map ranked every file the same
+        way, so on this repo six of its top nine entries were test files — it
+        told the model where the tests were, not what the program was. Each
+        file leads with its own first docstring or comment line (the author's
+        one-sentence answer), and the symbols shown are the file's most-USED
+        ones by call/import degree, not the alphabetically first six. Only
+        `code` nodes count as symbols: rationale, concept and document nodes
+        are what turned the old map into a list of docstring fragments."""
         G = self._load_graph()
-        by_file: dict[str, set[str]] = {}
+        # Cross-file use-degree per symbol. The graph is undirected, so "who
+        # imports whom" is gone by the time it loads; what survives is how many
+        # OTHER files' symbols a symbol touches. Intra-file edges are skipped —
+        # a call within a module says nothing about the module's place in the
+        # repo.
+        file_of = {nid: _norm_path(_node_file(nd)) for nid, nd in G.nodes(data=True)}
+        use_degree: dict = {}
+        touches: dict[str, set[str]] = {}  # file -> other files its symbols connect to
+        for u, v, d in G.edges(data=True):
+            if str(d.get("relation") or "") in _STRUCTURAL_RELATIONS:
+                continue
+            fu, fv = file_of.get(u) or "", file_of.get(v) or ""
+            if fu and fu == fv:
+                continue
+            use_degree[u] = use_degree.get(u, 0) + 1
+            use_degree[v] = use_degree.get(v, 0) + 1
+            if fu and fv:
+                touches.setdefault(fu, set()).add(fv)
+                touches.setdefault(fv, set()).add(fu)
+
+        by_file: dict[str, list[tuple[int, str, str]]] = {}
         for nid, nd in G.nodes(data=True):
-            f = _node_file(nd)
-            if f:
-                by_file.setdefault(f, set()).add(short_label(nd, nid))
+            if str(nd.get("file_type") or "code") != "code":
+                continue
+            f = _norm_path(_node_file(nd))
+            if not f or not _is_source_path(f):
+                continue
+            label = _short_label(nd, nid, 40)
+            if _norm_path(label) == f:
+                continue  # the file's own node, not a symbol in it
+            by_file.setdefault(f, []).append((use_degree.get(nid, 0), label, nid))
+
+        source = {f: s for f, s in by_file.items() if not _is_test_path(f)}
+        tests = [f for f in by_file if _is_test_path(f)]
         lines = ["[repo map — from the knowledge graph]"]
-        for f, syms in sorted(by_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:max_files]:
-            shown = ", ".join(sorted(syms)[:max_symbols])
-            more = f", +{len(syms) - max_symbols} more" if len(syms) > max_symbols else ""
-            lines.append(f"  {f}: {shown}{more}")
-        hubs = sorted(G.degree, key=lambda kv: -kv[1])[:8]
-        seen: list[str] = []
-        for n, _ in hubs:
-            lbl = short_label(G.nodes[n], n)
-            if lbl not in seen:
-                seen.append(lbl)
-        if seen:
-            lines.append("  key hubs: " + ", ".join(seen))
+        # A file's rank is how many OTHER files its symbols connect to. That is
+        # direction-free (the graph is undirected), size-free (a 178-symbol
+        # TUI component file touching four files sits below a 20-line module
+        # touching forty), and it is what surfaces the entry points and the
+        # shared abstractions — cli, serve, the tool base — which is what "what
+        # is this codebase" means. Ties break on squared symbol degree, which
+        # tells "one class three files import" (1 × 3² = 9) apart from "three
+        # functions that each import it" (3 × 1² = 3); then on size.
+        ranked = sorted(
+            source.items(),
+            key=lambda kv: (
+                -len(touches.get(kv[0], ())),
+                -sum(d * d for d, _, _ in kv[1]),
+                -len(kv[1]),
+                kv[0],
+            ),
+        )[:max_files]
+        for f, syms in ranked:
+            # top-level names (classes, functions) before `.method()` entries,
+            # each group by use-degree — the shape of a module is its exports
+            top = [lbl for _, lbl, _ in sorted(syms, key=lambda x: (x[1].startswith('.'), -x[0], x[1]))]
+            shown = ", ".join(top[:max_symbols])
+            more = f", +{len(top) - max_symbols} more" if len(top) > max_symbols else ""
+            purpose = _file_purpose(self.repo_root / f)
+            head = f"  {f}" + (f" — {purpose}" if purpose else "")
+            lines.append(f"{head} ({shown}{more})")
+        if len(source) > len(ranked):
+            lines.append(f"  … and {len(source) - len(ranked)} more source files")
+        if tests:
+            names = sorted(tests, key=lambda f: (-len(by_file[f]), f))
+            shown = ", ".join(n.rsplit("/", 1)[-1] for n in names[:6])
+            tail = ", …" if len(tests) > 6 else ""
+            plural = "s" if len(tests) != 1 else ""
+            lines.append(f"  tests: {len(tests)} file{plural} ({shown}{tail})")
+
+        # hubs: the most-used symbols repo-wide, each tagged with its file so
+        # the name is something `read` can act on
+        hubs: list[str] = []
+        for nid, _ in sorted(use_degree.items(), key=lambda kv: (-kv[1], str(kv[0]))):
+            nd = G.nodes[nid]
+            if str(nd.get("file_type") or "code") != "code":
+                continue
+            f = _norm_path(_node_file(nd))
+            lbl = _short_label(nd, nid, 40)
+            if not f or _norm_path(lbl) == f or not _is_source_path(f) or _is_test_path(f):
+                continue
+            tag = f"{lbl} [{f.rsplit('/', 1)[-1]}]"
+            if tag not in hubs:
+                hubs.append(tag)
+            if len(hubs) >= 8:
+                break
+        if hubs:
+            lines.append("  key hubs: " + ", ".join(hubs))
         return "\n".join(lines)
 
     def affected_files(self, files: list[str], depth: int = 2, limit: int = 8) -> list[str]:

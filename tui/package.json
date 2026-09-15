@@ -8,7 +8,8 @@
     "start": "tsx src/main.ts",
     "dev": "tsx src/main.ts",
     "check": "tsc --noEmit",
-    "test": "tsx src/markdown.smoke.ts && tsx src/branding.test.ts",
+    "test": "tsx src/markdown.smoke.ts && tsx src/branding.test.ts && tsx src/queue.test.ts && tsx src/mcp-catalog.smoke.ts && tsx src/bridge.test.ts && tsx src/pickers.test.ts",
+    "test:mcp-catalog": "tsx src/mcp-catalog.smoke.ts",
     "debug": "tsx src/debug.ts"
   },
   "dependencies": {

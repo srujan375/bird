@@ -1,8 +1,9 @@
 import { useSyncExternalStore } from "react";
-import { boardLine, dropTurn, getChat, nextTurnId, patchTurn, push, say, setChat, settleAskInMessage, spendAsk, you } from "../board/chat";
+import { ask, boardLine, dropTurn, getChat, hasAsk, nextTurnId, patchTurn, push, queueAsk, resetChat, say, setChat, settleAskInMessage, spendAsk, you } from "../board/chat";
+import type { PickerOption } from "../board/picker";
 import { splitTask } from "./task";
 import { flash } from "../board/ui";
-import type { ArchState, ConnState, Incoming, ReadyEvent } from "./types";
+import type { ArchState, ConnState, Frontier, Incoming, ReadyEvent, ScribeEvent } from "./types";
 
 /**
  * Harness truth. Every field here is written by an event and never by the page.
@@ -29,6 +30,14 @@ export interface SessionState {
   bornWith: Record<string, true>;
   totalIn: number;
   totalOut: number;
+  /** what is still askable, and what the user closed — from the harness */
+  frontier: Frontier | null;
+  /** the scribe's state, when one is drawing the board a step behind */
+  scribe: ScribeEvent | null;
+  /** a scribe is on: the board's lines belong to its strip, not the thread */
+  scribeOn: boolean;
+  /** the research turn's steps, in order */
+  research: { step: string; text: string; done: boolean }[];
 }
 
 let state: SessionState = {
@@ -43,6 +52,10 @@ let state: SessionState = {
   bornWith: {},
   totalIn: 0,
   totalOut: 0,
+  frontier: null,
+  scribe: null,
+  scribeOn: false,
+  research: [],
 };
 
 const listeners = new Set<() => void>();
@@ -76,6 +89,8 @@ function toolLine(name: string, details: Record<string, unknown> | null | undefi
  *  text that describes them rather than in a block of their own. */
 let openTurnId: number | null = null;
 let thinkingId: number | null = null;
+/** the research turn's list, while it is the live indicator */
+let progressId: number | null = null;
 
 /** Text arrives a token at a time. It lands in a turn of its own that grows,
  *  rather than appearing whole when the turn is already over — the waiting is
@@ -110,7 +125,12 @@ export function applyEvent(ev: Incoming): void {
         conn: state.conn === "complete" ? "complete" : "connected",
         totalIn: ev.input_tokens ?? 0,
         totalOut: ev.output_tokens ?? 0,
+        scribeOn: Boolean(ev.scribe),
       });
+      break;
+
+    case "scribe":
+      set({ scribe: ev });
       break;
 
     case "arch_state": {
@@ -128,9 +148,18 @@ export function applyEvent(ev: Incoming): void {
         noticing: ev.noticing ?? [],
         changed: ev.changed,
         pendingEdits: ev.pending_edits ?? 0,
+        frontier: ev.frontier ?? state.frontier,
         bornWith,
         ...(handedOff && !state.handedOff ? { handedOff: true, conn: "complete" as ConnState } : {}),
       });
+      /* The one question on the table, if there is one. The harness re-pushes
+         its whole state on every change, so the id is what makes this idempotent
+         — and because it only ever sends the earliest open question, the next
+         one appears here exactly when the last is answered. */
+      if (ev.ask && !hasAsk(ev.ask.id)) {
+        if (openTurnId === null) openTurnId = push({ t: "say", id: nextTurnId(), lines: [] });
+        ask(openTurnId, ev.ask);
+      }
       break;
     }
 
@@ -142,7 +171,13 @@ export function applyEvent(ev: Incoming): void {
              sends them as one turn, so the page has to show every half or the
              typed words disappear from the record. */
           const { drew, about, picked, typed } = splitTask(data.task);
-          if (drew.length || about.length || picked.length) {
+          /* A bare pick says nothing here: the row it answered has already
+             collapsed into the answered block above, which is the record. A
+             turn reading "you · picked" under it is the same fact twice. */
+          const bare = picked.length && !typed && !drew.length && !about.length;
+          if (bare) {
+            /* nothing to add to the thread */
+          } else if (drew.length || about.length || picked.length) {
             const via = !typed && drew.length && !picked.length ? "on the board"
               : !typed && picked.length ? "picked" : undefined;
             you(typed || undefined, undefined, via, drew, about);
@@ -179,11 +214,28 @@ export function applyEvent(ev: Incoming): void {
         if (data.tool_calls?.length) startThinking();
       } else if (event === "tool_result") {
         const line = toolLine(String(data.name ?? "tool"), data.details);
-        if (openTurnId === null) openTurnId = push({ t: "say", id: nextTurnId(), lines: [] });
-        boardLine(openTurnId, line.text, line.ids);
+        /* With a scribe on, the board's lines belong to its strip: the thread
+           carries the argument only. The halo still says what moved. */
+        if (!state.scribeOn) {
+          if (openTurnId === null) openTurnId = push({ t: "say", id: nextTurnId(), lines: [] });
+          boardLine(openTurnId, line.text, line.ids);
+        }
         /* halo everything that call touched, so a change that lands while you
            are reading elsewhere is still visible when you look back */
         if (line.ids.length) flash(line.ids);
+      } else if (event === "research") {
+        /* the research turn: one line per kind of work, in place of the
+           thinking dots, kept afterwards as the record of the first minute */
+        const step = String(data.step ?? "");
+        const text = String(data.text ?? step);
+        const done = Boolean(data.done);
+        const steps = state.research.some((r) => r.step === step)
+          ? state.research.map((r) => (r.step === step ? { ...r, text, done } : r))
+          : [...state.research, { step, text, done }];
+        set({ research: steps });
+        stopThinking();
+        if (progressId === null) progressId = push({ t: "progress", id: nextTurnId(), steps });
+        else patchTurn(progressId, { steps } as never);
       } else if (event === "abort") {
         stopThinking();
         say([`_The turn stopped: ${data.reason || "no reason given"}._`]);
@@ -195,6 +247,14 @@ export function applyEvent(ev: Incoming): void {
       stopThinking();
       finishStream();
       openTurnId = null;
+      if (progressId !== null) {
+        /* the list stays as the record; nothing in it is live any more */
+        const steps = state.research.map((r) => ({ ...r, done: true }));
+        patchTurn(progressId, { steps } as never);
+        set({ research: steps });
+        progressId = null;
+      }
+      if (ev.status === "interrupted") say([stopCopy(ev.reason)]);
       set({
         running: false,
         totalIn: ev.input_tokens ?? state.totalIn,
@@ -210,9 +270,20 @@ export function applyEvent(ev: Incoming): void {
       break;
 
     case "bye":
+      over = true;
+      source?.close();
+      source = null;
       if (!state.handedOff) set({ conn: "disconnected", running: false });
       break;
   }
+}
+
+/** Why a turn stopped, in the page's words. "you interrupted it" is said
+ *  only when the harness says it was the user. */
+export function stopCopy(reason: unknown): string {
+  if (reason === "user") return "_You stopped the turn._";
+  if (reason === "shutdown") return "_The session is closing._";
+  return "_The turn stopped._";
 }
 
 /* ── talking back ─────────────────────────────────────────────────────── */
@@ -233,19 +304,27 @@ export function sendInput(text: string, subjects: string[] = []): void {
   void post("/input", subjects.length ? { text, subjects } : { text });
 }
 
-/** Answering with a row of the picker. Sent as its own prefixed block so the
- *  harness transcript records "picked", never words the user did not type. */
-export function sendPick(label: string): void {
-  spendAskPending(label);
-  sendInput(`${PICK_PREFIX}\n- ${label}`);
+/**
+ * Answering with a row of the picker.
+ *
+ * The answer goes to the harness, not to the message box: the harness settles
+ * the question on its own state and starts the turn itself, prefixed so the
+ * transcript records "picked" rather than words the user never typed. That
+ * order matters — the state is what decides which question is next, so the
+ * page can never get ahead of it.
+ */
+export function sendAnswer(host: number, id: string, option: PickerOption): void {
+  /* While the architect is still writing, the harness parks the answer until
+     the turn ends. The dock says so; the turn the answer starts is what
+     collapses the question (run_start carries the pick). */
+  if (state.running) queueAsk(host, option.label, option.value);
+  else spendAsk(host, option.label, option.value);  // it reads as done the frame it happens
+  void post("/answer", { id, value: option.value });
 }
 
-/* Optimistically settle every open ask — the run_start echo confirms it, but
-   a pick should read as done the frame it happens. */
-function spendAskPending(label: string) {
-  for (const t of getChat().turns) {
-    if (t.t === "say" && t.ask && !t.ask.spent) spendAsk(t.id, label);
-  }
+/** The user closes a branch from the frontier, or reopens one. */
+export function closeBranch(op: "settle" | "out_of_scope" | "reopen", id: string): Promise<string | null> {
+  return mutate({ op, id });
 }
 
 /**
@@ -290,12 +369,37 @@ export function refusal(message: string): void {
 /* ── the connection ───────────────────────────────────────────────────── */
 
 /**
- * One SSE connection for the life of the page. The harness replays late
- * joiners (ready, a bounded transcript buffer, the latest arch_state), so a
- * refresh mid-session rebuilds everything without special-casing.
+ * One SSE connection at a time, for the life of the page. The harness replays
+ * a joiner (ready, a bounded transcript buffer, the latest arch_state), so a
+ * refresh mid-session rebuilds everything without special-casing — and so
+ * does a reconnect: a dropped connection used to be the end of the page, its
+ * composer announcing the harness gone while the server sat there serving.
+ * Now it is retried with backoff, the transcript cleared just before the
+ * replay so nothing lands twice, and only a `bye` is final.
  */
+const BACKOFF_MAX_MS = 15000;
+let source: EventSource | null = null;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let attempt = 0;
+/** the harness said goodbye: nothing to reconnect to */
+let over = false;
+
+function resetForReplay(): void {
+  resetChat();
+  openTurnId = null; thinkingId = null; streamId = null; streamText = ""; progressId = null;
+  set({ bornWith: {}, research: [] });
+}
+
 export function connect(): void {
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  if (typeof EventSource === "undefined") return;
+  source?.close();
   const es = new EventSource("/events");
+  source = es;
+  es.onopen = () => {
+    attempt = 0;
+    if (state.conn === "reconnecting") resetForReplay();
+  };
   es.onmessage = (e) => {
     let parsed: Incoming;
     try {
@@ -306,9 +410,31 @@ export function connect(): void {
     applyEvent(parsed);
   };
   es.onerror = () => {
+    if (source !== es) return; // an older connection, already replaced
     es.close();
-    if (!getSession().handedOff) set({ conn: "disconnected", running: false });
+    source = null;
+    if (over || state.handedOff || state.conn === "complete") {
+      if (state.conn !== "complete") set({ conn: "disconnected", running: false });
+      return;
+    }
+    const delay = Math.min(BACKOFF_MAX_MS, 1000 * 2 ** attempt);
+    attempt++;
+    if (state.conn !== "reconnecting") set({ conn: "reconnecting" });
+    retryTimer = setTimeout(connect, delay);
   };
+}
+
+/** How the page is doing on the wire, for tests. */
+export const connection = () => ({ attempt, retrying: retryTimer !== null, over });
+
+/** Tests: back to a fresh page. */
+export function resetSession(): void {
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  source?.close(); source = null; attempt = 0; over = false;
+  state = { ...state, conn: "connecting", arch: null, noticing: [], changed: null, running: false, handedOff: false,
+    pendingEdits: 0, bornWith: {}, frontier: null, scribe: null, scribeOn: false, research: [] };
+  openTurnId = null; thinkingId = null; streamId = null; streamText = ""; progressId = null;
+  emit();
 }
 
 export const chatIsOpen = () => getChat().open;

@@ -253,8 +253,9 @@ cd arch-ui  && npm install    # only needed to rebuild the architecture canvas
 ```
 
 **What to actually run it on.** Any tool-calling model in `models.json` should
-work, and `/model` swaps between them mid-conversation. These are the ones with
-real hours on them:
+work. `/model` walks harness → model → thinking level: the pick becomes that
+harness's alias (and swaps the running session mid-conversation when it is the
+running harness). These are the ones with real hours on them:
 
 | Role | Run on | Notes |
 |---|---|---|
@@ -424,7 +425,8 @@ run). Then `-y/--yes` (auto-approve, for unattended `code`/`lead` runs) ·
 **Slash commands** (REPL and TUI):
 
 ```
-/help  /model [spec|filter]  /think [off|low|medium|high|max]
+/help  /model  /model <harness>  /model [harness] <spec> [mode] [tokens]
+/think [off|low|medium|high|max]
 /kg status|build|update|query  /tools  /skills
 /compact  /clear  /reload  /session  /sessions [filter]  /continue <id>
 /rename <name>  /quit          plus /<skill-name> for any loaded skill

@@ -11,8 +11,10 @@ from dotenv import find_dotenv, load_dotenv
 
 from .activity import attach_printer
 from .context.kg import KG
+from .context.store import ContextStore
 from .engine.runner import Runner
 from .engine.session import SessionRecorder, new_run_id
+from .llm.discovery import ollama_context_window
 from .llm.ollama import Ollama, OllamaError
 from .llm.registry import USER_ENV_FILE, Registry, RegistryError
 from .llm.wire.openai_compat import WireError
@@ -20,6 +22,7 @@ from .llm.wire.openai_compat import OpenAICompatClient
 from .harnesses.handoff import read_seed
 from .harnesses.lead import lead_harness_tools
 from .harnesses.registry import build_runner
+from .paxel import STAGE_DIR_ENV
 from .tools import ToolContext
 from .skills import load_skills
 
@@ -57,7 +60,10 @@ def _add_common(p) -> None:
     p.add_argument("--no-web", action="store_true",
                    help="drop web_search/web_fetch — a network-free run, so an "
                         "eval measures the context engine and not the internet")
-    p.add_argument("--max-turns", type=int, default=40)
+    # unset = no ceiling; the stuck guards end a spinning run, and a run that
+    # is making progress is not cut off mid-job. Pass it to budget a headless
+    # batch where nobody is watching.
+    p.add_argument("--max-turns", type=int, default=None)
     p.add_argument("--models-json", default=None, help="path to a models.json override")
     p.add_argument(
         "--resume",
@@ -120,6 +126,27 @@ def main(argv: list[str] | None = None) -> int:
     arch = sub.add_parser("arch", help="architecture session in a browser page")
     arch.add_argument("task", nargs="?", default=None, help="what to design, in natural language")
     arch.add_argument("--no-open", action="store_true", help="don't open the browser (tests/headless)")
+    arch.add_argument("--engine", choices=["bird", "claude"], default="bird",
+                      help="what runs the model turn: bird's own loop (default), or the "
+                           "user's Claude Code — same page and board, but Claude Code "
+                           "picks the model, brings its read/search tools, and bills the "
+                           "subscription as a terminal session would")
+    arch.add_argument("--claude-bin", default=None,
+                      help="the `claude` binary for --engine claude (default: PATH, or $CLAUDE_BIN)")
+    arch.add_argument("--scribe-model", default="haiku", metavar="MODEL",
+                      help="--engine claude: the cheap model that draws the board one step "
+                           "behind the conversation (default: haiku)")
+    arch.add_argument("--no-scribe", action="store_true",
+                      help="--engine claude: no scribe; the architect draws in its own turn")
+    arch.add_argument("--linger", type=float, default=ARCH_LINGER_SECONDS, metavar="SECONDS",
+                      help="after the handoff, keep serving the finished board until the tab "
+                           "closes or this many seconds pass (default: 30 minutes). A caller "
+                           "waiting on the exit — a terminal agent that dispatched this — "
+                           "wants it short")
+    arch.add_argument("--close-when-empty", type=float, default=0.0, metavar="SECONDS",
+                      help="end the session when the page has been closed for this long "
+                           "(default: never). Without it a dispatched run whose tab was "
+                           "closed without a handoff waits forever")
     arch.add_argument("--repl", action="store_true",
                       help="have the design conversation in the terminal instead of the "
                            "browser page. Same harness, same board underneath — the canvas "
@@ -129,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
                            "exit. For evals and scripting — a design conversation with no "
                            "user is not the product")
     _add_common(arch)
+
+    design = sub.add_parser("design", help="design session in a browser page (the Workbench)")
+    design.add_argument("task", nargs="?", default=None, help="what to design, in natural language")
+    design.add_argument("--no-open", action="store_true", help="don't open the browser (tests/headless)")
+    _add_common(design)
 
     kg_cmd = sub.add_parser("kg", help="knowledge graph maintenance")
     kg_cmd.add_argument("action", choices=["build", "update", "query", "status"])
@@ -174,6 +206,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_common(doctor_cmd)
 
+    paxel_cmd = sub.add_parser(
+        "paxel",
+        help="stage this repo's sessions for Paxel's uploader (never uploads)",
+        description=(
+            "Convert this repo's bird sessions into the Claude Code layout Paxel "
+            "ingests, under ~/.paxel/staged-transcripts/<repo>/. Nothing is "
+            "uploaded — the staged files are local until you run Paxel's own "
+            "uploader, which the command prints.\n\n"
+            "originalPath is set to the repo's git toplevel, so bird's sessions "
+            "land in the same project bucket as Claude Code's. To get ONE report "
+            "covering both, run Paxel with --all-agents (or from the parent "
+            "folder):\n"
+            "  export TRANSCRIPT_DIR=~/.paxel/staged-transcripts\n"
+            "  curl -fsSL https://paxel.ycombinator.com/upload.sh | bash -s -- --all-agents --all"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    paxel_cmd.add_argument("--repo", default=".", help="repository root (default: cwd)")
+    paxel_cmd.add_argument(
+        "--stage-dir", default=None, metavar="DIR",
+        help=f"where to stage (default: ${STAGE_DIR_ENV}, else ~/.paxel/staged-transcripts)",
+    )
+    paxel_cmd.add_argument(
+        "--session", action="append", default=None, metavar="RUN_ID",
+        help="stage only this session (repeatable; a run-id prefix works). "
+             "Default: every session in the repo",
+    )
+
     args = parser.parse_args(argv)
     try:
         return _dispatch(args)
@@ -199,12 +259,18 @@ def _dispatch(args) -> int:
         from .doctor import doctor_main
 
         return doctor_main(args)
+    if args.command == "paxel":
+        from .paxel import paxel_main
+
+        return paxel_main(args, Path(args.repo).resolve())
     if args.command == "kg":
         return _kg_main(args)
     if args.command == "serve":
         return _serve_main(args)
     if args.command == "arch":
         return _arch_main(args)
+    if args.command == "design":
+        return _design_main(args)
     if args.command == "lead":
         if args.task:
             return _lead_main(args)  # one-shot: route and build, no interactive shell
@@ -274,6 +340,13 @@ def _setup(args):
         return 2
 
     registry = Registry.load(args.models_json)
+    if args.model:
+        # --model naming a local Ollama model with no models.json entry: the
+        # daemon knows its window; assuming 32k would compact far too early
+        window = ollama_context_window(registry, args.model)
+        if window:
+            spec_key = registry.aliases.get(args.model, args.model)
+            registry.models.setdefault(spec_key, {})["context_window"] = window
     spec = registry.resolve(args.model)
 
     if spec.provider.name == "ollama":
@@ -333,6 +406,9 @@ def _make_runner(args, registry, spec, kg, recorder, *, harness="code",
         # before the runner is built — and it rides the ctx into any
         # sub-harness the lead dispatches
         broker=broker,
+        # one store per process, shared by every harness this session runs:
+        # what the lead works out is what the code fork starts from
+        store=ContextStore(),
     )
     # all harness construction goes through the registry now — the arch/code/lead
     # tuning (instructions, toolset, nudges, tracker) lives in HarnessDef, not here
@@ -602,12 +678,20 @@ def _arch_main(args) -> int:
     from .harnesses.arch.session import ArchSession
     from .harnesses.arch.state import LegacyStateError
 
+    if getattr(args, "engine", "bird") == "claude":
+        if args.headless or args.repl:
+            print("--engine claude runs the browser page only (no --headless / --repl)",
+                  file=sys.stderr)
+            return 2
+        from .harnesses.arch.claude import main as claude_main
+
+        return claude_main(args)
     if args.headless:
         return _arch_headless_main(args)
     if args.repl:
         return _arch_repl_main(args)
     from .http_transport import HttpTransport
-    from .permissions import PermissionBroker
+    from .permissions import ConsoleBroker
     from .repl import Repl
     from .serve import Server
 
@@ -621,10 +705,11 @@ def _arch_main(args) -> int:
     registry, spec, kg, _build_proc, run_id, run_dir = setup
 
     with SessionRecorder(run_dir) as recorder:
-        # arch mounts no gated tools (it designs, it doesn't touch the repo) and
-        # has no gates of its own any more; the broker is here so the Server has
-        # one to hand any sub-session, and stays inert for the whole run
-        broker = PermissionBroker()
+        # arch mutates nothing, but its `read` is gated outside the repo
+        # (read_outside_repo). The Workbench page has no permission UI, so a
+        # page-bound broker would hang the session on the first such read;
+        # the terminal this command runs in answers instead.
+        broker = ConsoleBroker()
         runner = _make_runner(args, registry, spec, kg, recorder, harness="arch",
                               broker=broker)
         repl = Repl(runner, registry, kg, recorder, run_id)
@@ -638,7 +723,8 @@ def _arch_main(args) -> int:
             # the handoff ends the session, not the reading of it: keep serving
             # the read-only design until the tab is closed (or half an hour
             # passes). Nothing can change any more.
-            linger=ARCH_LINGER_SECONDS,
+            linger=args.linger,
+            close_when_empty=args.close_when_empty,
         )
         server = Server(repl, transport=transport, broker=broker)
 
@@ -737,6 +823,55 @@ def _arch_headless_main(args) -> int:
     # arch_state.json — it is a weaker result, not a crash, so it is not an
     # error exit. The caller reads the status to tell the two apart.
     return 0 if state.handed_off else 1
+
+
+def _design_main(args) -> int:
+    """`bird design`: the design Workbench in a browser page.
+
+    Interactive only, like arch's page path: run.py has no headless form (a
+    design conversation with nobody in the room has nothing to finalize) and
+    no resume. The session ends when the user finalizes or closes the page."""
+    from .harnesses.design.run import run_design_interactive
+    from .permissions import ConsoleBroker
+
+    # design defaults to the designer alias; an explicit --model always wins.
+    # Remapped before _setup so the Ollama pre-flight resolves the same model
+    # the session will actually run.
+    if args.model == "default":
+        args.model = "designer"
+    setup = _setup(args)
+    if isinstance(setup, int):
+        return setup
+    registry, spec, kg, _build_proc, run_id, run_dir = setup
+
+    print(f"bird design | model={spec.spec} | kg={'off' if args.no_kg else 'on'} "
+          f"| session={run_id}")
+    # no SessionRecorder here: run_design_interactive opens its own on this same
+    # run_dir, and a second one would just hold an idle handle on the log
+    #
+    # same broker contract as arch: the Workbench page renders no permission
+    # prompts, so the terminal this command runs in answers
+    session = run_design_interactive(
+        repo_root=Path(args.repo).resolve(),
+        prompt=args.task or "",
+        registry=registry,
+        client=OpenAICompatClient(),
+        run_dir=run_dir,
+        kg=kg,
+        model=args.model,
+        no_open=args.no_open,
+        broker=ConsoleBroker(),
+    )
+
+    artboard = session.state.finalized_artboard
+    if artboard:
+        print(f"\n[finalized] artboard={artboard} | session={run_dir}")
+    else:
+        print(f"\n[unfinalized] the session ended without a finalized artboard "
+              f"| session={run_dir}")
+    # an unfinalized session is a weaker result, not a crash — the board is
+    # still on disk in design_state.json for the next run to pick at
+    return 0
 
 
 def _lead_main(args) -> int:

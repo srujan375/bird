@@ -1,0 +1,19 @@
+{
+  "name": "bird",
+  "owner": {
+    "name": "srujan375"
+  },
+  "metadata": {
+    "description": "Plugins from the bird repository",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "bird",
+      "source": "./plugins/bird",
+      "description": "Design on a board before you build: /bird:arch opens bird's architecture Workbench in the browser and hands the design back as a bundle.",
+      "version": "0.1.0",
+      "category": "development"
+    }
+  ]
+}

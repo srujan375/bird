@@ -79,8 +79,8 @@ CATEGORY_HELP = (
     "go test, cargo test, make test, prefixed with uv run / poetry run / npx if needed), "
     "linters and type checks (ruff, mypy, flake8, eslint, tsc), and git reads (status, "
     "log, diff, show, branch, blame). Also allowed: package-manager installs (npm/pnpm/yarn "
-    "install, npm ci) and any package.json script (npm/pnpm/yarn run <script>), bare python "
-    "on a script file (python script.py, python3 manage.py migrate), pip install, and "
+    "install, npm ci) and any package.json script (npm/pnpm/yarn run <script>), an interpreter "
+    "on a script file (python script.py, node probe.js, npx tsx probe.ts), pip install, and "
     "activating a virtualenv (source .venv/bin/activate && pytest). "
     "Rejected: python -c (inline code), python -m outside the module allowlist. "
     "Use the edit/write tools to change files."
@@ -177,7 +177,11 @@ def _segment_tokens(command: str) -> tuple[list[list[str]], str | None]:
 def check_command(command: str, categories: tuple[str, ...]) -> str | None:
     """Return None if allowed, else a rejection reason."""
     if re.search(r"(?<!\d)>{1,2}|<\(", _split_unquoted(command)[1]):
-        return "output redirection is not allowed; use the write tool to create files"
+        return (
+            "output redirection is not allowed; use the write tool to create files. "
+            "Nothing needs capturing: when a command's output is long it is saved to "
+            "a file automatically and the result names the path — `read` that."
+        )
     segments, parse_error = _segment_tokens(command)
     if parse_error:
         return parse_error
@@ -194,19 +198,29 @@ def _is_check_linter(head: str, tokens: list[str]) -> bool:
     return head in CHECK_LINTERS and not (len(tokens) >= 2 and tokens[1] in FORMAT_SUBCOMMANDS)
 
 
-def _is_bare_python_script(tokens: list[str]) -> bool:
-    """`python script.py` / `python3 manage.py migrate` — bare python on a
-    file path. Arbitrary code execution, but the harness already has
-    edit/write tools that can write arbitrary code, so this removes friction
-    without adding a new attack surface. `python -c "..."` (inline code with
-    no file to audit) is rejected; `python -m <module>` is handled separately
-    and stays restricted to PYTHON_MODULE_ALLOW."""
+# Interpreters that may be pointed at a script FILE. Node and the TypeScript
+# runners are here for the same reason python is: a repo whose code is
+# TypeScript had no permitted way to run a throwaway probe, so a model that
+# wrote one — the right instinct — could not execute it and fell back to
+# reading compiled output by hand.
+SCRIPT_RUNNER_HEADS = {"python", "python3", "node", "tsx", "ts-node"}
+SCRIPT_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")
+
+
+def _is_bare_script_run(tokens: list[str]) -> bool:
+    """`python script.py`, `node probe.js`, `npx tsx probe.ts` — an interpreter
+    pointed at a file path. Arbitrary code execution, but the harness already
+    has edit/write tools that can write arbitrary code, so this removes friction
+    without adding a new attack surface: the file is on disk and auditable.
+    Inline code with nothing to audit (`python -c`, `node -e`) is rejected, and
+    `python -m <module>` is handled separately, restricted to
+    PYTHON_MODULE_ALLOW."""
     if len(tokens) < 2:
         return False
     arg = tokens[1]
     if arg.startswith("-"):
-        return False  # -c, -m, -I, ... are not a bare script path
-    return arg.endswith(".py") or "/" in arg
+        return False  # -c, -e, -m, -I, ... are not a bare script path
+    return arg.endswith(SCRIPT_SUFFIXES) or "/" in arg
 
 
 def _is_venv_activate(tokens: list[str]) -> bool:
@@ -328,7 +342,7 @@ def _check_segment(head: str, tokens: list[str], categories: tuple[str, ...]) ->
         return None
     if "test" in categories and head in PIP_INSTALL_HEADS and len(tokens) >= 2 and tokens[1] == "install":
         return None
-    if "test" in categories and head in {"python", "python3"} and _is_bare_python_script(tokens):
+    if "test" in categories and head in SCRIPT_RUNNER_HEADS and _is_bare_script_run(tokens):
         return None
     if "test" in categories and len(tokens) >= 3 and (head, tokens[1]) in SCRIPT_RUNNERS:
         # any package.json script name is allowed — the script is the user's
@@ -345,8 +359,73 @@ def _check_segment(head: str, tokens: list[str], categories: tuple[str, ...]) ->
         sub = next((t for t in tokens[1:] if not t.startswith("-")), "")
         if sub in GIT_READ_SUBCOMMANDS:
             return None
-        return f"git '{sub}' is not a read-only subcommand ({CATEGORY_HELP})"
-    return f"'{head}' is not in the allowed categories. {CATEGORY_HELP}"
+        return f"git '{sub}' is not a read-only subcommand. {_nearest_allowed(head, tokens)}"
+    return f"'{head}' is not in the allowed categories. {_nearest_allowed(head, tokens)}"
+
+
+# git subcommands that rewrite the working tree. Named so the hint can say why
+# they are refused — the tree holds in-progress work — rather than only that.
+_GIT_TREE_REWRITES = {"stash", "checkout", "restore", "reset", "clean", "switch", "rebase", "merge"}
+_FILE_MUTATORS = {"rm", "mv", "cp", "mkdir", "touch", "tee", "chmod", "ln", "rmdir"}
+_FETCHERS = {"curl", "wget"}
+
+
+def _nearest_allowed(head: str, tokens: list[str]) -> str:
+    """The allowed form closest to what was tried, named outright.
+
+    Of 206 logged rejections, 45 were `python`/`python3` — nearly all
+    `python -c` probes — and the reply was a list of categories. The model's
+    next move was a shell grep, which is where the same-call loops started,
+    or a fourth guess at the test command. Told instead "write it to a file
+    and run `python probe.py`", it takes that turn. The category list stays
+    as the fallback for a head nothing here recognises.
+    """
+    arg = tokens[1] if len(tokens) > 1 else ""
+    if head in {"python", "python3"}:
+        if arg == "-c":
+            return (
+                "Nearest allowed: inline code is rejected. Write it to a file and run "
+                "`python probe.py`, or run tests with `python -m pytest <tests>`."
+            )
+        if arg == "-m":
+            return (
+                "Nearest allowed: `python -m` only for "
+                + ", ".join(sorted(PYTHON_MODULE_ALLOW))
+                + ". For anything else write a script file and run `python script.py`."
+            )
+        return (
+            "Nearest allowed: `python path/to/script.py` (a script file) or "
+            "`python -m pytest <tests>`. A venv interpreter such as `.venv/bin/python` "
+            "is accepted in the same forms."
+        )
+    if head in {"node", "tsx", "ts-node"}:
+        return (
+            "Nearest allowed: point the interpreter at a script file — `node probe.js`, "
+            "`npx tsx probe.ts`. Inline `-e` code is rejected."
+        )
+    if head == "git":
+        sub = next((t for t in tokens[1:] if not t.startswith("-")), "")
+        if sub in _GIT_TREE_REWRITES:
+            return (
+                "Nearest allowed: git reads only (status, log, diff, show, branch, blame). "
+                f"Do not `git {sub}` — the working tree holds in-progress work that is not "
+                "yours to move. To isolate a change, run the specific test file instead."
+            )
+        return "Nearest allowed: git status / log / diff / show / branch / blame."
+    if head in _FILE_MUTATORS:
+        return "Nearest allowed: the write, edit and delete tools change files; bash may not."
+    if head in _FETCHERS:
+        return "Nearest allowed: the web_fetch tool for URLs; bash may not fetch."
+    if head in NPM_LIKE:
+        return (
+            f"Nearest allowed: `{head} install` / `{head} ci`, `{head} test`, or "
+            f"`{head} run <script>` for any package.json script."
+        )
+    if head in PIP_INSTALL_HEADS:
+        return "Nearest allowed: `pip install <pkg>` or `pip install -r requirements.txt`."
+    if head == "make":
+        return "Nearest allowed: make " + " / ".join(sorted(MAKE_TARGETS)) + "."
+    return CATEGORY_HELP
 
 
 class BashTool(Tool):

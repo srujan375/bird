@@ -1,8 +1,8 @@
 """Ollama lifecycle helper on the NATIVE API (not the /v1 shim).
 
-Health via /api/tags, model pull via /api/pull, and keep_alive warming via
-/api/generate so the model stays resident between harness turns instead of
-reloading weights on every call.
+Health via /api/tags, model pull via /api/pull, context length via
+/api/show, and keep_alive warming via /api/generate so the model stays
+resident between harness turns instead of reloading weights on every call.
 
 Auth: when an API key is supplied (either explicitly via ``api_key`` or via
 the ``OLLAMA_API_KEY`` env var when ``api_key_env="OLLAMA_API_KEY"``), every
@@ -29,6 +29,14 @@ DEFAULT_NATIVE_URL = "http://localhost:11434"
 DEFAULT_KEEP_ALIVE = "30m"
 
 DEFAULT_API_KEY_ENV = "OLLAMA_API_KEY"
+
+# pull() used to pass timeout=None: a daemon that accepted the request and then
+# went quiet left the socket open with nothing arriving and nothing ever
+# raising — the same indefinite hang the wire adapter's read timeout exists to
+# kill. 300s is generous enough for a multi-GB pull on a slow link (the daemon
+# streams progress lines the whole way, so only a genuinely stalled one trips
+# it) while guaranteeing the hang ends in an OllamaError instead of never.
+DEFAULT_PULL_TIMEOUT_SECONDS = 300
 
 
 class OllamaError(Exception):
@@ -94,6 +102,30 @@ class Ollama:
         names = set(self.local_models())
         return name in names or f"{name}:latest" in names
 
+    def context_length(self, name: str) -> int | None:
+        """The context window the daemon serves `name` with, per /api/show: a
+        Modelfile `num_ctx` when one is set (the daemon loads at that), else
+        the architecture's `<arch>.context_length`. None when the daemon can't
+        say — an unknown model, a hosted endpoint, a network error — so
+        callers fall back to their default instead of failing a listing."""
+        try:
+            resp = self._http.post(
+                f"{self.native_url}/api/show", json={"model": name}, headers=self._headers()
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        for line in (data.get("parameters") or "").splitlines():
+            key, _, value = line.partition(" ")
+            if key == "num_ctx" and value.strip().isdigit():
+                return int(value)
+        for key, value in (data.get("model_info") or {}).items():
+            if key.endswith(".context_length") and isinstance(value, int) and value > 0:
+                return value
+        return None
+
     def pull(self, name: str, on_progress=None) -> None:
         """Pull a model, streaming progress. Raises OllamaError on failure."""
         with self._http.stream(
@@ -101,7 +133,7 @@ class Ollama:
             f"{self.native_url}/api/pull",
             json={"model": name},
             headers=self._headers(),
-            timeout=None,
+            timeout=DEFAULT_PULL_TIMEOUT_SECONDS,
         ) as resp:
             if resp.status_code == 401 or resp.status_code == 403:
                 raise self._auth_error(f"pull {name}", resp.status_code)

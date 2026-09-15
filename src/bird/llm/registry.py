@@ -213,24 +213,31 @@ class Registry:
         )
 
     def set_default(self, spec: str, context_window: int | None = None) -> bool:
-        """Make `spec` the `default` alias, remembering its context window when
-        discovery learned one. Persists to the user file ~/.bird/models.json
-        (creating it if needed) so the choice survives upgrades and root-owned
-        prefixes — the builtin package file is never written. An explicit
-        --models-json keeps persisting to that file, as before. Returns False
-        when there is no file to write, or when the file is not writable. The
-        in-memory alias applies either way, so the current run still honours
-        the choice; only persistence is lost."""
-        self.aliases["default"] = spec
-        if context_window and spec not in self.models:
-            self.models[spec] = {"context_window": context_window}
+        """Make `spec` the `default` alias — see set_alias."""
+        return self.set_alias("default", spec, context_window)
+
+    def set_alias(self, alias: str, spec: str, context_window: int | None = None) -> bool:
+        """Point `alias` (default / architect / designer — one per harness) at
+        `spec`, remembering its context window when discovery learned one.
+        Persists to the user file ~/.bird/models.json (creating it if needed)
+        so the choice survives upgrades and root-owned prefixes — the builtin
+        package file is never written. An explicit --models-json keeps
+        persisting to that file, as before. Returns False when there is no
+        file to write, or when the file is not writable. The in-memory alias
+        applies either way, so the current run still honours the choice; only
+        persistence is lost."""
+        self.aliases[alias] = spec
+        if context_window and not self.models.get(spec, {}).get("context_window"):
+            # an entry may already exist without a window (a /think choice
+            # writes reasoning_effort alone): fill it rather than skip it
+            self.models.setdefault(spec, {})["context_window"] = context_window
 
         def apply(data: dict) -> None:
-            data.setdefault("aliases", {})["default"] = spec
+            data.setdefault("aliases", {})[alias] = spec
             if spec in self.models:
-                data.setdefault("models", {}).setdefault(spec, self.models[spec])
+                data.setdefault("models", {}).setdefault(spec, {}).update(self.models[spec])
 
-        return self._persist(apply, what="default")
+        return self._persist(apply, what=alias)
 
     def set_think_mode(self, spec: str, reasoning_effort: str | None) -> bool:
         """Persist `reasoning_effort` into the model's models.json entry so it
@@ -327,11 +334,13 @@ class Registry:
             model, cloud = split_cloud_marker(model)
             provider = ollama_provider_for(provider, cloud)
         entry = dict(self.models.get(spec, {}))
-        if not entry and spec not in _warned_unknown_specs:
-            # a wrong context window silently breaks compaction, so be loud
+        if "context_window" not in entry and spec not in _warned_unknown_specs:
+            # a wrong context window silently breaks compaction, so be loud —
+            # also for an entry that exists but never learned its window
             _warned_unknown_specs.add(spec)
+            what = "no models.json entry" if not entry else "no context_window in the models.json entry"
             print(
-                f"warning: no models.json entry for '{spec}'; assuming "
+                f"warning: {what} for '{spec}'; assuming "
                 f"context_window={DEFAULT_CONTEXT_WINDOW}",
                 file=sys.stderr,
             )

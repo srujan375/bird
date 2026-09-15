@@ -22,6 +22,19 @@ function LanesImpl({ lanes }: { lanes: Lane[] }) {
             <span className="lane-note" title={l.note}>{l.note}</span>
             {l.taken ? <span className="taken">taken</span> : null}
           </div>
+          {l.evidence ? (
+            <div className="lane-evidence" data-od-id={"evidence-" + l.k}>
+              <span className="k">seen at</span>
+              {l.evidence.who ? <span className="who">{l.evidence.who}</span> : null}
+              {l.evidence.scale ? <span>{l.evidence.who ? "· " : ""}{l.evidence.scale}</span> : null}
+              {l.evidence.sources?.length ? (
+                <a className="src" href={l.evidence.sources[0]} target="_blank" rel="noreferrer"
+                   title={l.evidence.sources.join("\n")}>
+                  {l.evidence.sources.length} source{l.evidence.sources.length > 1 ? "s" : ""}
+                </a>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       ))}
     </div>

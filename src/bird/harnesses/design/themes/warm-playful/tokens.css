@@ -1,0 +1,77 @@
+:root {
+  --bg: #fff8f0;
+  --surface: #ffffff;
+  --text: #3d2c29;
+  --text-secondary: #8a7268;
+  --accent: #f26b4e;
+  --accent-hover: #d95538;
+  --border: #f0e2d8;
+  --radius: 16px;
+  --font-display: 'Nunito', 'Quicksand', 'Trebuchet MS', sans-serif;
+  --font-body: 'Nunito', 'Quicksand', 'Trebuchet MS', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+  --space-section: 4.5rem;
+  --max-width: 68rem;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 1.02rem;
+  line-height: 1.6;
+  margin: 0;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display);
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.5em;
+}
+
+h1 { font-size: clamp(2rem, 4.5vw, 3rem); }
+h2 { font-size: clamp(1.5rem, 3vw, 2rem); }
+h3 { font-size: 1.2rem; line-height: 1.3; }
+
+p { max-width: 68ch; }
+
+a { color: var(--accent); font-weight: 600; }
+a:hover { color: var(--accent-hover); }
+
+button {
+  background: var(--accent);
+  color: #ffffff;
+  border: none;
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 700;
+  padding: 0.7em 1.6em;
+  box-shadow: 0 2px 8px rgba(61, 44, 41, 0.15);
+  cursor: pointer;
+}
+button:hover { background: var(--accent-hover); }
+
+input, textarea, select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  font: inherit;
+  padding: 0.6em 0.9em;
+}
+input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 14px rgba(61, 44, 41, 0.08);
+  padding: 1.5rem;
+}
+
+hr { border: none; border-top: 1px solid var(--border); }

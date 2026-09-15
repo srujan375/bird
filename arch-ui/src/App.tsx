@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
-import { openAsk, setChat, useChat } from "./board/chat";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { openAsk, selectAsk, setChat, useChat } from "./board/chat";
+import { rowAt } from "./board/picker";
 import type { Attachment } from "./board/types";
-import { fitNow, nudgeX } from "./board/viewApi";
-import { useSession } from "./wire/session";
+import { flash, getUi } from "./board/ui";
+import { fitNow, frame, nudgeX } from "./board/viewApi";
+import { ChatHostProvider, type ChatHost } from "./chat/host";
+import { sendAnswer, sendBoard, sendInput, useSession } from "./wire/session";
 import { AppBar } from "./components/AppBar";
 import { Board } from "./components/Board";
 import { Chat } from "./components/Chat";
@@ -10,7 +13,7 @@ import { Lightbox } from "./components/Lightbox";
 import { readChatClosed, useRail, writeChatOpen } from "./hooks/useRail";
 
 export default function App() {
-  const { arch, conn, handedOff, running } = useSession();
+  const { arch, conn, handedOff, running, pendingEdits, research } = useSession();
   const chat = useChat();
   const { rail, setRail } = useRail();
 
@@ -23,6 +26,23 @@ export default function App() {
   const [tip, setTip] = useState("Select a box to pin your note to it");
 
   useEffect(() => { setChat({ open: chatOpen }); }, [chatOpen]);
+
+  /* What the shared rail needs from this board. Notes are not components, so
+     only a selected box travels as a subject; "show me" frames the boxes a
+     line names and halos them. */
+  const host = useMemo<ChatHost>(() => ({
+    who: "Message the architect",
+    placeholder: "Say what's wrong, or point at something on the board…",
+    pendingEdits,
+    subjects: () => {
+      const sel = getUi().selected;
+      return sel && sel.t === "node" ? [sel.id] : [];
+    },
+    sendInput,
+    sendBoard,
+    sendAnswer,
+    reveal: (ids) => { frame(ids, 120, 1.15); flash(ids); },
+  }), [pendingEdits]);
 
   useEffect(() => {
     if (!sizing) return;
@@ -46,18 +66,27 @@ export default function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "\\") { e.preventDefault(); toggleChat(); return; }
-      /* Digits 1–3 answer the open question from anywhere — but only when the
-         user is not typing, and not with a modifier that means something else. */
+      /* Digits choose a row of the open question from anywhere, and Enter
+         confirms it — but only when the user is not typing, and not with a
+         modifier that means something else. Choosing is deliberately not
+         answering: the confirm button is the answer, here as on the page. */
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      const ask = openAsk();
-      if (!ask) return;
+      const open = openAsk();
+      if (!open) return;
+      const { host, ask } = open;
       const n = Number(e.key);
-      if (Number.isInteger(n) && n >= 1 && n <= Math.min(3, ask.opts.length)) {
+      if (Number.isInteger(n) && n >= 1 && n <= ask.picker.options.length) {
+        const o = ask.picker.options[n - 1];
+        if (o.disabled) return;
         e.preventDefault();
-        const o = ask.opts[n - 1];
-        if (ask.onPick) ask.onPick(o); else sendPick(o.label);
+        selectAsk(host, o.value);
+      } else if (e.key === "Enter" && ask.selected) {
+        const o = rowAt(ask.picker, ask.picker.options.findIndex((x) => x.value === ask.selected) + 1);
+        if (!o) return;
+        e.preventDefault();
+        sendAnswer(host, ask.picker.id, o);
       }
     };
     addEventListener("keydown", onKey);
@@ -71,6 +100,7 @@ export default function App() {
   const live = approaches.filter((a) => a.status === "active");
   const lost = approaches.filter((a) => a.status === "greyed");
   const sub = (() => {
+    if (conn === "reconnecting") return "reconnecting to the harness…";
     if (conn === "disconnected") return "the harness disconnected";
     if (handedOff) return "handed off · read-only";
     if (!arch || !Object.keys(arch.nodes).length) return running ? "thinking…" : "nothing on the board yet";
@@ -108,24 +138,29 @@ export default function App() {
         exportLabel={exportLabel}
         onExport={onExport}
         onToggleChat={() => toggleChat()}
+        waiting={chat.pendingAsk ? 1 : 0}
       />
 
       <main className={"split" + (sizing ? " sizing" : "")} id="content">
         <Board setTip={setTip} />
+        <ChatHostProvider host={host}>
         <Chat
           turns={chat.turns}
-          tip={tip}
+          tip={running && research.some((r) => !r.done) ? "Type to interrupt and go with what it has." : tip}
           rail={rail}
           setRail={setRail}
           onSizingStart={() => setSizing(true)}
           onSizingEnd={() => setSizing(false)}
           onCollapse={() => toggleChat(false)}
           onOpenShot={setShot}
-          readOnly={handedOff || conn === "disconnected"}
+          readOnly={handedOff || conn === "disconnected" || conn === "reconnecting"}
           readOnlyReason={handedOff
             ? "The design was handed off — this board is read-only."
-            : "The harness is gone — nothing you type here can reach it."}
+            : conn === "reconnecting"
+              ? "Reconnecting to the harness…"
+              : "The harness is gone — nothing you type here can reach it."}
         />
+        </ChatHostProvider>
       </main>
 
       {shot ? <Lightbox shot={shot} onClose={() => setShot(null)} /> : null}

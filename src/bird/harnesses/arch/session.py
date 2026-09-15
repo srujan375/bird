@@ -23,6 +23,7 @@ from pathlib import Path
 from collections.abc import Sequence
 from typing import Any, Callable
 
+from ..picker import Ask
 from . import derive, render
 from .state import ArchState
 
@@ -50,6 +51,11 @@ FOCUS_PREFIX = "[the user is pointing at]"
 # arrives over HTTP and nothing else bounds it.
 MAX_FOCUS = 8
 
+# How a picked row announces itself as a turn. The page reads this back so the
+# transcript records "picked" rather than words the user never typed — the
+# other half of this contract is PICK_PREFIX in arch-ui/src/wire/task.ts.
+PICK_PREFIX = "[the user picked]"
+
 
 class ArchSession:
     def __init__(
@@ -67,6 +73,7 @@ class ArchSession:
     def state_event(self, changed: dict[str, str] | None = None) -> dict[str, Any]:
         """The full-replacement push. `status` is what the transport's stop
         condition reads — a session is open until it is handed off."""
+        ask = self.pending_ask()
         return {
             "type": "arch_state",
             "status": "handed_off" if self.state.handed_off else "open",
@@ -80,6 +87,15 @@ class ArchSession:
             # yet. The page badges its submit with this, and reading it off the
             # harness means a refresh does not lose the count.
             "pending_edits": self.pending_edit_count(),
+            # what is still askable, the fork if open, and what the user closed
+            # — the same walk the architect's note is built from, so the user
+            # sees why it asks what it asks and can end a branch on purpose
+            "frontier": derive.frontier_struct(self.state),
+            # The one question on the table, as the picker payload both this
+            # page and the design workbench render. Deliberately the earliest
+            # open one and no other: two pickers in a thread is two questions
+            # asked at once, which is how a user ends up answering neither.
+            "ask": ask.payload() if ask is not None else None,
             "changed": changed,
         }
 
@@ -224,6 +240,71 @@ class ArchSession:
     def _node_name(self, node_id: str) -> str:
         node = self.state.nodes.get(node_id)
         return node.label if node is not None else node_id
+
+    # ---- questions on the table ----
+
+    def pending_ask(self) -> Ask | None:
+        """The earliest open question that has rows to pick from.
+
+        A question without options is asked in prose and answered in the
+        message box; only one with them is a picker, and only one picker is
+        ever on the table."""
+        for q in self.state.questions:
+            if q.open and q.options:
+                return q.as_ask()
+        return None
+
+    def answer_ask(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """A row taken in the page's picker.
+
+        Duck-typed like `apply_mutation`: the pump finds this by name on
+        `ctx.arch`. It settles the question in the state and hands back the
+        turn to send — the architect hears the answer as a pick, with the
+        question it answers hung under it so it cannot bind it to the wrong
+        one."""
+        qid = str(payload.get("id") or "")
+        q = self.state.question_by_id(qid)
+        if q is None:
+            known = ", ".join(x.id for x in self.state.questions) or "none"
+            raise ValueError(f"no question {qid!r} (known: {known}).")
+        ask = q.as_ask()
+        picked = ask.take(str(payload.get("value") or ""))
+        q.answer = picked.label
+        q.status = "answered"
+        self._record_pick(q, picked)
+        self.touched("question", q.id)
+        return {
+            "answered": q.id,
+            "value": picked.value,
+            "label": picked.label,
+            "input": f"{PICK_PREFIX}\n- {picked.label}\n  in answer to {q.id}: {q.question}",
+        }
+
+    def _record_pick(self, q: Any, picked: Any) -> None:
+        """A row taken is a decision made. Record it here, deterministically,
+        rather than hoping the architect calls `decide` afterwards — in the
+        one live run before this existed, it did not, and the bundle would
+        have shipped without the only call the user had actually made.
+
+        The other rows travel as what it was weighed against, each with its
+        one-line consequence. A revised pick updates the decision it made
+        rather than adding a second one."""
+        from .state import Decision, Option
+
+        topic = q.summary or q.question
+        options = [
+            Option(name=o.label, pros=[o.description] if o.description else [])
+            for o in q.options
+        ]
+        rationale = "picked by the user" + (f": {picked.description}" if picked.description else "")
+        for d in self.state.decisions:
+            if d.source == "user" and d.topic == topic:
+                d.choice, d.options, d.rationale = picked.label, options, rationale
+                return
+        self.state.decisions.append(Decision(
+            id=self.next_decision_id(), topic=topic, options=options,
+            choice=picked.label, rationale=rationale, source="user",
+        ))
 
     def next_question_id(self) -> str:
         return self.state.next_id("q", self.state.questions)

@@ -25,6 +25,9 @@ is the only writer.
     {"op": "remove_box", "id": "rate-limiter"}
     {"op": "connect",    "src": "api", "dst": "rate-limiter"}
     {"op": "disconnect", "src": "api", "dst": "rate-limiter"}
+    {"op": "settle",       "id": "rate-limiter"}   — good enough, stop asking
+    {"op": "out_of_scope", "id": "rate-limiter"}   — not this session's problem
+    {"op": "reopen",       "id": "rate-limiter"}
 
 Drawing is talking. A box the user puts up arrives as a stub with no kind —
 "here is a thing, you tell me what it is" — and the architect sees it in the
@@ -135,6 +138,37 @@ def _approach(session: ArchSession, payload: dict[str, Any]) -> dict[str, Any]:
     session.touched("approach", aid)
     verb = "greyed out" if candidate.status == "greyed" else "brought back"
     return {"applied": f"'{candidate.name}' {verb}."}
+
+
+def _close(how: str):
+    """settle / out_of_scope: the user ends a branch. The box stays, the
+    frontier drops it, and the architect hears it as the user talking."""
+
+    def op(session: ArchSession, payload: dict[str, Any]) -> dict[str, Any]:
+        nid = str(payload.get("id") or "").strip()
+        node = session.state.nodes.get(nid)
+        if node is None:
+            raise MutationError(f"no box {nid!r}.")
+        node.closed = how
+        said = "good enough as it is" if how == "settled" else "out of scope for this session"
+        session.note_user_edit(f"said {node.label or nid} ({nid}) is {said}")
+        session.touched("node", nid)
+        return {"applied": f"{node.label or nid}: {said}."}
+
+    return op
+
+
+def _reopen(session: ArchSession, payload: dict[str, Any]) -> dict[str, Any]:
+    nid = str(payload.get("id") or "").strip()
+    node = session.state.nodes.get(nid)
+    if node is None:
+        raise MutationError(f"no box {nid!r}.")
+    if not node.closed:
+        return {"applied": f"{node.label or nid} was already open."}
+    node.closed = ""
+    session.note_user_edit(f"reopened {node.label or nid} ({nid}) — ask about it again")
+    session.touched("node", nid)
+    return {"applied": f"{node.label or nid} reopened."}
 
 
 def _move(session: ArchSession, payload: dict[str, Any]) -> dict[str, Any]:
@@ -318,4 +352,5 @@ _OPS = {
     "node": _node, "approach": _approach, "move": _move, "tidy": _tidy, "note": _note,
     "add_box": _add_box, "remove_box": _remove_box,
     "connect": _connect, "disconnect": _disconnect,
+    "settle": _close("settled"), "out_of_scope": _close("out_of_scope"), "reopen": _reopen,
 }

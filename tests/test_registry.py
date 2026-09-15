@@ -175,3 +175,79 @@ def test_split_and_add_cloud_marker_roundtrip():
         assert add_cloud_marker(marked) == marked
     assert split_cloud_marker("ornith:35b") == ("ornith:35b", False)
     assert split_cloud_marker("cloud") == ("cloud", False)
+
+
+def test_set_alias_persists_any_harness_alias(tmp_path):
+    """set_alias is set_default for the other harnesses' aliases: designer,
+    architect — written to the same file, with a discovered context window
+    remembered under models."""
+    import json
+
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps({
+        "providers": {"fake": {"base_url": "http://x"}},
+        "models": {"fake:model": {"context_window": 32768}},
+        "aliases": {"default": "fake:model"},
+    }))
+    reg = Registry.load(path)
+    assert reg.set_alias("designer", "fake:other", context_window=65536) is True
+    assert reg.aliases["designer"] == "fake:other"
+    data = json.loads(path.read_text())
+    assert data["aliases"] == {"default": "fake:model", "designer": "fake:other"}
+    assert data["models"]["fake:other"] == {"context_window": 65536}
+    assert Registry.load(path).resolve("designer").spec == "fake:other"
+
+
+
+def test_set_alias_fills_a_window_into_an_entry_that_lacks_one(tmp_path):
+    """A /think choice on a fresh pick leaves {"reasoning_effort": ...} with
+    no window; a later pick that learned the window must merge it into that
+    entry (in memory and on disk), not skip it because an entry exists."""
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps({
+        "providers": {"fake": {"base_url": "http://x"}},
+        "models": {"fake:model": {"reasoning_effort": "none"}},
+        "aliases": {"default": "fake:model"},
+    }))
+    reg = Registry.load(path)
+    assert reg.set_alias("default", "fake:model", context_window=262144) is True
+    assert reg.models["fake:model"] == {"reasoning_effort": "none", "context_window": 262144}
+    assert json.loads(path.read_text())["models"]["fake:model"] == {
+        "reasoning_effort": "none", "context_window": 262144,
+    }
+    # a window already on file is not overridden by a later pick's guess
+    assert reg.set_alias("default", "fake:model", context_window=4096) is True
+    assert Registry.load(path).resolve("default").context_window == 262144
+
+
+def test_resolve_warns_when_an_entry_has_no_window(tmp_path, capsys):
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps({
+        "providers": {"fake": {"base_url": "http://x"}},
+        "models": {"fake:thinky": {"reasoning_effort": "low"}},
+        "aliases": {"default": "fake:thinky"},
+    }))
+    spec = Registry.load(path).resolve("default")
+    assert spec.context_window == 32768
+    err = capsys.readouterr().err
+    assert "no context_window in the models.json entry for 'fake:thinky'" in err
+
+
+def test_cloud_spec_without_an_entry_resolves_without_warning(tmp_path, capsys):
+    """A :cloud model has no API to learn its window from, so the table fills
+    it before resolve() — the warning must not fire for a model bird ships."""
+    from bird.llm.discovery import ollama_context_window
+
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps({
+        "providers": {"ollama": {"base_url": "http://localhost:11434/v1"}},
+        "models": {},
+        "aliases": {},
+    }))
+    reg = Registry.load(path)
+    window = ollama_context_window(reg, "ollama:glm-5.3:cloud")
+    assert window == 1000000
+    reg.models.setdefault("ollama:glm-5.3:cloud", {})["context_window"] = window
+    spec = reg.resolve("ollama:glm-5.3:cloud")
+    assert spec.context_window == 1000000
+    assert "assuming context_window" not in capsys.readouterr().err
