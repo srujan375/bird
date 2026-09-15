@@ -1,1 +1,0 @@
-// (deleted — probe moved into mcp-catalog.smoke.ts assertions)

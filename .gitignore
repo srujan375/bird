@@ -38,3 +38,6 @@ _demo_reverse_seed.py
 # design-benchmark tasks pointing at the proprietary A2V2 repo. Local validation
 # only — a reader cannot reproduce them and the trap text quotes closed source.
 evals/design/tasks-private/
+
+# a vendored checkout of ibelick/motion-primitives, used for reference; not part of bird
+motion-primitives/
